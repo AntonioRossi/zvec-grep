@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { Model2VecEmbeddingModel } from "../../../dist/engine/models/backends/model2vec.js";
+import { resolveModelArtifacts } from "../../../dist/engine/models/artifact-downloader.js";
 import { createTemporaryDirectory } from "../../helpers/fixtures.mjs";
 
 function entry(overrides = {}) {
@@ -70,6 +72,74 @@ function createArtifactResolver(onResolve) {
     return { source, directory: source.cacheDirectory, paths };
   };
 }
+
+test("Model2Vec loads mapped assets from the real resolver's verified generation", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-model2vec-generation-");
+  const files = {
+    "model.safetensors": Buffer.from("table fixture"),
+    "tokenizer.json": Buffer.from("{}"),
+  };
+  const artifacts = Object.entries(files).map(([path, bytes]) => ({
+    path,
+    size: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  }));
+  let resolved;
+  const loaded = [];
+  const model = new Model2VecEmbeddingModel(
+    entry({ artifacts }),
+    { apiKey: "", modelCacheDir: root },
+    {
+      async resolveArtifacts(options) {
+        resolved = await resolveModelArtifacts({
+          ...options,
+          dependencies: {
+            async fetch(url) {
+              return new Response(
+                files[
+                  url.endsWith("tokenizer.json")
+                    ? "tokenizer.json"
+                    : "model.safetensors"
+                ],
+              );
+            },
+          },
+        });
+        return resolved;
+      },
+      async loadSafetensors(path) {
+        assert.equal(path, resolved.paths["model.safetensors"]);
+        assert.deepEqual(await readFile(path), files["model.safetensors"]);
+        loaded.push("table");
+        return {
+          data: Float32Array.from([1, 0, 0]),
+          dimension: 3,
+          dtype: "F32",
+          rows: 1,
+        };
+      },
+      async loadTokenizer(source) {
+        assert.equal(source, dirname(resolved.paths["tokenizer.json"]));
+        assert.equal(
+          await readFile(join(source, "tokenizer.json"), "utf8"),
+          "{}",
+        );
+        assert.equal(
+          JSON.parse(
+            await readFile(join(source, "tokenizer_config.json"), "utf8"),
+          ).tokenizer_class,
+          "PreTrainedTokenizer",
+        );
+        loaded.push("tokenizer");
+        return async () => ({ input_ids: { data: BigInt64Array.from([0n]) } });
+      },
+    },
+  );
+  t.after(() => model.dispose());
+  await model.prepare();
+  assert.notEqual(resolved.directory, resolved.source.cacheDirectory);
+  assert.deepEqual(loaded, ["table", "tokenizer"]);
+});
 
 async function writeSafetensors(path, dtype, values, shape) {
   const bytesPerValue = dtype === "F16" ? 2 : 4;

@@ -1,16 +1,24 @@
-import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, type Stats } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants, createReadStream } from "node:fs";
 import {
+  copyFile,
   mkdir,
+  mkdtemp,
   lstat,
   open,
   readFile,
-  rename,
   rm,
   stat,
 } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import { writeJsonFile } from "../utils/json.js";
 import {
   acquireModelArtifactCacheLock,
@@ -172,8 +180,11 @@ type NormalizedOptions = Readonly<{
 
 type SourceManifest = Readonly<{
   fingerprint: string;
+  directory: string;
   markerPath: string;
   lockPath: string;
+  selectionPath: string;
+  generationsDirectory: string;
   localPaths: Readonly<Record<string, string>>;
 }>;
 
@@ -190,16 +201,6 @@ type CompleteMarker = Readonly<{
       }>
     >
   >;
-}>;
-
-type FileIdentity = Readonly<{
-  device: number;
-  inode: number;
-  mode: number;
-  size: number;
-  mtimeMs: number;
-  ctimeMs: number;
-  replaceable: boolean;
 }>;
 
 class DeadlineError extends Error {
@@ -231,20 +232,22 @@ export async function resolveModelArtifacts(
   // avoid a doomed Hugging Face network attempt.
   for (const source of normalized.sources) {
     const manifest = manifests.get(source.kind)!;
-    if (
-      await validateSnapshot(
-        normalized.model,
-        source,
-        normalized.artifacts,
-        manifest,
-      )
-    ) {
-      await writeCompleteMarkerBestEffort(
-        source,
-        normalized.artifacts,
-        manifest,
-      );
-      return resolvedResult(source, manifest);
+    for (const candidate of await snapshotCandidates(source, manifest)) {
+      if (
+        await validateSnapshot(
+          normalized.model,
+          source,
+          normalized.artifacts,
+          candidate,
+        )
+      ) {
+        await writeCompleteMarkerBestEffort(
+          source,
+          normalized.artifacts,
+          candidate,
+        );
+        return resolvedResult(source, candidate);
+      }
     }
   }
 
@@ -254,8 +257,12 @@ export async function resolveModelArtifacts(
   for (const [sourceIndex, source] of normalized.sources.entries()) {
     const manifest = manifests.get(source.kind)!;
     try {
-      await downloadSourceSnapshot(normalized, source, manifest);
-      return resolvedResult(source, manifest);
+      const selected = await downloadSourceSnapshot(
+        normalized,
+        source,
+        manifest,
+      );
+      return resolvedResult(source, selected);
     } catch (error) {
       if (sourceIndex === 0) {
         primaryError = error;
@@ -497,6 +504,15 @@ function createSourceManifest(
     .slice(0, 24);
   return {
     fingerprint,
+    directory: resolve(source.cacheDirectory),
+    selectionPath: join(
+      source.cacheDirectory,
+      `.zvec-grep-artifacts-${fingerprint}.current`,
+    ),
+    generationsDirectory: join(
+      source.cacheDirectory,
+      `.zvec-grep-artifacts-${fingerprint}.generations`,
+    ),
     markerPath: join(
       source.cacheDirectory,
       `.zvec-grep-artifacts-${fingerprint}.complete`,
@@ -509,17 +525,111 @@ function createSourceManifest(
   };
 }
 
+function generationManifest(
+  manifest: SourceManifest,
+  directory: string,
+): SourceManifest {
+  return {
+    ...manifest,
+    directory: resolve(directory),
+    markerPath: join(resolve(directory), basename(manifest.markerPath)),
+  };
+}
+
+async function snapshotCandidates(
+  source: ModelArtifactSource,
+  manifest: SourceManifest,
+): Promise<SourceManifest[]> {
+  try {
+    let selection: unknown;
+    try {
+      selection = JSON.parse(await readFile(manifest.selectionPath, "utf8"));
+    } catch (error) {
+      if (isMissingFileError(error) || error instanceof SyntaxError)
+        return [manifest];
+      throw error;
+    }
+    if (
+      !isRecord(selection) ||
+      selection.version !== MANIFEST_VERSION ||
+      selection.fingerprint !== manifest.fingerprint ||
+      typeof selection.generation !== "string" ||
+      !/^generation-[a-zA-Z0-9_-]+$/u.test(selection.generation)
+    )
+      return [manifest];
+    const directory = join(manifest.generationsDirectory, selection.generation);
+    try {
+      // Selection records cannot redirect lookup through a generation symlink.
+      if (
+        !(await lstat(directory)).isDirectory() ||
+        !(await lstat(manifest.generationsDirectory)).isDirectory()
+      )
+        return [manifest];
+    } catch (error) {
+      if (isMissingFileError(error)) return [manifest];
+      throw error;
+    }
+    return [generationManifest(manifest, directory), manifest];
+  } catch (error) {
+    throw filesystemError(
+      `Unable to inspect ${source.kind} artifact generation`,
+      source,
+      undefined,
+      error,
+    );
+  }
+}
+
+async function copyCachedArtifact(
+  model: string,
+  source: ModelArtifactSource,
+  artifact: ModelArtifact,
+  candidates: readonly SourceManifest[],
+  generation: SourceManifest,
+): Promise<boolean> {
+  const destination = safeLocalPath(
+    generation.directory,
+    generation.localPaths[artifact.path],
+  );
+  await mkdir(dirname(destination), { recursive: true });
+  for (const candidate of candidates) {
+    const path = safeLocalPath(
+      candidate.directory,
+      candidate.localPaths[artifact.path],
+    );
+    try {
+      const stats = await stat(path);
+      if (!stats.isFile() || stats.size !== artifact.size) continue;
+      // Never hard-link reusable files: writes to a predecessor must not alter
+      // the new snapshot. Verify the copy, since the source can change mid-copy.
+      await copyFile(path, destination, constants.COPYFILE_EXCL);
+      if (await validateArtifact(model, source, artifact, generation))
+        return true;
+      await rm(destination, { force: true });
+    } catch (error) {
+      if (isMissingFileError(error)) continue;
+      throw filesystemError(
+        `Unable to copy cached artifact '${artifact.path}'`,
+        source,
+        artifact.path,
+        error,
+      );
+    }
+  }
+  return false;
+}
+
 function resolvedResult(
   source: ModelArtifactSource,
   manifest: SourceManifest,
 ): ResolvedModelArtifacts {
   return {
     source,
-    directory: resolve(source.cacheDirectory),
+    directory: manifest.directory,
     paths: Object.fromEntries(
       Object.entries(manifest.localPaths).map(([artifact, localPath]) => [
         artifact,
-        safeLocalPath(source.cacheDirectory, localPath),
+        safeLocalPath(manifest.directory, localPath),
       ]),
     ),
   };
@@ -531,9 +641,7 @@ async function validateSnapshot(
   artifacts: readonly ModelArtifact[],
   manifest: SourceManifest,
 ): Promise<boolean> {
-  if (await hasValidCompleteMarker(source, artifacts, manifest)) {
-    return true;
-  }
+  // Metadata is not an integrity guarantee, including for selected generations.
   for (const artifact of artifacts) {
     if (!(await validateArtifact(model, source, artifact, manifest))) {
       return false;
@@ -542,7 +650,7 @@ async function validateSnapshot(
   return true;
 }
 
-async function hasValidCompleteMarker(
+async function completeMarkerMatchesMetadata(
   source: ModelArtifactSource,
   artifacts: readonly ModelArtifact[],
   manifest: SourceManifest,
@@ -574,10 +682,7 @@ async function hasValidCompleteMarker(
         return false;
       }
       const stats = await stat(
-        safeLocalPath(
-          source.cacheDirectory,
-          manifest.localPaths[artifact.path],
-        ),
+        safeLocalPath(manifest.directory, manifest.localPaths[artifact.path]),
       );
       if (
         !stats.isFile() ||
@@ -610,7 +715,7 @@ async function validateArtifact(
   manifest: SourceManifest,
 ): Promise<boolean> {
   const localPath = safeLocalPath(
-    source.cacheDirectory,
+    manifest.directory,
     manifest.localPaths[artifact.path],
   );
   try {
@@ -640,7 +745,7 @@ async function downloadSourceSnapshot(
   options: NormalizedOptions,
   source: ModelArtifactSource,
   manifest: SourceManifest,
-): Promise<void> {
+): Promise<SourceManifest> {
   try {
     await mkdir(source.cacheDirectory, { recursive: true });
     const lock = await acquireModelArtifactCacheLock(manifest.lockPath, {
@@ -649,26 +754,76 @@ async function downloadSourceSnapshot(
       heartbeatMs: options.lockHeartbeatMs,
       dependencies: options.dependencies,
     });
+    let generation: SourceManifest | undefined;
+    let published = false;
     try {
-      // Another process may have completed the snapshot while we waited.
-      if (await hasValidCompleteMarker(source, options.artifacts, manifest)) {
-        return;
+      const candidates = await snapshotCandidates(source, manifest);
+      // Another process may have published a complete snapshot while we waited.
+      for (const candidate of candidates) {
+        if (
+          await validateSnapshot(
+            options.model,
+            source,
+            options.artifacts,
+            candidate,
+          )
+        ) {
+          return candidate;
+        }
       }
+      await mkdir(manifest.generationsDirectory, { recursive: true });
+      const directory = await mkdtemp(
+        join(manifest.generationsDirectory, "generation-"),
+      );
+      generation = generationManifest(manifest, directory);
       const missingArtifacts: ModelArtifact[] = [];
       for (const artifact of options.artifacts) {
+        await lock.assertOwned();
         if (
-          !(await validateArtifact(options.model, source, artifact, manifest))
+          !(await copyCachedArtifact(
+            options.model,
+            source,
+            artifact,
+            candidates,
+            generation,
+          ))
         ) {
           missingArtifacts.push(artifact);
         }
       }
-      invokeDownloadPlanCallback(options, source, missingArtifacts);
-      for (const artifact of missingArtifacts) {
-        await downloadArtifact(options, source, artifact, manifest, lock);
+      if (missingArtifacts.length > 0) {
+        invokeDownloadPlanCallback(options, source, missingArtifacts);
+        for (const artifact of missingArtifacts) {
+          await downloadArtifact(options, source, artifact, generation, lock);
+        }
       }
+      if (
+        !(await validateSnapshot(
+          options.model,
+          source,
+          options.artifacts,
+          generation,
+        ))
+      ) {
+        throw new Error("Artifact generation changed before publication");
+      }
+      await writeCompleteMarker(source, generation);
       await lock.assertOwned();
-      await writeCompleteMarker(source, manifest);
+      await writeJsonFile(manifest.selectionPath, {
+        version: MANIFEST_VERSION,
+        fingerprint: manifest.fingerprint,
+        generation: basename(directory),
+      });
+      published = true;
+      return generation;
     } finally {
+      // Only this attempt owns this unpublished directory. Retain every
+      // published generation: a backend may still have paths or handles to it.
+      if (generation && !published) {
+        await rm(generation.directory, { recursive: true, force: true }).catch(
+          () => undefined,
+        );
+      }
       await lock.release();
     }
   } catch (error) {
@@ -692,20 +847,19 @@ async function downloadArtifact(
   lock: ModelArtifactCacheLock,
 ): Promise<void> {
   const destination = safeLocalPath(
-    source.cacheDirectory,
+    manifest.directory,
     manifest.localPaths[artifact.path],
   );
-  const partialPath = `${destination}.part-${process.pid}-${randomUUID()}`;
   const url = modelArtifactUrl(source, artifact.path);
-  let originalDestination: FileIdentity | undefined;
   let file: FileHandle | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const controller = new AbortController();
   try {
     try {
       await mkdir(dirname(destination), { recursive: true });
-      originalDestination = await inspectFileIdentity(destination);
-      file = await open(partialPath, "wx");
+      // This file lives in a new, unselected generation, never in an existing
+      // snapshot. Exclusive creation also refuses an unexpected destination.
+      file = await open(destination, "wx");
     } catch (error) {
       throw filesystemError(
         `Unable to prepare local artifact '${artifact.path}'`,
@@ -834,21 +988,11 @@ async function downloadArtifact(
       );
     }
 
-    await installDownloadedArtifact(
-      partialPath,
-      destination,
-      originalDestination,
-      options.model,
-      source,
-      artifact,
-      manifest,
-      lock,
-    );
+    await lock.assertOwned();
   } finally {
     controller.abort();
     await reader?.cancel().catch(() => undefined);
     await file?.close().catch(() => undefined);
-    await rm(partialPath, { force: true }).catch(() => undefined);
   }
 }
 
@@ -879,118 +1023,6 @@ async function readUntilData(
   }
 }
 
-async function installDownloadedArtifact(
-  partialPath: string,
-  destination: string,
-  originalDestination: FileIdentity | undefined,
-  model: string,
-  source: ModelArtifactSource,
-  artifact: ModelArtifact,
-  manifest: SourceManifest,
-  lock: ModelArtifactCacheLock,
-): Promise<void> {
-  try {
-    await lock.assertOwned();
-    const currentDestination = await inspectFileIdentity(destination);
-    if (!sameFileIdentity(originalDestination, currentDestination)) {
-      if (await validateArtifact(model, source, artifact, manifest)) {
-        return;
-      }
-      throw new Error(
-        "Artifact destination changed concurrently while downloading",
-      );
-    }
-
-    if (currentDestination && !currentDestination.replaceable) {
-      throw new Error(
-        `Refusing to replace non-file destination '${destination}'`,
-      );
-    }
-    // All downloader writers use the snapshot lock. POSIX rename replaces the
-    // destination atomically. Windows rejects that operation when the existing
-    // file is open, so preserve the old entry under a unique name while the
-    // verified replacement is installed.
-    try {
-      await rename(partialPath, destination);
-    } catch (error) {
-      if (
-        process.platform !== "win32" ||
-        !currentDestination ||
-        !isWindowsRenameReplacementError(error)
-      ) {
-        throw error;
-      }
-      await replaceDownloadedArtifactOnWindows(
-        partialPath,
-        destination,
-        currentDestination,
-        lock,
-      );
-    }
-  } catch (error) {
-    if (error instanceof ArtifactDownloadError) {
-      throw error;
-    }
-    throw filesystemError(
-      `Unable to install local artifact '${artifact.path}'`,
-      source,
-      artifact.path,
-      error,
-    );
-  }
-}
-
-async function replaceDownloadedArtifactOnWindows(
-  partialPath: string,
-  destination: string,
-  expectedDestination: FileIdentity,
-  lock: ModelArtifactCacheLock,
-): Promise<void> {
-  await lock.assertOwned();
-  const currentDestination = await inspectFileIdentity(destination);
-  if (!sameFileIdentity(expectedDestination, currentDestination)) {
-    throw new Error(
-      "Artifact destination changed concurrently while replacing",
-    );
-  }
-
-  const displacedPath = `${destination}.replaced-${process.pid}-${randomUUID()}`;
-  await rename(destination, displacedPath);
-  let replacementInstalled = false;
-  try {
-    await lock.assertOwned();
-    if ((await inspectFileIdentity(destination)) !== undefined) {
-      throw new Error(
-        "Artifact destination was recreated concurrently while replacing",
-      );
-    }
-    await rename(partialPath, destination);
-    replacementInstalled = true;
-  } catch (error) {
-    if ((await inspectFileIdentity(destination)) === undefined) {
-      try {
-        await rename(displacedPath, destination);
-      } catch (restoreError) {
-        throw new AggregateError(
-          [error, restoreError],
-          "Unable to install or restore the local artifact",
-          { cause: restoreError },
-        );
-      }
-    }
-    throw error;
-  } finally {
-    if (replacementInstalled) {
-      await rm(displacedPath, { force: true });
-    }
-  }
-}
-
-function isWindowsRenameReplacementError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  return code === "EACCES" || code === "EEXIST" || code === "EPERM";
-}
-
 async function writeCompleteMarker(
   source: ModelArtifactSource,
   manifest: SourceManifest,
@@ -1001,7 +1033,7 @@ async function writeCompleteMarker(
         Object.entries(manifest.localPaths).map(
           async ([artifactPath, localPath]) => {
             const stats = await stat(
-              safeLocalPath(source.cacheDirectory, localPath),
+              safeLocalPath(manifest.directory, localPath),
             );
             if (!stats.isFile()) {
               throw new Error(`Artifact '${artifactPath}' is not a file`);
@@ -1040,57 +1072,14 @@ async function writeCompleteMarkerBestEffort(
   manifest: SourceManifest,
 ): Promise<void> {
   try {
-    if (await hasValidCompleteMarker(source, artifacts, manifest)) {
+    if (await completeMarkerMatchesMetadata(source, artifacts, manifest)) {
       return;
     }
     await writeCompleteMarker(source, manifest);
   } catch {
-    // A complete marker is only a hashing optimization. A valid read-only cache
-    // remains usable even when metadata cannot be written beside it.
+    // Legacy completion markers are retained for compatibility, not integrity.
+    // A valid read-only cache remains usable when metadata cannot be written.
   }
-}
-
-async function inspectFileIdentity(
-  path: string,
-): Promise<FileIdentity | undefined> {
-  try {
-    return fileIdentity(await lstat(path));
-  } catch (error) {
-    if (isMissingFileError(error)) {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-function fileIdentity(stats: Stats): FileIdentity {
-  return {
-    device: stats.dev,
-    inode: stats.ino,
-    mode: stats.mode,
-    size: stats.size,
-    mtimeMs: stats.mtimeMs,
-    ctimeMs: stats.ctimeMs,
-    replaceable: stats.isFile() || stats.isSymbolicLink(),
-  };
-}
-
-function sameFileIdentity(
-  left: FileIdentity | undefined,
-  right: FileIdentity | undefined,
-): boolean {
-  return (
-    left === right ||
-    (left !== undefined &&
-      right !== undefined &&
-      left.device === right.device &&
-      left.inode === right.inode &&
-      left.mode === right.mode &&
-      left.size === right.size &&
-      left.mtimeMs === right.mtimeMs &&
-      left.ctimeMs === right.ctimeMs &&
-      left.replaceable === right.replaceable)
-  );
 }
 
 function invokeDownloadPlanCallback(

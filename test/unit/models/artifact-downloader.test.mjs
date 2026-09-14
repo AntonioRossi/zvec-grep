@@ -183,7 +183,7 @@ test("concurrent completion-marker writers leave no temporary files", async (t) 
   );
 });
 
-test("rejects a same-size corrupt cache and atomically installs the verified HF artifact", async (t) => {
+test("preserves a same-size corrupt cache and selects a verified HF generation", async (t) => {
   const root = await createTemporaryDirectory(t, "zvec-artifact-download-");
   const huggingFaceDirectory = join(root, "huggingface");
   const destination = join(huggingFaceDirectory, artifact.path);
@@ -206,7 +206,12 @@ test("rejects a same-size corrupt cache and atomically installs the verified HF 
   );
 
   assert.equal(result.source.kind, "huggingface");
-  assert.deepEqual(await readFile(destination), bytes);
+  assert.notEqual(result.paths[artifact.path], destination);
+  assert.deepEqual(await readFile(result.paths[artifact.path]), bytes);
+  assert.deepEqual(
+    await readFile(destination),
+    Buffer.alloc(bytes.byteLength, 120),
+  );
   assert.equal(calls.length, 1);
   assert.equal(calls[0].request.redirect, "follow");
   assert.ok(calls[0].request.signal instanceof AbortSignal);
@@ -240,10 +245,15 @@ test("does not trust a completion marker after a same-size file mutation", async
     first.paths[artifact.path],
     Buffer.alloc(bytes.byteLength, 120),
   );
-  await resolveModelArtifacts(resolveOptions);
+  const repaired = await resolveModelArtifacts(resolveOptions);
 
   assert.equal(fetchCalls, 2);
-  assert.deepEqual(await readFile(first.paths[artifact.path]), bytes);
+  assert.notEqual(repaired.paths[artifact.path], first.paths[artifact.path]);
+  assert.deepEqual(await readFile(repaired.paths[artifact.path]), bytes);
+  assert.deepEqual(
+    await readFile(first.paths[artifact.path]),
+    Buffer.alloc(bytes.byteLength, 120),
+  );
   assert.deepEqual(
     (await readdir(join(root, "huggingface"))).filter((name) =>
       name.includes(".replaced-"),
@@ -295,11 +305,9 @@ test("never removes an artifact destination changed by another writer", async (t
   await writeFile(destination, concurrentBytes);
   releaseBody();
 
-  await assert.rejects(resolution, (error) => {
-    assert.ok(error instanceof ArtifactDownloadError);
-    assert.equal(error.kind, "filesystem");
-    return true;
-  });
+  const result = await resolution;
+  assert.notEqual(result.paths[artifact.path], destination);
+  assert.deepEqual(await readFile(result.paths[artifact.path]), bytes);
   assert.equal(fetchCalls, 1, "a local race must not trigger source fallback");
   assert.deepEqual(await readFile(destination), concurrentBytes);
 });

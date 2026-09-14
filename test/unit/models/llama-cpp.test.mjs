@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { LlamaCppEmbeddingModel } from "../../../dist/engine/models/backends/llama-cpp.js";
+import { resolveModelArtifacts } from "../../../dist/engine/models/artifact-downloader.js";
 import { createTemporaryDirectory } from "../../helpers/fixtures.mjs";
 
 function entry(overrides = {}) {
@@ -528,7 +530,7 @@ test("local embedding falls back to packaged backend and retries model/context G
   );
 });
 
-test("local embedding rejects invalid downloaded GGUF and removes corrupt artifacts", async (t) => {
+test("local embedding rejects invalid GGUF without deleting a shared snapshot", async (t) => {
   for (const [contents, message] of [
     ["<!doctype html><html>failure</html>", /HTML, not GGUF/],
     ["NOPE invalid binary", /not a valid GGUF/],
@@ -549,7 +551,44 @@ test("local embedding rejects invalid downloaded GGUF and removes corrupt artifa
         /embedding failed/.test(error.message) &&
         message.test(String(error.cause?.message)),
     );
+    assert.equal(await readFile(modelFile.path, "utf8"), contents);
   }
+});
+
+test("llama.cpp loads the verified generation path returned by the real resolver", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-llama-generation-");
+  const bytes = Buffer.from("GGUFpayload");
+  const setup = createDependencies("unused");
+  let resolved;
+  setup.dependencies.resolveArtifacts = async (options) => {
+    resolved = await resolveModelArtifacts({
+      ...options,
+      dependencies: {
+        async fetch() {
+          return new Response(bytes);
+        },
+      },
+    });
+    return resolved;
+  };
+  const model = new LlamaCppEmbeddingModel(
+    entry({
+      artifacts: [
+        {
+          path: "model.gguf",
+          size: bytes.length,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+        },
+      ],
+    }),
+    { modelCacheDir: root, device: "cpu" },
+    setup.dependencies,
+  );
+  t.after(() => model.dispose());
+  await model.embed([{ kind: "text", text: "probe" }]);
+  assert.notEqual(resolved.directory, root);
+  assert.equal(setup.calls.model[0].modelPath, resolved.paths["model.gguf"]);
+  assert.deepEqual(await readFile(setup.calls.model[0].modelPath), bytes);
 });
 
 test("local embedding reports context and embedding runtime failures", async (t) => {

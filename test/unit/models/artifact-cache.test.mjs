@@ -102,7 +102,7 @@ test("repairs malformed completion metadata without downloading healthy cached f
   }
 });
 
-test("replaces same-size corruption with verified bytes without mutating an open predecessor", async (t) => {
+test("repairs same-size corruption in a new generation without mutating an open predecessor", async (t) => {
   const cache = await cachedSnapshot(t);
   const corruptedBytes = Buffer.alloc(bytes.byteLength, 120);
   await writeFile(cache.destination, corruptedBytes);
@@ -127,8 +127,9 @@ test("replaces same-size corruption with verified bytes without mutating an open
     });
 
     assert.equal(downloads, 1);
-    assert.equal(result.paths[artifact.path], cache.destination);
-    assert.deepEqual(await readFile(cache.destination), bytes);
+    assert.notEqual(result.paths[artifact.path], cache.destination);
+    assert.deepEqual(await readFile(result.paths[artifact.path]), bytes);
+    assert.deepEqual(await readFile(cache.destination), corruptedBytes);
     assert.deepEqual(await predecessor.readFile(), corruptedBytes);
 
     // A repaired snapshot must be reusable with the network unavailable.

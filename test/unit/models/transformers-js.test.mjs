@@ -1,9 +1,75 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { TransformersJsEmbeddingModel } from "../../../dist/engine/models/backends/transformers-js.js";
+import { resolveModelArtifacts } from "../../../dist/engine/models/artifact-downloader.js";
+import { createTemporaryDirectory } from "../../helpers/fixtures.mjs";
 
 const MODEL_CACHE_DIRECTORY = resolve("/tmp/model-cache");
+
+test("Transformers.js loads the complete directory selected by the real resolver", async (t) => {
+  const root = await createTemporaryDirectory(
+    t,
+    "zvec-transformers-generation-",
+  );
+  const files = {
+    "onnx/model_quantized.onnx": Buffer.from("onnx fixture"),
+    "tokenizer.json": Buffer.from("{}"),
+  };
+  const artifacts = Object.entries(files).map(([path, bytes]) => ({
+    path,
+    size: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  }));
+  let resolved;
+  let loads = 0;
+  const extractor = Object.assign(
+    async () => ({ dims: [1, 3], data: Float32Array.from([1, 0, 0]) }),
+    { tokenizer: createTokenizer(), async dispose() {} },
+  );
+  const model = new TransformersJsEmbeddingModel(
+    entry({ artifacts }),
+    { apiKey: "", modelCacheDir: root, device: "cpu" },
+    {
+      async resolveArtifacts(options) {
+        resolved = await resolveModelArtifacts({
+          ...options,
+          dependencies: {
+            async fetch(url) {
+              return new Response(
+                files[
+                  url.endsWith("tokenizer.json")
+                    ? "tokenizer.json"
+                    : "onnx/model_quantized.onnx"
+                ],
+              );
+            },
+          },
+        });
+        return resolved;
+      },
+      async loadRuntime() {
+        return {
+          async pipeline(task, directory, options) {
+            assert.equal(task, "feature-extraction");
+            assert.equal(directory, resolved.directory);
+            assert.equal(options.local_files_only, true);
+            for (const [path, bytes] of Object.entries(files))
+              assert.deepEqual(await readFile(join(directory, path)), bytes);
+            loads++;
+            return extractor;
+          },
+        };
+      },
+    },
+  );
+  t.after(() => model.dispose());
+  await model.embed([{ kind: "text", text: "probe" }]);
+  assert.notEqual(resolved.directory, resolved.source.cacheDirectory);
+  assert.equal(loads, 1);
+});
 const HUGGING_FACE_SNAPSHOT_DIRECTORY = join(
   MODEL_CACHE_DIRECTORY,
   "test",

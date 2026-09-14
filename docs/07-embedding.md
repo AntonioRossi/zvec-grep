@@ -22,6 +22,26 @@ ModelScope copy. A complete ModelScope snapshot is reused on later runs without
 retrying Hugging Face. ModelScope downloads use a separate `modelscope` cache
 subdirectory.
 
+Cached pinned artifacts are checked against their expected size and SHA-256
+before reuse. Valid legacy caches remain usable offline. New downloads and
+repairs create a separate generation, copy and verify any reusable files, and
+select the new directory only after the entire snapshot verifies. Existing
+artifact files and older generations are never overwritten by a repair.
+
+An interrupted attempt does not replace the selected generation. Normal failure
+cleanup removes only that attempt's unpublished directory. Completed generations
+and directories left by abruptly terminated processes are retained, since other
+processes may still use them; automatic garbage collection is not performed.
+To reclaim space, stop all processes using the cache before manually removing
+obsolete generations. Avoid changing artifact files while a model uses them.
+The resolver's returned paths identify the selected files; applications should
+not reconstruct download paths from the cache root. Older zvec-grep versions
+cannot discover the new generations and may download their own legacy copies.
+
+Verification reads the model files, and repair may temporarily duplicate model
+data on disk. Preparing a large cached model can take longer on slower storage.
+No additional assistant configuration is required.
+
 Remote models avoid local inference but send disclosed query or workspace
 content to the configured provider after authorization.
 

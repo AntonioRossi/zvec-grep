@@ -1,11 +1,4 @@
-import {
-  closeSync,
-  existsSync,
-  openSync,
-  readSync,
-  statSync,
-  unlinkSync,
-} from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { EngineError } from "../../errors.js";
 import type { Content, TextContent } from "../../types.js";
@@ -820,7 +813,8 @@ function validateGgufFile(filePath: string, modelUri: string): void {
     ? (statSync(filePath).size / 1024).toFixed(0)
     : "0";
 
-  unlinkSync(filePath);
+  // Resolved snapshots may be shared with other readers. Report invalid data
+  // without deleting their files; the resolver repairs into a new generation.
 
   if (isHtml) {
     throw new EngineError(
