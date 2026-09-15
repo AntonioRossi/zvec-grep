@@ -11,6 +11,8 @@ import {
   indexWorkspacePaths,
 } from "../pipeline/indexing/index.js";
 import { searchWorkspaceIndex } from "../pipeline/search/index.js";
+import { workspaceRootFingerprint } from "../utils/canonical-path.js";
+import { dirname } from "node:path";
 import {
   createWorkspaceIndexStorage,
   type WorkspaceIndexStorage,
@@ -35,6 +37,7 @@ export class WorkspaceIndex {
   private readonly storage: WorkspaceIndexStorage;
   private readonly embedding: WorkspaceIndexEmbeddingSchema;
   private readonly embeddingModel?: EmbeddingModel;
+  private readonly workspaceRoot: string;
   private closed = false;
 
   constructor(
@@ -48,15 +51,21 @@ export class WorkspaceIndex {
       this.validateEmbeddingSchema(this.embeddingModel);
     }
 
+    // The index home lives at <workspace>/.zvec-grep; the workspace root is
+    // derived from the current location, never from persisted absolute paths.
+    this.workspaceRoot = dirname(info.path);
+
     if (options.mode === "write") {
       this.storage = createWorkspaceIndexStorage({
         storagePath: info.path,
+        workspaceRoot: this.workspaceRoot,
         readOnly: false,
         embedding: this.embedding,
       });
     } else {
       this.storage = createWorkspaceIndexStorage({
         storagePath: info.path,
+        workspaceRoot: this.workspaceRoot,
         readOnly: true,
       });
     }
@@ -80,6 +89,10 @@ export class WorkspaceIndex {
       workspaceIndex: this.info,
       embeddingModel,
       storage: this.storage,
+      workspaceRoot: this.workspaceRoot,
+      reconcile:
+        this.info.rootFingerprint !==
+        workspaceRootFingerprint(this.workspaceRoot),
       embeddingConcurrency: options.embeddingConcurrency,
       onProgress: options.onProgress,
       signal: options.signal,
@@ -90,7 +103,11 @@ export class WorkspaceIndex {
   }
 
   status(): Promise<WorkspaceIndexStatus> {
-    return getWorkspaceIndexStatus(this.info, this.storage.listFiles());
+    return getWorkspaceIndexStatus(
+      this.info,
+      this.storage.listFiles(),
+      this.workspaceRoot,
+    );
   }
 
   searchPlan(plan: SearchPlan): Promise<SearchPlanResult> {

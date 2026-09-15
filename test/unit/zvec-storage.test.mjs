@@ -109,6 +109,7 @@ test("file metadata supports one batched path-prefix lookup", async (t) => {
   const root = join(parent, "repo");
   const storage = createWorkspaceIndexStorage({
     storagePath: join(parent, "storage"),
+    workspaceRoot: root,
     readOnly: false,
     embedding: {
       provider: "local",
@@ -144,6 +145,7 @@ function fileInfo(id, root, relativePath) {
   return {
     id: id.repeat(64),
     absolutePath: join(root, relativePath),
+    canonicalPath: relativePath,
     relativePath,
     rootPath: root,
     sizeBytes: 1,

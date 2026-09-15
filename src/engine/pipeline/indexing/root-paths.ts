@@ -1,13 +1,71 @@
 import { realpathSync, statSync, type Stats } from "node:fs";
 import { dirname, relative } from "node:path";
 import { EngineError } from "../../errors.js";
+import type { WorkspaceManifestRootPath } from "../../manifest.js";
 import type { RootPath } from "../../types.js";
+import {
+  workspaceRootCrp,
+  type CanonicalPathResolver,
+} from "../../utils/canonical-path.js";
 import { pathPatternMatches } from "../../utils/glob.js";
 import {
   isPathInside,
   normalizePath,
   toDisplayPath,
 } from "../../utils/path.js";
+
+/**
+ * Convert runtime roots to their persisted manifest form: canonical
+ * workspace-relative paths with selection options, no absolute locations.
+ */
+export function manifestRootPathsFromRuntime(
+  paths: readonly RootPath[],
+  resolver: CanonicalPathResolver,
+): WorkspaceManifestRootPath[] {
+  return canonicalizeRootPaths(paths, resolver).map((root) => {
+    const {
+      absolutePath: _absolutePath,
+      canonicalPath,
+      ...options
+    } = root;
+    return { ...options, path: canonicalPath as string };
+  });
+}
+/**
+ * Assign each root its canonical workspace-relative path, the identity
+ * reference point for scanned files. Roots must stay inside the workspace,
+ * including through symlinks; anything else is an explicit error in portable
+ * mode.
+ */
+export function canonicalizeRootPaths(
+  paths: readonly RootPath[],
+  resolver: CanonicalPathResolver,
+): RootPath[] {
+  return paths.map((root) => {
+    if (root.canonicalPath !== undefined) {
+      return root;
+    }
+    const canonicalPath =
+      normalizePath(root.absolutePath) === resolver.workspaceRoot
+        ? workspaceRootCrp()
+        : resolver.toCanonical(root.absolutePath);
+    const realRoot = realpathSync(root.absolutePath);
+    const escapes = !isPathInside(
+      resolver.workspaceRoot,
+      normalizePath(realRoot),
+    );
+    if (canonicalPath === null || escapes) {
+      throw new EngineError(
+        "Workspace index root path is outside the workspace",
+        {
+          code: "ZVEC_GREP.ENGINE.SCANNER.ROOT_PATH_OUTSIDE_WORKSPACE",
+          context: `rootPath=${root.absolutePath} workspaceRoot=${resolver.workspaceRoot}`,
+        },
+      );
+    }
+    return { ...root, canonicalPath };
+  });
+}
 
 export function validateRootPaths(
   paths: readonly (string | RootPath)[],

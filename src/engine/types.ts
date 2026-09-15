@@ -45,6 +45,11 @@ export type FileIndexStatus = {
 
 export type RootPath = {
   absolutePath: string;
+  /**
+   * Canonical workspace-relative path (CRP) of this root when operating in
+   * portable mode; the runtime identity reference point for scanned files.
+   */
+  canonicalPath?: string;
   recursive: boolean;
   include?: readonly string[];
   exclude?: readonly string[];
@@ -63,6 +68,8 @@ export type RootPath = {
 export type FileInfo = {
   id: string;
   absolutePath: string;
+  /** Canonical workspace-relative path; the portable persistent identity. */
+  canonicalPath?: string;
   relativePath: string;
   rootPath: string;
   sizeBytes: number;
@@ -74,7 +81,11 @@ export type FileInfo = {
 };
 
 export type SkippedFileReason =
-  "empty" | "too_large" | "unsupported" | "binary";
+  | "empty"
+  | "too_large"
+  | "unsupported"
+  | "binary"
+  | "escapes_workspace";
 
 export type SkippedFile = {
   absolutePath: string;
@@ -194,7 +205,7 @@ export type EntityFragment = {
 // Workspace index types
 // -----------------------------------------------------------------------------
 
-export const CURRENT_INDEX_VERSION = 1;
+export const CURRENT_INDEX_VERSION = 2;
 
 export type WorkspaceIndexEmbeddingSchema = {
   provider: string;
@@ -215,6 +226,8 @@ export type WorkspaceIndexInfo = {
   indexVersion?: number | null;
   createdTime: number;
   updatedTime: number;
+  /** One-way relocation token for the workspace root; never a usable path. */
+  rootFingerprint?: string;
 };
 
 // -----------------------------------------------------------------------------

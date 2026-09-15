@@ -23,6 +23,12 @@ import type {
 } from "../../../types.js";
 import { detectFileType } from "../../../file-type.js";
 import { resolveMaxFileSizeBytes } from "../../../file-size-policy.js";
+import { EngineError } from "../../../errors.js";
+import {
+  canonicalRelativePath,
+  findCanonicalNameCollisions,
+  makeFileId as makeCanonicalFileId,
+} from "../../../utils/canonical-path.js";
 import { sha256Text } from "../../../utils/hash.js";
 import {
   matchesFileSelection,
@@ -34,7 +40,11 @@ import {
   pathPatternMatches,
   pathPatternMightMatchDescendant,
 } from "../../../utils/glob.js";
-import { normalizePath, toDisplayPath } from "../../../utils/path.js";
+import {
+  isPathInside,
+  normalizePath,
+  toDisplayPath,
+} from "../../../utils/path.js";
 import {
   matchesRootExcludePatterns,
   matchesRootPatterns,
@@ -166,6 +176,13 @@ export type ScanResult = {
 export type ScanOptions = {
   signal?: AbortSignal;
   knownFiles?: readonly FileInfo[];
+  /**
+   * Current workspace root. When set, scanned files receive portable
+   * canonical-path identities and the scan enforces canonical-name collision
+   * and workspace-containment rules. When absent, legacy absolute-path
+   * identities are produced (direct scanner use in tests).
+   */
+  workspaceRoot?: string;
 };
 
 function knownFilesByPath(files: readonly FileInfo[] | undefined) {
@@ -193,6 +210,7 @@ export async function scanRootPaths(
       diagnostics,
       options.signal,
       knownFiles,
+      options.workspaceRoot,
     );
   }
 
@@ -249,6 +267,7 @@ export async function scanFilePath(
       absolutePath,
       diagnostics,
       knownFiles,
+      options.workspaceRoot,
     );
     if (file) {
       files.push(file);
@@ -381,6 +400,7 @@ export async function scanDirectoryPath(
       depth,
       options.signal,
       knownFiles,
+      options.workspaceRoot,
     );
   }
   return { files: dedupeFiles(files), diagnostics };
@@ -501,6 +521,7 @@ async function scanRootPath(
   diagnostics: FileScanDiagnostics,
   signal?: AbortSignal,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
+  workspaceRoot?: string,
 ): Promise<void> {
   throwIfAborted(signal);
   const root = normalizeRootPath(rootPath);
@@ -523,6 +544,7 @@ async function scanRootPath(
           root.absolutePath,
           diagnostics,
           knownFiles,
+          workspaceRoot,
         )
       : null;
     if (file) {
@@ -557,6 +579,7 @@ async function scanRootPath(
     0,
     signal,
     knownFiles,
+    workspaceRoot,
   );
 }
 
@@ -572,6 +595,7 @@ async function walk(
   depth: number,
   signal?: AbortSignal,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
+  workspaceRoot?: string,
 ): Promise<void> {
   throwIfAborted(signal);
   let entries;
@@ -586,6 +610,27 @@ async function walk(
     entries = await readdir(currentPath, { withFileTypes: true });
   } catch {
     return;
+  }
+
+  if (workspaceRoot !== undefined) {
+    const collisions = findCanonicalNameCollisions(
+      currentPath,
+      entries.map((entry) => entry.name),
+    );
+    if (collisions.length > 0) {
+      throw new EngineError(
+        "Directory contains colliding canonical file names",
+        {
+          code: "ZVEC_GREP.ENGINE.SCANNER.CANONICAL_NAME_COLLISION",
+          context: collisions
+            .map(
+              (collision) =>
+                `${collision.kind} directory=${collision.directory} names=${collision.names.join(",")}`,
+            )
+            .join(" "),
+        },
+      );
+    }
   }
 
   for (const entry of entries) {
@@ -637,6 +682,12 @@ async function walk(
       if (!realDirectory || visitedDirectories.has(realDirectory)) {
         continue;
       }
+      if (
+        workspaceRoot !== undefined &&
+        !isPathInside(workspaceRoot, realDirectory)
+      ) {
+        continue;
+      }
       visitedDirectories.add(realDirectory);
       await walk(
         workspaceIndexId,
@@ -650,6 +701,7 @@ async function walk(
         depth + 1,
         signal,
         knownFiles,
+        workspaceRoot,
       );
       continue;
     }
@@ -686,12 +738,29 @@ async function walk(
       continue;
     }
 
+    if (
+      workspaceRoot !== undefined &&
+      entry.isSymbolicLink() &&
+      rootPath.follow
+    ) {
+      const realFile = await realpath(absolutePath).catch(() => null);
+      if (realFile !== null && !isPathInside(workspaceRoot, realFile)) {
+        recordSkippedFile(diagnostics, {
+          absolutePath,
+          relativePath,
+          reason: "escapes_workspace",
+        });
+        continue;
+      }
+    }
+
     const file = await readFileInfo(
       workspaceIndexId,
       rootPath,
       absolutePath,
       diagnostics,
       knownFiles,
+      workspaceRoot,
     );
     throwIfAborted(signal);
     if (file) {
@@ -1077,6 +1146,7 @@ async function readFileInfo(
   absolutePath: string,
   diagnostics: FileScanDiagnostics,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
+  workspaceRoot?: string,
 ): Promise<FileInfo | null> {
   const info = await stat(absolutePath).catch(() => null);
 
@@ -1087,6 +1157,28 @@ async function readFileInfo(
   const relativePath =
     toDisplayPath(relative(rootPath.absolutePath, absolutePath)) ||
     basename(absolutePath);
+
+  // Portable mode: identity comes from the canonical workspace-relative
+  // path. Files that cannot be placed inside the workspace are excluded.
+  let id: string;
+  let canonicalFields: { canonicalPath?: string } = {};
+  if (workspaceRoot !== undefined) {
+    const canonicalPath = canonicalRelativePath(workspaceRoot, absolutePath);
+    if (canonicalPath === null) {
+      recordSkippedFile(diagnostics, {
+        absolutePath,
+        relativePath,
+        reason: "escapes_workspace",
+        sizeBytes: info.size,
+      });
+      return null;
+    }
+    id = makeCanonicalFileId(workspaceIndexId, canonicalPath);
+    canonicalFields = { canonicalPath };
+  } else {
+    id = makeFileId(workspaceIndexId, absolutePath);
+  }
+
   if (info.size === 0) {
     recordSkippedFile(diagnostics, {
       absolutePath,
@@ -1131,8 +1223,9 @@ async function readFileInfo(
     known.lastModifiedTime === lastModifiedTime
   ) {
     return {
-      id: makeFileId(workspaceIndexId, absolutePath),
+      id,
       absolutePath,
+      ...canonicalFields,
       relativePath,
       rootPath: rootPath.absolutePath,
       sizeBytes: info.size,
@@ -1153,8 +1246,9 @@ async function readFileInfo(
   }
 
   return {
-    id: makeFileId(workspaceIndexId, absolutePath),
+    id,
     absolutePath,
+    ...canonicalFields,
     relativePath,
     rootPath: rootPath.absolutePath,
     sizeBytes: info.size,
@@ -1174,6 +1268,7 @@ export function createScanDiagnostics(): FileScanDiagnostics {
       too_large: 0,
       unsupported: 0,
       binary: 0,
+      escapes_workspace: 0,
     },
     skippedSamples: [],
   };
