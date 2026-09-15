@@ -81,11 +81,7 @@ export type FileInfo = {
 };
 
 export type SkippedFileReason =
-  | "empty"
-  | "too_large"
-  | "unsupported"
-  | "binary"
-  | "escapes_workspace";
+  "empty" | "too_large" | "unsupported" | "binary" | "escapes_workspace";
 
 export type SkippedFile = {
   absolutePath: string;

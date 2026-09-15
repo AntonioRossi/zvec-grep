@@ -66,10 +66,7 @@ test("workspace manifest rejects persisted host bindings", async (t) => {
     updatedTime: now,
   };
 
-  for (const embeddingRuntime of [
-    { apiKey: "secret" },
-    { device: "metal" },
-  ]) {
+  for (const embeddingRuntime of [{ apiKey: "secret" }, { device: "metal" }]) {
     writeWorkspaceManifest(home, { ...base, embeddingRuntime });
     assert.throws(
       () => readWorkspaceManifest(home),

@@ -23,11 +23,7 @@ export function manifestRootPathsFromRuntime(
   resolver: CanonicalPathResolver,
 ): WorkspaceManifestRootPath[] {
   return canonicalizeRootPaths(paths, resolver).map((root) => {
-    const {
-      absolutePath: _absolutePath,
-      canonicalPath,
-      ...options
-    } = root;
+    const { absolutePath: _absolutePath, canonicalPath, ...options } = root;
     return { ...options, path: canonicalPath as string };
   });
 }

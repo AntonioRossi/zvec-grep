@@ -121,9 +121,7 @@ async function runMigrate(parsed: ParsedArgs): Promise<void> {
     );
   }
   const sourceHome = resolve(parsed.positionals[0]!);
-  const destinationRoot = resolve(
-    parsed.positionals[1] ?? dirname(sourceHome),
-  );
+  const destinationRoot = resolve(parsed.positionals[1] ?? dirname(sourceHome));
   const { migrateWorkspaceIndex } = await import("../engine/migrate/index.js");
   const result = await migrateWorkspaceIndex({
     sourceHome,

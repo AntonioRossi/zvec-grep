@@ -1,13 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import {
-  cp,
-  mkdir,
-  readFile,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   ZVecCollectionSchema,
@@ -59,7 +53,9 @@ function oldFileId(indexId, absolutePath) {
 }
 
 function oldFragmentId(oldId, fragmentIndex) {
-  return createHash("sha256").update(`${oldId}\0${fragmentIndex}`).digest("hex");
+  return createHash("sha256")
+    .update(`${oldId}\0${fragmentIndex}`)
+    .digest("hex");
 }
 
 function indexedString(name, nullable = false) {
@@ -92,7 +88,11 @@ function legacyFilesSchema() {
       indexedString("content_hash", true),
       indexedString("kind"),
       indexedString("format"),
-      { name: "has_index_status", dataType: ZVecDataType.BOOL, nullable: false },
+      {
+        name: "has_index_status",
+        dataType: ZVecDataType.BOOL,
+        nullable: false,
+      },
       { name: "indexed_time", dataType: ZVecDataType.INT64, nullable: true },
       { name: "entity_count", dataType: ZVecDataType.INT32, nullable: false },
       { name: "token_count", dataType: ZVecDataType.INT32, nullable: true },
@@ -118,7 +118,10 @@ async function buildLegacyHome(v2Root, legacyHome, indexId) {
 
   const legacyPaths = resolveWorkspaceIndexStoragePaths(legacyHome);
   mkdir(legacyPaths.storagePath, { recursive: true });
-  const dstFiles = ZVecCreateAndOpen(legacyPaths.filesPath, legacyFilesSchema());
+  const dstFiles = ZVecCreateAndOpen(
+    legacyPaths.filesPath,
+    legacyFilesSchema(),
+  );
   const dstEntities = ZVecCreateAndOpen(
     legacyPaths.indexPath,
     createEntitiesSchema(EMBEDDING),
@@ -143,7 +146,8 @@ async function buildLegacyHome(v2Root, legacyHome, indexId) {
     const entityIds = JSON.parse(doc.fields.entity_ids_json).map((id) =>
       legacyFragmentIds.get(id),
     );
-    const { canonical_path: _legacyField, ...legacyFields } = doc.fields;
+    const legacyFields = { ...doc.fields };
+    delete legacyFields.canonical_path;
     dstFiles.insertSync({
       id: legacyFileIds.get(doc.id),
       fields: {
@@ -210,7 +214,10 @@ test("migration converts a legacy index preserving vectors and relationships", a
 
   // A real index provides authentic entity content and vectors.
   const model = new FakeEmbeddingModel();
-  const service = await createZvecGrep({ root: sourceRoot, embeddingModel: model });
+  const service = await createZvecGrep({
+    root: sourceRoot,
+    embeddingModel: model,
+  });
   await service.index();
   await service.close();
   const v2Manifest = readWorkspaceManifest(join(sourceRoot, ".zvec-grep"));
@@ -348,7 +355,10 @@ test("migration refuses to overwrite an existing destination", async (t) => {
   const parent = await createTemporaryDirectory(t, "zg-migrate-guard-");
   const sourceRoot = join(parent, "original");
   await mkdir(join(sourceRoot, "docs"), { recursive: true });
-  await writeFile(join(sourceRoot, "docs", "guide.md"), FIXTURES["docs/guide.md"]);
+  await writeFile(
+    join(sourceRoot, "docs", "guide.md"),
+    FIXTURES["docs/guide.md"],
+  );
   const service = await createZvecGrep({
     root: sourceRoot,
     embeddingModel: new FakeEmbeddingModel(),
