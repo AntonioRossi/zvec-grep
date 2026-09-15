@@ -11,11 +11,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import {
-  ZVecInitialize,
-  ZVecLogLevel,
-  ZVecOpen,
-} from "@zvec/zvec";
+import { ZVecInitialize, ZVecLogLevel, ZVecOpen } from "@zvec/zvec";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
 import { migrateWorkspaceIndex } from "../../dist/engine/migrate/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../../dist/engine/storage/layout.js";

@@ -256,10 +256,7 @@ export async function scanFilePath(
     if (workspaceRealRoot !== undefined) {
       // Real containment covers the leaf and every intermediate symlink.
       const realFile = await realpath(absolutePath).catch(() => null);
-      if (
-        realFile !== null &&
-        !isPathInside(workspaceRealRoot, realFile)
-      ) {
+      if (realFile !== null && !isPathInside(workspaceRealRoot, realFile)) {
         recordSkippedFile(diagnostics, {
           absolutePath,
           relativePath: toDisplayPath(

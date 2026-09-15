@@ -127,7 +127,9 @@ export async function exportWorkspaceIndex(
       ZVecOpen(sourcePaths.indexPath, { readOnly: true }),
     );
     const fileDocs = [...sourceFiles.iterDocsSync({ includeVector: false })];
-    const entityDocs = [...sourceEntities.iterDocsSync({ includeVector: true })];
+    const entityDocs = [
+      ...sourceEntities.iterDocsSync({ includeVector: true }),
+    ];
 
     const rawManifest = readJsonFileSync<unknown>(
       join(sourceHome, "manifest.json"),
@@ -173,8 +175,11 @@ export async function exportWorkspaceIndex(
               originalRoot,
             ),
             entity_ids_json: JSON.stringify(
-              (JSON.parse(String(doc.fields.entity_ids_json ?? "[]")) as string[])
-                .map((old) => fragmentIdByOld.get(old) ?? old),
+              (
+                JSON.parse(
+                  String(doc.fields.entity_ids_json ?? "[]"),
+                ) as string[]
+              ).map((old) => fragmentIdByOld.get(old) ?? old),
             ),
           },
         });
@@ -201,7 +206,10 @@ export async function exportWorkspaceIndex(
         throw transferError("Index manifest not found", sourceHome);
       }
       if (!manifest.embedding) {
-        throw transferError("Workspace has no built index to export", sourceHome);
+        throw transferError(
+          "Workspace has no built index to export",
+          sourceHome,
+        );
       }
       for (const doc of fileDocs) {
         writer.writeDoc("files", { id: doc.id, fields: { ...doc.fields } });
@@ -218,9 +226,13 @@ export async function exportWorkspaceIndex(
     }
 
     writer.finish();
-    writeJsonFileSync(join(options.artifactPath, "manifest.json"), portableManifest, {
-      fileMode: 0o600,
-    });
+    writeJsonFileSync(
+      join(options.artifactPath, "manifest.json"),
+      portableManifest,
+      {
+        fileMode: 0o600,
+      },
+    );
     const formatFile: TransferFormatFile = {
       format: TRANSFER_FORMAT,
       formatVersion: TRANSFER_FORMAT_VERSION,
@@ -320,9 +332,10 @@ export async function importWorkspaceIndex(
       ),
     );
 
-    const fileDocs = await readJsonLines<{ id: string; fields: Record<string, unknown> }>(
-      join(artifactPath, "files.jsonl"),
-    );
+    const fileDocs = await readJsonLines<{
+      id: string;
+      fields: Record<string, unknown>;
+    }>(join(artifactPath, "files.jsonl"));
     const entityDocs = await readJsonLines<{
       id: string;
       fields: Record<string, unknown>;
@@ -341,7 +354,10 @@ export async function importWorkspaceIndex(
     const resolver = createCanonicalPathResolver(destinationRoot);
     const missingFiles: string[] = [];
     for (const doc of fileDocs) {
-      assertInsertOk(destFiles.insertSync({ id: doc.id, fields: doc.fields }), doc.id);
+      assertInsertOk(
+        destFiles.insertSync({ id: doc.id, fields: doc.fields }),
+        doc.id,
+      );
       const canonicalPath = String(doc.fields.canonical_path ?? "");
       const existence = resolver.resolveDetailedSync(canonicalPath);
       if (existence.status === "forbidden") {
@@ -531,7 +547,10 @@ function vectorToBase64(vector: unknown): string {
 function base64ToVector(encoded: string): Float32Array {
   const buffer = Buffer.from(encoded, "base64");
   return new Float32Array(
-    buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+    buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength,
+    ),
   );
 }
 

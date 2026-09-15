@@ -19,10 +19,7 @@ const NFD_E = "é";
 test("canonicalFromRelative normalizes separators, dots and Unicode", () => {
   assert.equal(canonicalFromRelative("a/b/c.md"), "a/b/c.md");
   assert.equal(canonicalFromRelative("./a//b/"), "a/b");
-  assert.equal(
-    canonicalFromRelative(`a/caf${NFD_E}.md`),
-    `a/caf${NFC_E}.md`,
-  );
+  assert.equal(canonicalFromRelative(`a/caf${NFD_E}.md`), `a/caf${NFC_E}.md`);
 });
 
 test("canonicalRelativePath rejects paths outside the workspace", () => {
@@ -137,10 +134,7 @@ test("findCanonicalNameCollisions detects Unicode and case groups", () => {
   const caseCollision = collisions.find(
     (c) => c.kind === "case" && c.names.includes("README.md"),
   );
-  assert.deepEqual(unicode?.names.sort(), [
-    `caf${NFD_E}.md`,
-    `caf${NFC_E}.md`,
-  ]);
+  assert.deepEqual(unicode?.names.sort(), [`caf${NFD_E}.md`, `caf${NFC_E}.md`]);
   assert.deepEqual(caseCollision?.names.sort(), ["README.md", "readme.md"]);
 });
 
