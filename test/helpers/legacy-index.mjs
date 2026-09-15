@@ -25,7 +25,9 @@ function oldFileId(indexId, absolutePath) {
 }
 
 function oldFragmentId(oldId, fragmentIndex) {
-  return createHash("sha256").update(`${oldId}\0${fragmentIndex}`).digest("hex");
+  return createHash("sha256")
+    .update(`${oldId}\0${fragmentIndex}`)
+    .digest("hex");
 }
 
 function indexedString(name, nullable = false) {
@@ -58,7 +60,11 @@ export function legacyFilesSchema() {
       indexedString("content_hash", true),
       indexedString("kind"),
       indexedString("format"),
-      { name: "has_index_status", dataType: ZVecDataType.BOOL, nullable: false },
+      {
+        name: "has_index_status",
+        dataType: ZVecDataType.BOOL,
+        nullable: false,
+      },
       { name: "indexed_time", dataType: ZVecDataType.INT64, nullable: true },
       { name: "entity_count", dataType: ZVecDataType.INT32, nullable: false },
       { name: "token_count", dataType: ZVecDataType.INT32, nullable: true },
@@ -91,7 +97,10 @@ export async function buildLegacyHome(
 
   const legacyPaths = resolveWorkspaceIndexStoragePaths(legacyHome);
   await mkdir(legacyPaths.storagePath, { recursive: true });
-  const dstFiles = ZVecCreateAndOpen(legacyPaths.filesPath, legacyFilesSchema());
+  const dstFiles = ZVecCreateAndOpen(
+    legacyPaths.filesPath,
+    legacyFilesSchema(),
+  );
   const dstEntities = ZVecCreateAndOpen(
     legacyPaths.indexPath,
     createEntitiesSchema(LEGACY_EMBEDDING),
@@ -175,5 +184,12 @@ export async function buildLegacyHome(
     }),
     { mode: 0o600 },
   );
-  return { fileCount: fileDocs.length, entityCount: entityDocs.length, fileDocs, entityDocs, legacyFragmentIds, legacyFileIds };
+  return {
+    fileCount: fileDocs.length,
+    entityCount: entityDocs.length,
+    fileDocs,
+    entityDocs,
+    legacyFragmentIds,
+    legacyFileIds,
+  };
 }

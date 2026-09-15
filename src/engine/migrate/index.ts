@@ -169,7 +169,9 @@ export async function migrateWorkspaceIndex(
       ZVecOpen(sourcePaths.indexPath, { readOnly: true }),
     );
     const fileDocs = [...sourceFiles.iterDocsSync({ includeVector: false })];
-    const entityDocs = [...sourceEntities.iterDocsSync({ includeVector: true })];
+    const entityDocs = [
+      ...sourceEntities.iterDocsSync({ includeVector: true }),
+    ];
 
     // Remap file identities to canonical workspace-relative paths.
     report("remap", "Remapping file identities");

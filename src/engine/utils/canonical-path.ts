@@ -1,6 +1,6 @@
 import { readdirSync, realpathSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { EngineError } from "../errors.js";
 import { sha256Text } from "./hash.js";
 import { isPathInside, normalizePath } from "./path.js";

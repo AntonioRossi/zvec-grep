@@ -1,12 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import {
-  cp,
-  mkdir,
-  readFile,
-  rename,
-  writeFile,
-} from "node:fs/promises";
+import { cp, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -162,10 +156,7 @@ test("exported legacy v1 index imports in portable form", async (t) => {
   });
   assert.ok(exported.entitiesExported > 0);
 
-  const artifactText = await readFile(
-    join(artifact, "manifest.json"),
-    "utf8",
-  );
+  const artifactText = await readFile(join(artifact, "manifest.json"), "utf8");
   assert.ok(!artifactText.includes("legacy-persisted-secret"));
   assert.ok(!artifactText.includes("metal"));
 

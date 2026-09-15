@@ -1,13 +1,5 @@
 import assert from "node:assert/strict";
-import {
-  cp,
-  mkdir,
-  readFile,
-  rename,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { cp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { createZvecGrep } from "../../dist/index.js";
@@ -35,7 +27,10 @@ test("a saved root replaced by an escaping symlink is rejected on indexing", asy
   await mkdir(C, { recursive: true });
   await mkdir(outside, { recursive: true });
   await writeFiles(C, DOCS);
-  await writeFile(join(outside, "external.md"), "# External\n\nOutside marker.\n");
+  await writeFile(
+    join(outside, "external.md"),
+    "# External\n\nOutside marker.\n",
+  );
 
   const serviceC = await createZvecGrep({
     root: C,
@@ -126,7 +121,10 @@ test("a changed parent symlink is caught when refreshing a copied workspace", as
   await mkdir(E, { recursive: true });
   await mkdir(outside, { recursive: true });
   await writeFiles(E, DOCS);
-  await writeFile(join(outside, "external.md"), "# External\n\nOutside marker.\n");
+  await writeFile(
+    join(outside, "external.md"),
+    "# External\n\nOutside marker.\n",
+  );
 
   const serviceE = await createZvecGrep({
     root: E,
