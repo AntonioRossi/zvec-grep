@@ -49,8 +49,10 @@ its index can be moved or copied to another directory or host and continue to
 work. After a move, the first update verifies content by hash and reuses the
 existing vectors for unchanged files; no re-embedding is needed. Credentials
 and device selection are host-local and are never stored in the manifest.
-Indexes created by earlier versions used absolute paths and can be converted
-with `zg --migrate-index`.
+Remote Embedding grants are keyed by the workspace's absolute root, so a
+relocated workspace re-requests authorization rather than inheriting a grant
+from the old location. Indexes created by earlier versions used absolute paths
+and can be converted with `zg --migrate-index`.
 
 Scope large repositories early:
 
