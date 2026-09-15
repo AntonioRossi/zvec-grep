@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import {
   createZvecGrep,
@@ -90,6 +90,9 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
     case "status":
       await runStatus(parsed);
       return;
+    case "migrate":
+      await runMigrate(parsed);
+      return;
     case "install":
       await runInstall(parsed);
       return;
@@ -109,6 +112,46 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
     case "version":
       throw new Error(`${parsed.command} must be handled before dispatch`);
   }
+}
+
+async function runMigrate(parsed: ParsedArgs): Promise<void> {
+  if (parsed.positionals.length < 1 || parsed.positionals.length > 2) {
+    throw new Error(
+      "zg --migrate-index requires a legacy index home and an optional destination workspace root",
+    );
+  }
+  const sourceHome = resolve(parsed.positionals[0]!);
+  const destinationRoot = resolve(
+    parsed.positionals[1] ?? dirname(sourceHome),
+  );
+  const { migrateWorkspaceIndex } = await import("../engine/migrate/index.js");
+  const result = await migrateWorkspaceIndex({
+    sourceHome,
+    destinationRoot,
+    onProgress: (stage, detail) => console.error(`${stage}: ${detail}`),
+  });
+  console.log(`Migrated index: ${result.destinationHome}`);
+  console.log(
+    `Files: ${result.filesConverted}, fragments: ${result.entitiesConverted}`,
+  );
+  if (result.missingFiles.length > 0) {
+    console.log(
+      `Missing at destination: ${result.missingFiles.length} file(s) (handled by the next incremental update)`,
+    );
+  }
+  if (result.droppedPersistedCredential) {
+    console.log(
+      "Dropped a credential persisted by the legacy format; configure it per session (environment, global config, or explicit option).",
+    );
+  }
+  if (result.droppedPersistedDevice) {
+    console.log(
+      "Dropped a device setting persisted by the legacy format; device selection is host-local now.",
+    );
+  }
+  console.log(
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesResolve ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared)`,
+  );
 }
 
 async function runConfig(parsed: ParsedArgs): Promise<void> {
