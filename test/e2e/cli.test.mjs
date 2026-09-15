@@ -618,6 +618,8 @@ test("CLI completes index, search, explicit refresh, status, and rg workflows", 
     USERPROFILE: home,
     NO_COLOR: "1",
     ZVEC_GREP_EMBEDDING: "qwen/qwen3.7-text-embedding",
+    // Credentials resolve per session; the manifest never persists them.
+    ZVEC_GREP_API_KEY: "test-key",
   };
   await mkdir(join(home, ".zvec-grep"), { recursive: true });
   await writeFile(

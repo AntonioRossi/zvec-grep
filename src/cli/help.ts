@@ -224,6 +224,23 @@ ${formatEnvironmentVariables([
 ])}
 
 See zg --help environment for precedence and Server-mode scope.`;
+    case "migrate":
+      return `Usage:
+  zg --migrate-index <legacy-home> [destination-root]
+
+Convert a legacy (version 1, absolute-path) workspace index into the portable
+format. The source is never modified; the destination is built in a staging
+directory, verified, and only then moved into place. Stored vectors and
+fragment content are preserved; no embedding computation occurs.
+
+Arguments:
+  legacy-home        Path to the legacy .zvec-grep directory
+  destination-root   Workspace root receiving the portable index
+                     (default: the legacy home's parent directory)
+
+Persisted credentials and device settings are not carried over: credentials
+are configured per session (environment, global config, or explicit options)
+and device selection is host-local.`;
     case "status":
       return `Usage:
   zg --status [root] [--mode <direct|server|auto>] [--check-ready] [--debug]

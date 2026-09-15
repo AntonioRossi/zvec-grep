@@ -96,6 +96,7 @@ const MANAGED_RG_OUTPUT_OPTIONS = new Set([
 const ACTION_FLAGS = new Map<string, CliCommand>([
   ["--index", "index"],
   ["--status", "status"],
+  ["--migrate-index", "migrate"],
   ["--install", "install"],
   ["--uninstall", "uninstall"],
   ["--config", "config"],
@@ -107,6 +108,7 @@ const COMMAND_SHAPED_QUERY_WORDS = new Set(["query", "search"]);
 const COMMAND_SHAPED_ACTION_WORDS = new Map<string, string>([
   ["index", "--index"],
   ["status", "--status"],
+  ["migrate", "--migrate-index"],
   ["install", "--install"],
   ["uninstall", "--uninstall"],
   ["config", "--config"],
