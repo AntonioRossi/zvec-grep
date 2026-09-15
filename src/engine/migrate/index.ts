@@ -338,7 +338,8 @@ function verifyDestination(
     ];
     const groups = new Map<string, number>();
     for (const doc of destEntityDocs) {
-      const group = typeof doc.fields.group === "string" ? doc.fields.group : doc.id;
+      const group =
+        typeof doc.fields.group === "string" ? doc.fields.group : doc.id;
       if (doc.id === group) {
         groups.set(group, (groups.get(group) ?? 0) + 1);
       } else if (!groups.has(group)) {
@@ -351,8 +352,9 @@ function verifyDestination(
     const inventoriesResolve = [
       ...destFiles.iterDocsSync({ includeVector: false }),
     ].every((doc) =>
-      (JSON.parse(String(doc.fields.entity_ids_json ?? "[]")) as string[])
-        .every((id) => destEntityIds.has(id)),
+      (
+        JSON.parse(String(doc.fields.entity_ids_json ?? "[]")) as string[]
+      ).every((id) => destEntityIds.has(id)),
     );
 
     const vectorByNewId = new Map(
@@ -432,7 +434,7 @@ function vectorToArray(vector: unknown): number[] | null {
     return null;
   }
   if (Array.isArray(vector)) {
-    return vector;
+    return vector.map((value) => Number(value));
   }
   if (ArrayBuffer.isView(vector)) {
     return Array.from(vector as Float32Array);

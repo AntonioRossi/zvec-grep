@@ -48,7 +48,8 @@ test("scanned file identity is root-independent within the workspace", async (t)
   const legacy = await scanRootPaths(
     "index-id",
     [{ absolutePath: root, recursive: true }],
-    {});
+    {},
+  );
   assert.notEqual(
     legacy.files.find((file) => file.relativePath.endsWith("one.md"))?.id,
     idFromWorkspace,

@@ -43,8 +43,14 @@ and log directories are excluded by default, as are files ignored by the
 repository's ignore rules.
 
 The main workspace files are `manifest.json`, `files.zvec`, and `index.zvec`.
-The manifest stores index metadata and the workspace Embedding runtime settings,
-including an API key when one was explicitly persisted for that workspace.
+The manifest stores portable index metadata: file identities derive from
+workspace-relative canonical paths, not absolute locations, so a workspace and
+its index can be moved or copied to another directory or host and continue to
+work. After a move, the first update verifies content by hash and reuses the
+existing vectors for unchanged files; no re-embedding is needed. Credentials
+and device selection are host-local and are never stored in the manifest.
+Indexes created by earlier versions used absolute paths and can be converted
+with `zg --migrate-index`.
 
 Scope large repositories early:
 

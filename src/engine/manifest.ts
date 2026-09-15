@@ -125,8 +125,7 @@ export function workspaceIndexInfoFromManifest(
       const { path, ...options } = root;
       return {
         ...options,
-        absolutePath:
-          resolver.resolveSync(path) ?? join(location.root, path),
+        absolutePath: resolver.resolveSync(path) ?? join(location.root, path),
         canonicalPath: path,
       };
     }),

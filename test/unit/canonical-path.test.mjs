@@ -20,10 +20,7 @@ const NFD_E = "e\u0301";
 test("canonicalFromRelative normalizes separators, dots and Unicode", () => {
   assert.equal(canonicalFromRelative("a/b/c.md"), "a/b/c.md");
   assert.equal(canonicalFromRelative("./a//b/"), "a/b");
-  assert.equal(
-    canonicalFromRelative(`a/caf${NFD_E}.md`),
-    `a/caf${NFC_E}.md`,
-  );
+  assert.equal(canonicalFromRelative(`a/caf${NFD_E}.md`), `a/caf${NFC_E}.md`);
 });
 
 test("canonicalRelativePath rejects paths outside the workspace", () => {
@@ -85,10 +82,7 @@ test("resolver rejects ambiguous NFC collisions", async (t) => {
   await writeFile(join(root, "docs", `caf${NFC_E}.md`), "nfc");
   await writeFile(join(root, "docs", `caf${NFD_E}.md`), "nfd");
   const resolver = createCanonicalPathResolver(root);
-  assert.throws(
-    () => resolver.resolveSync(`docs/caf${NFC_E}.md`),
-    /ambiguous/,
-  );
+  assert.throws(() => resolver.resolveSync(`docs/caf${NFC_E}.md`), /ambiguous/);
 });
 
 test("findCanonicalNameCollisions detects Unicode and case groups", () => {
@@ -103,10 +97,7 @@ test("findCanonicalNameCollisions detects Unicode and case groups", () => {
   const caseCollision = collisions.find(
     (c) => c.kind === "case" && c.names.includes("README.md"),
   );
-  assert.deepEqual(unicode?.names.sort(), [
-    `caf${NFD_E}.md`,
-    `caf${NFC_E}.md`,
-  ]);
+  assert.deepEqual(unicode?.names.sort(), [`caf${NFD_E}.md`, `caf${NFC_E}.md`]);
   assert.deepEqual(caseCollision?.names.sort(), ["README.md", "readme.md"]);
 });
 

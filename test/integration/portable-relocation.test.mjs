@@ -292,12 +292,18 @@ test("edit, add, delete and rename behave incrementally without orphans", async 
   assert.equal(status.status?.filesPending ?? 1, 0);
   assert.equal(status.status?.filesFailed ?? 1, 0);
 
-  const renamed = await service.context({ query: "configuration device", limit: 5 });
+  const renamed = await service.context({
+    query: "configuration device",
+    limit: 5,
+  });
   assert.ok(
     hitPaths(renamed).some((file) => file.endsWith("docs/renamed.md")),
     "renamed file must be searchable",
   );
-  const removed = await service.context({ query: "normalizeEndpoint", limit: 5 });
+  const removed = await service.context({
+    query: "normalizeEndpoint",
+    limit: 5,
+  });
   assert.ok(
     !hitPaths(removed).some((file) => file.endsWith("src/util.ts")),
     "deleted file must not be searchable",

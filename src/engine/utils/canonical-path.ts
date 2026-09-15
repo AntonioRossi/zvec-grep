@@ -67,8 +67,7 @@ export function isCanonicalRelativePath(value: string): boolean {
   return value
     .split("/")
     .every(
-      (segment) =>
-        segment.length > 0 && segment !== "." && segment !== "..",
+      (segment) => segment.length > 0 && segment !== "." && segment !== "..",
     );
 }
 
