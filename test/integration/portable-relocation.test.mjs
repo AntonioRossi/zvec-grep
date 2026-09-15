@@ -14,15 +14,10 @@ import test from "node:test";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
 import { createZvecGrep } from "../../dist/index.js";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
-import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
+import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
+import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
 
-class CountingEmbeddingModel extends FakeEmbeddingModel {
-  counts = { document: 0, query: 0 };
-  async doEmbed(contents, options) {
-    this.counts[options?.purpose ?? "document"] += contents.length;
-    return super.doEmbed(contents, options);
-  }
-}
+useIsolatedZvecGrepHome();
 
 const FIXTURES = {
   "docs/guide.md": [
@@ -236,19 +231,21 @@ test("reconciliation detects changed content with unchanged size and mtime", asy
 
   await cp(A, B, { recursive: true });
 
-  // Same size, same mtime, different content at B.
+  // Same size, same mtime, different content at B. The indexed stat values
+  // are captured BEFORE the edit and restored exactly afterwards.
   const target = join(B, "notes", "plain.txt");
+  const indexedStat = await stat(target);
   const original = await readFile(target, "utf8");
   const replaced = original.replace("portable", "PORTABLE");
   assert.equal(replaced.length, original.length);
   await writeFile(target, replaced);
-  const before = await stat(target);
-  await utimes(target, before.atime, before.mtime);
+  await utimes(target, indexedStat.atime, indexedStat.mtime);
 
   const modelB = new CountingEmbeddingModel();
   const serviceB = await createZvecGrep({ root: B, embeddingModel: modelB });
-  // Explicit index: the first run after a binding change reconciles by
-  // hashing content instead of trusting the stored stat metadata.
+  // Explicit index: the relocated copy has no established binding, so the
+  // run reconciles by hashing content instead of trusting stored stat
+  // metadata. The same-stat edit must be detected.
   const result = await serviceB.index();
   assert.ok(
     result.filesModified >= 1,
@@ -259,6 +256,10 @@ test("reconciliation detects changed content with unchanged size and mtime", asy
   );
   const search = await serviceB.context({ query: "PORTABLE", limit: 3 });
   assert.ok(search.items.length > 0);
+  assert.ok(
+    hitPaths(search).some((file) => file.endsWith("notes/plain.txt")),
+    "the same-stat edit must be searchable after reconciliation",
+  );
   await serviceB.close();
 });
 

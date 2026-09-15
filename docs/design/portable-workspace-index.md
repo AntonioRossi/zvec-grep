@@ -30,16 +30,23 @@ unchanged documents**. Query embedding remains a normal per-search operation.
    from user-supplied strings alone.
 3. **Resolution** (CRP → current absolute path): per-segment lookup against the
    current filesystem. For each segment, read the containing directory and
-   select the entry whose NFC form equals the segment. Zero matches means the
-   file is missing; more than one is a collision error. This handles
-   filesystems that store a different Unicode form than the canonical one.
+   select the entry whose NFC form equals the segment. Resolution is
+   tri-state: **ok**, **missing** (no entry), or **forbidden** (an entry
+   exists but escapes the workspace through a symlink, including any
+   intermediate component). A forbidden result is an explicit containment
+   error; no caller may reconstruct a readable pathname for it. A display
+   fallback is permitted for genuinely missing files only.
 4. **Collision rejection**: during scanning, two entries in one directory whose
    NFC forms are equal, or whose case-folded NFC forms are equal, are an
    explicit scan error naming both. This protects case-insensitive and
    normalizing destination filesystems.
 5. **Containment**: a stored CRP that would resolve outside the workspace root
-   (through `..` or a symlink) is rejected. A scanned entry whose symlink
-   target escapes the workspace root is excluded with an explicit diagnostic.
+   (through `..` or a symlink) is rejected. Persisted roots are re-validated
+   for real containment at every scan and at open; a pre-set canonical path
+   never bypasses the check. A scanned entry whose symlink target escapes the
+   workspace root is excluded with an explicit diagnostic. Backslashes are not
+   valid in stored portable data, so it cannot change meaning across
+   platforms' separators.
 6. `/` is the stored separator on every platform, including Windows.
 
 ## 3. Persistent identities
@@ -63,15 +70,15 @@ unchanged documents**. Query embedding remains a normal per-search operation.
 The manifest (format version 2) stores only portable data:
 
 - `id`, `name`, `manifestVersion: 2`
-- `rootPaths`: scan roots as CRPs with their existing selection options
+- `rootPaths`: scan roots as CRPs with their existing selection options;
+  ignore-file references are also stored as CRPs and resolved against the
+  current workspace with containment checks
 - `indexPolicy`, `embedding` (provider, model, dimension, metric — the
   endpoint stays part of the embedding identity per current rebuild rules),
   `indexVersion`, `createdTime`, `updatedTime`
-- `rootFingerprint`: `sha256hex(NFC canonical absolute workspace root)` — a
-  one-way relocation token, not a usable path (§5)
 
 The manifest does **not** store: its own absolute location, absolute root
-paths, `device`, or `apiKey`.
+paths, `device`, `apiKey`, or any verification claim.
 
 - **Storage location**: always the discovered `<workspace>/.zvec-grep`. A
   persisted location is unnecessary and is removed; the stale-binding failure
@@ -81,24 +88,36 @@ paths, `device`, or `apiKey`.
 - **Credentials**: `apiKey` is never persisted in the manifest. Remote
   providers resolve credentials per session from explicit options, environment,
   or global configuration, as they already can.
+- **Verification**: content-verification state lives in a host-local binding
+  store in the global home (never inside the workspace), keyed by index UUID
+  and physical binding. Transferred indexes therefore carry no verification
+  claim at all (§5).
 - **Locks and runtime caches**: remain keyed by the canonical physical root
   (existing daemon behavior). Two copies of one index on a single host are two
   distinct physical roots and never share a writer or storage handle.
 
 ## 5. Rebind reconciliation
 
-1. On open, all persisted paths are interpreted relative to the current
-   workspace root. The current `rootFingerprint` is recomputed; a mismatch
-   with the stored fingerprint marks the index **unverified**.
-2. The next indexing run on an unverified index performs a **reconciliation
-   pass**: every scanned file that matches a stored record by file ID is
-   content-hashed regardless of size/mtime agreement.
+1. Verification state is a **host-local binding record** (global home, keyed
+   by index UUID, bounded in size): the physical workspace binding (realpath
+   and filesystem identity) plus the time it was content-verified. It is
+   excluded from transfer artifacts by construction.
+2. An index is **unverified** whenever the current binding cannot be
+   established against the record — missing, mismatched, or unreadable. Any
+   doubt means unverified; no token inside the transferred data is trusted.
+   Status and freshness logic report unverified indexes as needing refresh.
+3. The next indexing run on an unverified index performs a **reconciliation
+   pass** (always a complete pass, never changed-paths-only): every scanned
+   file that matches a stored record by file ID is content-hashed regardless
+   of size/mtime agreement.
    - Identical content: the record and its vectors are reused. Stored size and
      mtime metadata are refreshed. No embedding calls occur.
    - Changed content: normal incremental handling.
    - Missing files: normal deletion handling.
-3. When reconciliation completes, the new fingerprint is stored.
-4. Acceptance: unchanged relocated content causes **zero** document-embedding
+4. The binding record is published **only after** a successful reconciliation.
+   Migrated and imported indexes start unverified and reconcile at their
+   first indexing run.
+5. Acceptance: unchanged relocated content causes **zero** document-embedding
    calls. Query embedding is separate and expected.
 
 ## 6. Version gates and migration
@@ -110,36 +129,53 @@ paths, `device`, or `apiKey`.
 2. `indexVersion` is bumped for the new files-collection schema (CRP identity,
   no persisted absolute path). Old executables reject the new storage through
    the existing version check.
-3. **Converter**: an explicit operation that reads a **closed** version-1
-   index, validates the original source-root mapping, computes CRPs, and
-   writes a separate version-2 destination:
+3. **Converter**: an explicit operation (`zg --migrate-index <legacy-home>
+   <destination-root>`; the destination is required) that reads a **closed**
+   version-1 index under a lock acquired before any read, validates the
+   original source-root mapping, computes CRPs, and writes a separate
+   version-2 destination in an exclusive staging directory:
    - full ID remapping (file IDs, fragment IDs, group references,
      `entity_ids_json` inventories) with the index UUID preserved — the
      accepted decision; no permanent lookup table;
-   - stored vectors and fragment content preserved byte-exactly;
-   - verification of the destination (file and entity counts, group integrity,
-     sample vector equality, sample searches) before activation;
-   - the source is never modified; an interrupted or rejected conversion
-     leaves it usable.
+   - stored vectors and fragment content preserved byte-exactly, with native
+     write statuses checked;
+   - verification of the destination before activation: counts, unique
+     remapped identities, per-file ownership, exact public inventories,
+     single-file groups with exactly one owned major, and vector equality
+     (sampled checks are named as such);
+   - every opened handle is closed in exception-safe finalizers; the source
+     is never modified; an interrupted or rejected conversion leaves no
+     staging residue and the source usable; the destination is re-validated
+     for ownership immediately before publication;
+   - the migrated index starts **unverified** and reconciles at its first
+     indexing run.
 
 ## 7. Export and import (logical portability)
 
-Logical export/import is the required fallback if native database files do not
-survive cross-platform transfer, and it is the converter's substrate.
+Logical export/import (`zg --export-index` / `zg --import-index`) is the
+required route when native database files do not cross platforms. Export
+works from a legacy (v1) or portable (v2) source; import needs only the
+artifact, never the source database.
 
-1. **Consistency**: the source is closed, or writers are excluded across both
-   collections and the manifest for the whole export. Per-collection snapshots
-   under live writes do not establish whole-index consistency.
+1. **Consistency**: the source is read under a lock acquired before any read,
+   excluding writers across both collections and the manifest for the whole
+   export.
 2. **Completeness**: the entities collection is iterated directly (not through
-   the public per-file inventory), so secondary fragments and their vectors are
-   included.
-3. **Artifact**: format version, embedding schema, all scalar fields, fragment
-   content, and vectors. No credential material: the manifest is exported in
-   version-2 form (no absolute location, no device, no API key).
+   the public per-file inventory), so secondary fragments and their vectors
+   are included.
+3. **Artifact**: a versioned directory — `format.json` (format version,
+   embedding schema, declared counts), `manifest.json` in portable v2 form
+   (no absolute location, no device, no API key, no verification claim), and
+   `files.jsonl` / `entities.jsonl` with every scalar field, fragment
+   content, relationships, and vectors (base64).
 4. **Import**: recreate collections with identical schema, metric, and
-   dimension; batch-insert preserving or remapping IDs; finalize; verify
-   counts, spot vector equality, and sample queries. Import pays structure
-   rebuild, never inference.
+   dimension in an exclusive staging directory; insert with status checks;
+   run the same verification as migration (counts, unique identities,
+   ownership, exact inventories, group integrity, vector equality); publish
+   by rename after re-checking destination ownership. Import pays structure
+   rebuild, never inference, and the imported index starts unverified.
+5. **Boundary proof**: import runs in a separate process with the source
+   unavailable, reading only the serialized artifact.
 
 ## 8. Test obligations
 
@@ -149,21 +185,32 @@ survive cross-platform transfer, and it is the converter's substrate.
   modify A.
 - Timestamp-only changes: existing vectors reused.
 - Changed content with unchanged size/timestamp: detected by the
-  reconciliation pass.
+  reconciliation pass (the test restores the indexed stat values captured
+  before the edit).
 - Edit, add, delete, rename: correct incremental behavior without stale or
   orphaned records.
 - Multilingual filenames, NFD/NFC forms, case collisions: correct resolution
   or explicit rejection.
+- Containment through storage and search operations, not only the resolver:
+  saved roots or directories swapped for escaping symlinks are explicit
+  errors; impostor files sharing an indexed name are never served; ignore
+  files that escape are rejected.
 - Symlink escaping the workspace: exclusion with diagnostic.
 - Two live copies sharing an index UUID: concurrent use without shared locks
   or handles.
 - Old executable vs new format and new executable vs old format: clear
   rejection/migration guidance.
-- Conversion: vectors and content preserved, relationships intact, source
-  untouched after interruption or invalid input.
-- Transfer artifacts contain no credential material.
-- Optional: native macOS→Linux open probe. Not required if the logical route
-  passes.
+- Conversion and import: vectors and content preserved, relationships intact
+  (ownership, exact inventories, single-file groups, unique identities),
+  source untouched after interruption (no leaked descriptors, no staging
+  residue) or invalid input, successful retry, corrupt relationship graphs
+  rejected before activation.
+- Transfer artifacts contain no credential material and no verification
+  claim; imported/migrated indexes start unverified and reconcile.
+- Import in a separate process with the source unavailable, reading only the
+  artifact, with asserted zero inference.
+- Optional: native macOS→Linux open probe. Not required while the logical
+  route passes.
 
 ## 9. Non-goals for version 1
 

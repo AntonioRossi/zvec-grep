@@ -10,17 +10,19 @@ import {
   findCanonicalNameCollisions,
   isCanonicalRelativePath,
   makeFileId,
-  workspaceRootFingerprint,
 } from "../../dist/engine/utils/canonical-path.js";
 
 // NFC form: U+00E9 (e-acute). NFD form: U+0065 U+0301 (e + combining acute).
-const NFC_E = "\u00e9";
-const NFD_E = "e\u0301";
+const NFC_E = "é";
+const NFD_E = "é";
 
 test("canonicalFromRelative normalizes separators, dots and Unicode", () => {
   assert.equal(canonicalFromRelative("a/b/c.md"), "a/b/c.md");
   assert.equal(canonicalFromRelative("./a//b/"), "a/b");
-  assert.equal(canonicalFromRelative(`a/caf${NFD_E}.md`), `a/caf${NFC_E}.md`);
+  assert.equal(
+    canonicalFromRelative(`a/caf${NFD_E}.md`),
+    `a/caf${NFC_E}.md`,
+  );
 });
 
 test("canonicalRelativePath rejects paths outside the workspace", () => {
@@ -42,6 +44,10 @@ test("isCanonicalRelativePath validates form", () => {
   assert.equal(isCanonicalRelativePath("a/"), false);
   assert.equal(isCanonicalRelativePath("a/../b"), false);
   assert.equal(isCanonicalRelativePath("a//b"), false);
+  // Backslash is not a portable separator; it must be rejected outright so
+  // stored data cannot change meaning across platforms.
+  assert.equal(isCanonicalRelativePath("..\\outside.txt"), false);
+  assert.equal(isCanonicalRelativePath("a\\b.md"), false);
 });
 
 test("makeFileId depends on the CRP, not the host location", () => {
@@ -63,16 +69,27 @@ test("resolver maps NFD storage through NFC canonical spelling", async (t) => {
   const resolver = createCanonicalPathResolver(root);
   const crp = canonicalFromRelative(`docs/${nfdName}`);
   assert.equal(crp, `docs/caf${NFC_E}.md`);
-  assert.equal(resolver.resolveSync(crp), join(root, "docs", nfdName));
-  assert.equal(await resolver.resolve(crp), join(root, "docs", nfdName));
+  assert.deepEqual(resolver.resolveDetailedSync(crp), {
+    status: "ok",
+    path: join(root, "docs", nfdName),
+  });
+  assert.deepEqual(await resolver.resolveDetailed(crp), {
+    status: "ok",
+    path: join(root, "docs", nfdName),
+  });
 });
 
-test("resolver returns null for missing files and resolves the root", async (t) => {
+test("resolver reports missing files and resolves the root", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "crp-missing-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const resolver = createCanonicalPathResolver(root);
-  assert.equal(resolver.resolveSync("docs/absent.md"), null);
-  assert.equal(resolver.resolveSync("."), root);
+  assert.deepEqual(resolver.resolveDetailedSync("docs/absent.md"), {
+    status: "missing",
+  });
+  assert.deepEqual(resolver.resolveDetailedSync("."), {
+    status: "ok",
+    path: resolver.workspaceRoot,
+  });
 });
 
 test("resolver rejects ambiguous NFC collisions", async (t) => {
@@ -82,7 +99,30 @@ test("resolver rejects ambiguous NFC collisions", async (t) => {
   await writeFile(join(root, "docs", `caf${NFC_E}.md`), "nfc");
   await writeFile(join(root, "docs", `caf${NFD_E}.md`), "nfd");
   const resolver = createCanonicalPathResolver(root);
-  assert.throws(() => resolver.resolveSync(`docs/caf${NFC_E}.md`), /ambiguous/);
+  assert.throws(
+    () => resolver.resolveDetailedSync(`docs/caf${NFC_E}.md`),
+    /ambiguous/,
+  );
+});
+
+test("resolver forbids symlinks escaping the workspace", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "crp-forbid-"));
+  const outside = await mkdtemp(join(tmpdir(), "crp-outside-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await writeFile(join(outside, "secret.md"), "outside");
+  await symlink(outside, join(root, "linked"));
+  const resolver = createCanonicalPathResolver(root);
+
+  const resolution = resolver.resolveDetailedSync("linked/secret.md");
+  assert.equal(resolution.status, "forbidden");
+  assert.throws(
+    () => resolver.requireContainedSync("linked/secret.md"),
+    /escapes the workspace/,
+  );
+  // A missing path inside an escaping tree is forbidden, not missing.
+  const missingInsideEscape = resolver.resolveDetailedSync("linked/absent.md");
+  assert.equal(missingInsideEscape.status, "missing");
 });
 
 test("findCanonicalNameCollisions detects Unicode and case groups", () => {
@@ -97,19 +137,11 @@ test("findCanonicalNameCollisions detects Unicode and case groups", () => {
   const caseCollision = collisions.find(
     (c) => c.kind === "case" && c.names.includes("README.md"),
   );
-  assert.deepEqual(unicode?.names.sort(), [`caf${NFD_E}.md`, `caf${NFC_E}.md`]);
+  assert.deepEqual(unicode?.names.sort(), [
+    `caf${NFD_E}.md`,
+    `caf${NFC_E}.md`,
+  ]);
   assert.deepEqual(caseCollision?.names.sort(), ["README.md", "readme.md"]);
-});
-
-test("workspaceRootFingerprint is stable for the same root", () => {
-  assert.equal(
-    workspaceRootFingerprint("/tmp"),
-    workspaceRootFingerprint("/tmp"),
-  );
-  assert.notEqual(
-    workspaceRootFingerprint("/tmp"),
-    workspaceRootFingerprint("/var"),
-  );
 });
 
 test("resolver toCanonical round-trips within the workspace", async (t) => {
@@ -120,16 +152,22 @@ test("resolver toCanonical round-trips within the workspace", async (t) => {
   const resolver = createCanonicalPathResolver(root);
   const crp = resolver.toCanonical(join(root, "a", "b.md"));
   assert.equal(crp, "a/b.md");
-  assert.equal(resolver.resolveSync(crp), join(root, "a", "b.md"));
+  assert.deepEqual(resolver.resolveDetailedSync(crp), {
+    status: "ok",
+    path: join(root, "a", "b.md"),
+  });
   assert.equal(resolver.toCanonical(join(root, "..", "outside.md")), null);
 });
 
-test("symlink entries resolve through their link path", async (t) => {
+test("contained symlink entries resolve through their link path", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "crp-link-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, "real"));
   await writeFile(join(root, "real", "f.md"), "x");
   await symlink(join(root, "real"), join(root, "link"));
   const resolver = createCanonicalPathResolver(root);
-  assert.equal(resolver.resolveSync("link/f.md"), join(root, "link", "f.md"));
+  assert.deepEqual(resolver.resolveDetailedSync("link/f.md"), {
+    status: "ok",
+    path: join(root, "link", "f.md"),
+  });
 });

@@ -51,7 +51,6 @@ export type WorkspaceManifest = {
   indexVersion: number | null;
   createdTime: number;
   updatedTime: number;
-  rootFingerprint?: string;
   embeddingRuntime: WorkspaceManifestEmbeddingRuntime;
 };
 
@@ -123,9 +122,38 @@ export function workspaceIndexInfoFromManifest(
     path: location.home,
     rootPaths: manifest.rootPaths.map((root) => {
       const { path, ...options } = root;
+      const resolution = resolver.resolveDetailedSync(path);
+      if (resolution.status === "forbidden") {
+        throw new EngineError(
+          "Workspace index root escapes the workspace through a symlink",
+          {
+            code: "ZVEC_GREP.ENGINE.MANIFEST.ROOT_ESCAPES_WORKSPACE",
+            context: `root=${path} resolved=${resolution.path}`,
+          },
+        );
+      }
+      const ignoreFiles = root.ignoreFiles?.map((entry) => {
+        const resolved = resolver.resolveDetailedSync(entry);
+        if (resolved.status === "forbidden") {
+          throw new EngineError(
+            "Workspace index ignore file escapes the workspace",
+            {
+              code: "ZVEC_GREP.ENGINE.MANIFEST.ROOT_ESCAPES_WORKSPACE",
+              context: `ignoreFile=${entry} resolved=${resolved.path}`,
+            },
+          );
+        }
+        return resolved.status === "ok"
+          ? resolved.path
+          : join(location.root, entry);
+      });
       return {
         ...options,
-        absolutePath: resolver.resolveSync(path) ?? join(location.root, path),
+        ...(ignoreFiles !== undefined ? { ignoreFiles } : {}),
+        absolutePath:
+          resolution.status === "ok"
+            ? resolution.path
+            : join(location.root, path),
         canonicalPath: path,
       };
     }),
@@ -134,9 +162,6 @@ export function workspaceIndexInfoFromManifest(
     indexVersion: manifest.indexVersion,
     createdTime: manifest.createdTime,
     updatedTime: manifest.updatedTime,
-    ...(manifest.rootFingerprint !== undefined
-      ? { rootFingerprint: manifest.rootFingerprint }
-      : {}),
   };
 }
 
@@ -158,8 +183,7 @@ function isWorkspaceManifest(value: unknown): value is WorkspaceManifest {
     Number.isFinite(value.createdTime) &&
     typeof value.updatedTime === "number" &&
     Number.isFinite(value.updatedTime) &&
-    (value.rootFingerprint === undefined ||
-      isNonEmptyString(value.rootFingerprint)) &&
+    value.rootFingerprint === undefined &&
     isEmbeddingRuntime(value.embeddingRuntime)
   );
 }
@@ -178,7 +202,7 @@ function isRootPath(value: unknown): boolean {
     isOptionalStringArray(value.excludedFileTypes) &&
     isOptionalBoolean(value.hidden) &&
     isOptionalBoolean(value.noIgnore) &&
-    isOptionalStringArray(value.ignoreFiles) &&
+    isOptionalCanonicalArray(value.ignoreFiles) &&
     isOptionalNonNegativeInteger(value.maxDepth) &&
     isOptionalNonNegativeInteger(value.maxFileSizeBytes) &&
     isOptionalBoolean(value.follow)
@@ -217,6 +241,16 @@ function isOptionalStringArray(value: unknown): boolean {
   return (
     value === undefined ||
     (Array.isArray(value) && value.every((item) => typeof item === "string"))
+  );
+}
+
+function isOptionalCanonicalArray(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (Array.isArray(value) &&
+      value.every(
+        (item) => typeof item === "string" && isCanonicalRelativePath(item),
+      ))
   );
 }
 

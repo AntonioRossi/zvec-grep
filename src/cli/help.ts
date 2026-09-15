@@ -226,7 +226,7 @@ ${formatEnvironmentVariables([
 See zg --help environment for precedence and Server-mode scope.`;
     case "migrate":
       return `Usage:
-  zg --migrate-index <legacy-home> [destination-root]
+  zg --migrate-index <legacy-home> <destination-root>
 
 Convert a legacy (version 1, absolute-path) workspace index into the portable
 format. The source is never modified; the destination is built in a staging
@@ -235,12 +235,35 @@ fragment content are preserved; no embedding computation occurs.
 
 Arguments:
   legacy-home        Path to the legacy .zvec-grep directory
-  destination-root   Workspace root receiving the portable index
-                     (default: the legacy home's parent directory)
+  destination-root   Workspace root receiving the portable index (required;
+                     must not already contain a workspace index)
 
-Persisted credentials and device settings are not carried over: credentials
-are configured per session (environment, global config, or explicit options)
-and device selection is host-local.`;
+The migrated index is unverified: its first indexing run reconciles content
+by hash. Persisted credentials and device settings are not carried over:
+credentials are configured per session (environment, global config, or
+explicit options) and device selection is host-local.`;
+    case "export":
+      return `Usage:
+  zg --export-index <index-home> <artifact-dir>
+
+Export a workspace index (legacy or portable format) to a versioned,
+credential-free transfer artifact. The source is never modified and is read
+under a lock that excludes writers. The artifact contains the portable
+manifest, every file record, and every fragment with its vector — no
+credentials and no host bindings. Import it on another host with
+zg --import-index; native database files do not need to cross platforms.`;
+    case "import":
+      return `Usage:
+  zg --import-index <artifact-dir> <destination-root>
+
+Import a transfer artifact written by zg --export-index into native storage
+at the destination workspace. The destination must not already contain a
+workspace index. The import is built in a staging directory, verified
+(counts, identities, ownership, inventories, groups, vectors), and only then
+moved into place. No embedding computation occurs.
+
+The imported index is unverified: its first indexing run reconciles content
+by hash.`;
     case "status":
       return `Usage:
   zg --status [root] [--mode <direct|server|auto>] [--check-ready] [--debug]

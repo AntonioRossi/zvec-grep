@@ -45,10 +45,7 @@ import {
   type WorkspaceManifestEmbeddingRuntime,
   writeWorkspaceManifest,
 } from "../manifest.js";
-import {
-  createCanonicalPathResolver,
-  workspaceRootFingerprint,
-} from "../utils/canonical-path.js";
+import { createCanonicalPathResolver } from "../utils/canonical-path.js";
 import {
   manifestRootPathsFromRuntime,
   validateRootPaths,
@@ -395,9 +392,6 @@ class ZvecGrepService implements ZvecGrep {
           indexVersion: null,
           createdTime: existing?.createdTime ?? now,
           updatedTime: now,
-          ...(existing?.rootFingerprint !== undefined
-            ? { rootFingerprint: existing.rootFingerprint }
-            : {}),
           embeddingRuntime: existing?.embeddingRuntime ?? {},
         });
       });
@@ -632,16 +626,6 @@ class ZvecGrepService implements ZvecGrep {
               onProgress: options.onAutoUpdateProgress,
             });
             timings.addEntries(result.timings, "auto_update_");
-            if (
-              existing.rootFingerprint !==
-              workspaceRootFingerprint(location.root)
-            ) {
-              writeWorkspaceManifest(location.home, {
-                ...existing,
-                rootFingerprint: workspaceRootFingerprint(location.root),
-                updatedTime: Date.now(),
-              });
-            }
           } finally {
             workspaceIndex.close();
           }
@@ -1396,7 +1380,6 @@ function prepareWorkspaceManifest(
     indexVersion: CURRENT_INDEX_VERSION,
     createdTime: existing?.createdTime ?? now,
     updatedTime: now,
-    rootFingerprint: workspaceRootFingerprint(location.root),
     embeddingRuntime,
   };
 }

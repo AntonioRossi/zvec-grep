@@ -11,7 +11,7 @@ import {
   indexWorkspacePaths,
 } from "../pipeline/indexing/index.js";
 import { searchWorkspaceIndex } from "../pipeline/search/index.js";
-import { workspaceRootFingerprint } from "../utils/canonical-path.js";
+import { WorkspaceBindingStore } from "../bindings.js";
 import { dirname } from "node:path";
 import {
   createWorkspaceIndexStorage,
@@ -38,6 +38,7 @@ export class WorkspaceIndex {
   private readonly embedding: WorkspaceIndexEmbeddingSchema;
   private readonly embeddingModel?: EmbeddingModel;
   private readonly workspaceRoot: string;
+  private readonly bindings: WorkspaceBindingStore;
   private closed = false;
 
   constructor(
@@ -54,6 +55,7 @@ export class WorkspaceIndex {
     // The index home lives at <workspace>/.zvec-grep; the workspace root is
     // derived from the current location, never from persisted absolute paths.
     this.workspaceRoot = dirname(info.path);
+    this.bindings = new WorkspaceBindingStore();
 
     if (options.mode === "write") {
       this.storage = createWorkspaceIndexStorage({
@@ -85,21 +87,34 @@ export class WorkspaceIndex {
 
     const embeddingModel = this.requireEmbeddingModel("index");
 
+    // An index is unverified until the host-local binding store proves the
+    // current workspace binding was content-verified. Unverified indexes
+    // reconcile: every matched file is hashed, unchanged content keeps its
+    // vectors, and the binding is recorded only after success.
+    const reconcile = !this.bindings.matches(this.info.id, this.workspaceRoot);
     const context = {
       workspaceIndex: this.info,
       embeddingModel,
       storage: this.storage,
       workspaceRoot: this.workspaceRoot,
-      reconcile:
-        this.info.rootFingerprint !==
-        workspaceRootFingerprint(this.workspaceRoot),
+      reconcile,
       embeddingConcurrency: options.embeddingConcurrency,
       onProgress: options.onProgress,
       signal: options.signal,
     };
-    return options.changedPaths && options.changedPaths.length > 0
-      ? indexWorkspacePaths(context, options.changedPaths)
-      : indexWorkspace(context);
+    const run = reconcile
+      ? // Reconciliation is always a complete pass: partial verification
+        // cannot establish the binding.
+        indexWorkspace(context)
+      : options.changedPaths?.length
+        ? indexWorkspacePaths(context, options.changedPaths)
+        : indexWorkspace(context);
+    return run.then((result) => {
+      if (reconcile) {
+        this.bindings.record(this.info.id, this.workspaceRoot);
+      }
+      return result;
+    });
   }
 
   status(): Promise<WorkspaceIndexStatus> {
@@ -107,6 +122,7 @@ export class WorkspaceIndex {
       this.info,
       this.storage.listFiles(),
       this.workspaceRoot,
+      { unverified: !this.bindings.matches(this.info.id, this.workspaceRoot) },
     );
   }
 
