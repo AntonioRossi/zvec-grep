@@ -237,6 +237,23 @@ export async function scanFilePath(
     if (!followedInfo?.isFile()) {
       continue;
     }
+    if (
+      options.workspaceRoot !== undefined &&
+      targetInfo?.isSymbolicLink() &&
+      root.follow
+    ) {
+      const realFile = await realpath(absolutePath).catch(() => null);
+      if (realFile !== null && !isPathInside(options.workspaceRoot, realFile)) {
+        recordSkippedFile(diagnostics, {
+          absolutePath,
+          relativePath: toDisplayPath(
+            relative(root.absolutePath, absolutePath),
+          ),
+          reason: "escapes_workspace",
+        });
+        continue;
+      }
+    }
     if (!root.recursive && dirname(absolutePath) !== root.absolutePath) {
       continue;
     }
