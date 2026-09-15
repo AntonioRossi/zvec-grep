@@ -790,16 +790,32 @@ function docToFileRecord(
   const canonicalPath = readStringField(doc, "canonical_path");
   const rootCrp = readStringField(doc, "root_path");
 
+  // The display-path fallback applies to genuinely missing files only; a
+  // forbidden (escaping) result is an explicit containment error and no
+  // caller-side reconstruction may produce a readable path for it.
+  const resolveForRead = (crp: string, field: string): string => {
+    const resolution = resolver.resolveDetailedSync(crp);
+    if (resolution.status === "ok") {
+      return resolution.path;
+    }
+    if (resolution.status === "forbidden") {
+      throw new EngineError(
+        "Stored canonical path escapes the workspace through a symlink",
+        {
+          code: "ZVEC_GREP.ENGINE.STORAGE.PATH_ESCAPES_WORKSPACE",
+          context: `field=${field} canonicalPath=${crp} resolved=${resolution.path}`,
+        },
+      );
+    }
+    return normalizePath(join(resolver.workspaceRoot, crp));
+  };
+
   return {
     id: readStringField(doc, "file_id"),
-    absolutePath:
-      resolver.resolveSync(canonicalPath) ??
-      normalizePath(join(resolver.workspaceRoot, canonicalPath)),
+    absolutePath: resolveForRead(canonicalPath, "canonical_path"),
     canonicalPath,
     relativePath: readStringField(doc, "relative_path"),
-    rootPath:
-      resolver.resolveSync(rootCrp) ??
-      normalizePath(join(resolver.workspaceRoot, rootCrp)),
+    rootPath: resolveForRead(rootCrp, "root_path"),
     sizeBytes: readNumberFieldFromFields(fields, "size_bytes"),
     lastModifiedTime: readNumberFieldFromFields(fields, "last_modified_time"),
     contentHash:

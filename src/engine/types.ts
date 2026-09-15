@@ -222,8 +222,6 @@ export type WorkspaceIndexInfo = {
   indexVersion?: number | null;
   createdTime: number;
   updatedTime: number;
-  /** One-way relocation token for the workspace root; never a usable path. */
-  rootFingerprint?: string;
 };
 
 // -----------------------------------------------------------------------------
@@ -293,6 +291,8 @@ export type WorkspaceIndexStatus = {
   filesModified: number;
   filesDeleted: number;
   filesUnchanged: number;
+  /** True when the current workspace binding is not content-verified. */
+  unverified?: boolean;
   pendingFiles: FileInfo[];
   failedFiles: FileInfo[];
   addedFiles: FileInfo[];

@@ -6,12 +6,15 @@ import test from "node:test";
 import { readWorkspaceManifest } from "../dist/engine/manifest.js";
 import { updateGlobalConfig } from "../dist/engine/config.js";
 import { createZvecGrep } from "../dist/index.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 import {
   createRemoteEmbeddingOperationPermit,
   createRemoteEmbeddingTarget,
   withRemoteEmbeddingOperationPermit,
 } from "../dist/authorization/index.js";
 import { createFakeEmbeddingServer } from "./helpers/fake-embedding.mjs";
+
+useIsolatedZvecGrepHome();
 
 test("workspace runtime persists the endpoint but never the key", async (t) => {
   const temporaryDirectory = await mkdtemp(

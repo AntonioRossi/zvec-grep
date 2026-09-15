@@ -26,6 +26,7 @@ import { resolveMaxFileSizeBytes } from "../../../file-size-policy.js";
 import { EngineError } from "../../../errors.js";
 import {
   canonicalRelativePath,
+  createCanonicalPathResolver,
   findCanonicalNameCollisions,
   makeFileId as makeCanonicalFileId,
 } from "../../../utils/canonical-path.js";
@@ -46,6 +47,7 @@ import {
   toDisplayPath,
 } from "../../../utils/path.js";
 import {
+  canonicalizeRootPaths,
   matchesRootExcludePatterns,
   matchesRootPatterns,
   normalizeRootPath,
@@ -196,7 +198,15 @@ export async function scanRootPaths(
   rootPaths: readonly RootPath[],
   options: ScanOptions = {},
 ): Promise<ScanResult> {
-  const validatedRootPaths = validateRootPaths(rootPaths);
+  let validatedRootPaths = validateRootPaths(rootPaths);
+  if (options.workspaceRoot !== undefined) {
+    // Persisted roots are re-validated for real containment at every scan;
+    // a pre-set canonicalPath never bypasses the check.
+    validatedRootPaths = canonicalizeRootPaths(
+      validatedRootPaths,
+      createCanonicalPathResolver(options.workspaceRoot),
+    );
+  }
   const files: FileInfo[] = [];
   const diagnostics = createScanDiagnostics();
   const knownFiles = knownFilesByPath(options.knownFiles);
@@ -226,6 +236,12 @@ export async function scanFilePath(
   const files: FileInfo[] = [];
   const diagnostics = createScanDiagnostics();
   const knownFiles = knownFilesByPath(options.knownFiles);
+  const workspaceRealRoot =
+    options.workspaceRoot === undefined
+      ? undefined
+      : await realpath(options.workspaceRoot).catch(
+          () => options.workspaceRoot,
+        );
   for (const rootPath of matchingRootPaths(rootPaths, absolutePath)) {
     throwIfAborted(options.signal);
     const root = normalizeRootPath(rootPath);
@@ -237,13 +253,13 @@ export async function scanFilePath(
     if (!followedInfo?.isFile()) {
       continue;
     }
-    if (
-      options.workspaceRoot !== undefined &&
-      targetInfo?.isSymbolicLink() &&
-      root.follow
-    ) {
+    if (workspaceRealRoot !== undefined) {
+      // Real containment covers the leaf and every intermediate symlink.
       const realFile = await realpath(absolutePath).catch(() => null);
-      if (realFile !== null && !isPathInside(options.workspaceRoot, realFile)) {
+      if (
+        realFile !== null &&
+        !isPathInside(workspaceRealRoot, realFile)
+      ) {
         recordSkippedFile(diagnostics, {
           absolutePath,
           relativePath: toDisplayPath(

@@ -93,6 +93,12 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
     case "migrate":
       await runMigrate(parsed);
       return;
+    case "export":
+      await runExport(parsed);
+      return;
+    case "import":
+      await runImport(parsed);
+      return;
     case "install":
       await runInstall(parsed);
       return;
@@ -115,13 +121,13 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
 }
 
 async function runMigrate(parsed: ParsedArgs): Promise<void> {
-  if (parsed.positionals.length < 1 || parsed.positionals.length > 2) {
+  if (parsed.positionals.length !== 2) {
     throw new Error(
-      "zg --migrate-index requires a legacy index home and an optional destination workspace root",
+      "zg --migrate-index requires a legacy index home and an explicit destination workspace root: zg --migrate-index <legacy-home> <destination-root>",
     );
   }
   const sourceHome = resolve(parsed.positionals[0]!);
-  const destinationRoot = resolve(parsed.positionals[1] ?? dirname(sourceHome));
+  const destinationRoot = resolve(parsed.positionals[1]!);
   const { migrateWorkspaceIndex } = await import("../engine/migrate/index.js");
   const result = await migrateWorkspaceIndex({
     sourceHome,
@@ -148,7 +154,58 @@ async function runMigrate(parsed: ParsedArgs): Promise<void> {
     );
   }
   console.log(
-    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesResolve ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared)`,
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared${result.verification.vectorsSampled ? ", sampled" : ", all"})`,
+  );
+  console.log(
+    "The migrated index is unverified; the first indexing run reconciles content by hash.",
+  );
+}
+
+async function runExport(parsed: ParsedArgs): Promise<void> {
+  if (parsed.positionals.length !== 2) {
+    throw new Error(
+      "zg --export-index requires an index home and an artifact directory: zg --export-index <index-home> <artifact-dir>",
+    );
+  }
+  const { exportWorkspaceIndex } = await import("../engine/transfer/index.js");
+  const result = await exportWorkspaceIndex({
+    sourceHome: resolve(parsed.positionals[0]!),
+    artifactPath: resolve(parsed.positionals[1]!),
+    onProgress: (stage, detail) => console.error(`${stage}: ${detail}`),
+  });
+  console.log(`Exported index: ${result.artifactPath}`);
+  console.log(
+    `Files: ${result.filesExported}, fragments: ${result.entitiesExported}`,
+  );
+  console.log("The artifact contains no credentials or host bindings.");
+}
+
+async function runImport(parsed: ParsedArgs): Promise<void> {
+  if (parsed.positionals.length !== 2) {
+    throw new Error(
+      "zg --import-index requires an artifact directory and an explicit destination workspace root: zg --import-index <artifact-dir> <destination-root>",
+    );
+  }
+  const { importWorkspaceIndex } = await import("../engine/transfer/index.js");
+  const result = await importWorkspaceIndex({
+    artifactPath: resolve(parsed.positionals[0]!),
+    destinationRoot: resolve(parsed.positionals[1]!),
+    onProgress: (stage, detail) => console.error(`${stage}: ${detail}`),
+  });
+  console.log(`Imported index: ${result.destinationHome}`);
+  console.log(
+    `Files: ${result.filesImported}, fragments: ${result.entitiesImported}`,
+  );
+  if (result.missingFiles.length > 0) {
+    console.log(
+      `Missing at destination: ${result.missingFiles.length} file(s) (handled by the next incremental update)`,
+    );
+  }
+  console.log(
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared${result.verification.vectorsSampled ? ", sampled" : ", all"})`,
+  );
+  console.log(
+    "The imported index is unverified; the first indexing run reconciles content by hash.",
   );
 }
 

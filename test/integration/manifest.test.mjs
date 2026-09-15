@@ -31,7 +31,6 @@ test("workspace manifest persists portable index metadata and embedding runtime"
     indexVersion: 2,
     createdTime: now,
     updatedTime: now,
-    rootFingerprint: "f".repeat(64),
     embeddingRuntime: {
       endpoint: "https://example.test/embeddings",
     },

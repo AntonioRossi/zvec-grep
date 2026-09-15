@@ -188,6 +188,7 @@ export async function getWorkspaceIndexStatus(
   workspaceIndex: WorkspaceIndexInfo,
   storedFiles: readonly FileInfo[],
   workspaceRoot: string,
+  options: { unverified?: boolean } = {},
 ): Promise<WorkspaceIndexStatus> {
   try {
     const scan = await scanRootPaths(
@@ -228,6 +229,7 @@ export async function getWorkspaceIndexStatus(
       filesModified: diff.modified.length,
       filesDeleted: diff.deleted.length,
       filesUnchanged: diff.unchanged.length,
+      ...(options.unverified ? { unverified: true } : {}),
       pendingFiles,
       failedFiles,
       addedFiles: diff.added,

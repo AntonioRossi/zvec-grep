@@ -1,13 +1,14 @@
-import { readdirSync } from "node:fs";
+import { readdirSync, realpathSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { EngineError } from "../errors.js";
 import { sha256Text } from "./hash.js";
-import { normalizePath } from "./path.js";
+import { isPathInside, normalizePath } from "./path.js";
 
 // Canonical workspace-relative paths (CRP) per
 // docs/design/portable-workspace-index.md: "/" separator, NFC segments, case
-// preserved from the actual directory entry, no "." or ".." segments.
+// preserved from the actual directory entry, no "." or ".." segments, no
+// backslashes.
 
 const ROOT_CRP = ".";
 
@@ -56,7 +57,11 @@ export function workspaceRootCrp(): string {
   return ROOT_CRP;
 }
 
-/** True when the value is a structurally valid CRP (form only). */
+/**
+ * True when the value is a structurally valid CRP (form only). Backslashes
+ * are rejected so stored portable data cannot change meaning across
+ * platforms' separators.
+ */
 export function isCanonicalRelativePath(value: string): boolean {
   if (value === ROOT_CRP) {
     return true;
@@ -67,7 +72,12 @@ export function isCanonicalRelativePath(value: string): boolean {
   return value
     .split("/")
     .every(
-      (segment) => segment.length > 0 && segment !== "." && segment !== "..",
+      (segment) =>
+        segment.length > 0 &&
+        segment !== "." &&
+        segment !== ".." &&
+        !segment.includes("\\") &&
+        !segment.includes("\0"),
     );
 }
 
@@ -117,26 +127,51 @@ export class CanonicalPathResolutionError extends EngineError {
   }
 }
 
+/**
+ * Tri-state resolution result. "missing" means no entry exists at the
+ * canonical location; "forbidden" means an entry exists but escapes the
+ * workspace through a symlink (including any intermediate component). A
+ * forbidden result is never a missing file: callers must not fall back to
+ * reconstructed pathnames for it.
+ */
+export type CanonicalResolution =
+  | { status: "ok"; path: string }
+  | { status: "missing" }
+  | { status: "forbidden"; path: string };
+
 type DirectoryEntries = Map<string, string[]>;
 
 /**
  * Resolver mapping CRPs to current absolute paths through per-segment
- * actual-name lookup (NFC match). Results are cached per directory for the
- * lifetime of the resolver; create one per operation/session.
+ * actual-name lookup (NFC match) with real containment enforcement. Results
+ * are cached per directory for the lifetime of the resolver; create one per
+ * operation/session.
  */
 export type CanonicalPathResolver = {
   readonly workspaceRoot: string;
-  /** Resolve to an absolute path, or null when a segment is missing. */
-  resolveSync(canonicalPath: string): string | null;
-  resolve(canonicalPath: string): Promise<string | null>;
+  /** Real path of the workspace root, used for containment checks. */
+  readonly workspaceRealRoot: string;
+  resolveDetailedSync(canonicalPath: string): CanonicalResolution;
+  resolveDetailed(canonicalPath: string): Promise<CanonicalResolution>;
   /** The CRP of an absolute path inside this workspace, or null outside. */
   toCanonical(absolutePath: string): string | null;
+  /** Throw when the CRP does not resolve to a contained existing path. */
+  requireContainedSync(canonicalPath: string): string;
 };
+
+export function tryRealpathSync(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
 
 export function createCanonicalPathResolver(
   workspaceRoot: string,
 ): CanonicalPathResolver {
   const root = normalizePath(workspaceRoot);
+  const realRoot = tryRealpathSync(root) ?? root;
   const cache = new Map<string, DirectoryEntries>();
 
   function entriesFor(directory: string): DirectoryEntries {
@@ -182,83 +217,97 @@ export function createCanonicalPathResolver(
     return join(directory, matches[0]);
   }
 
-  function resolveSync(canonicalPath: string): string | null {
+  function assertValid(canonicalPath: string): void {
     if (!isCanonicalRelativePath(canonicalPath)) {
       throw new CanonicalPathResolutionError(
         "Stored canonical path is invalid",
         `canonicalPath=${canonicalPath}`,
       );
     }
+  }
+
+  function finish(path: string): CanonicalResolution {
+    const realPath = tryRealpathSync(path);
+    if (realPath === undefined) {
+      return { status: "missing" };
+    }
+    if (!isPathInside(realRoot, realPath)) {
+      return { status: "forbidden", path };
+    }
+    return { status: "ok", path };
+  }
+
+  function resolveDetailedSync(canonicalPath: string): CanonicalResolution {
+    assertValid(canonicalPath);
     if (canonicalPath === ROOT_CRP) {
-      return root;
+      return { status: "ok", path: root };
     }
     let current = root;
     for (const segment of canonicalPath.split("/")) {
       const next = select(current, segment, entriesFor(current));
       if (next === null) {
-        return null;
+        return { status: "missing" };
       }
       current = next;
     }
-    return current;
+    return finish(current);
   }
 
-  async function resolveAsync(canonicalPath: string): Promise<string | null> {
-    if (!isCanonicalRelativePath(canonicalPath)) {
-      throw new CanonicalPathResolutionError(
-        "Stored canonical path is invalid",
-        `canonicalPath=${canonicalPath}`,
-      );
-    }
+  async function resolveDetailed(
+    canonicalPath: string,
+  ): Promise<CanonicalResolution> {
+    assertValid(canonicalPath);
     if (canonicalPath === ROOT_CRP) {
-      return root;
+      return { status: "ok", path: root };
     }
     let current = root;
     for (const segment of canonicalPath.split("/")) {
-      const cached = cache.get(current);
-      if (cached) {
-        const next = select(current, segment, cached);
-        if (next === null) {
-          return null;
+      let entries = cache.get(current);
+      if (!entries) {
+        let names: string[] = [];
+        try {
+          names = await readdir(current);
+        } catch {
+          // Missing or unreadable directory: every segment misses.
         }
-        current = next;
-        continue;
-      }
-      let names: string[] = [];
-      try {
-        names = await readdir(current);
-      } catch {
-        // Missing or unreadable directory: every segment misses.
-      }
-      const entries: DirectoryEntries = new Map();
-      for (const name of names) {
-        const key = name.normalize("NFC");
-        const group = entries.get(key);
-        if (group) {
-          group.push(name);
-        } else {
-          entries.set(key, [name]);
+        entries = new Map();
+        for (const name of names) {
+          const key = name.normalize("NFC");
+          const group = entries.get(key);
+          if (group) {
+            group.push(name);
+          } else {
+            entries.set(key, [name]);
+          }
         }
+        cache.set(current, entries);
       }
-      cache.set(current, entries);
       const next = select(current, segment, entries);
       if (next === null) {
-        return null;
+        return { status: "missing" };
       }
       current = next;
     }
-    return current;
+    return finish(current);
   }
 
   return {
     workspaceRoot: root,
-    resolveSync,
-    resolve: resolveAsync,
+    workspaceRealRoot: realRoot,
+    resolveDetailedSync,
+    resolveDetailed,
     toCanonical: (absolutePath) => canonicalRelativePath(root, absolutePath),
+    requireContainedSync(canonicalPath: string): string {
+      const resolution = resolveDetailedSync(canonicalPath);
+      if (resolution.status === "ok") {
+        return resolution.path;
+      }
+      throw new CanonicalPathResolutionError(
+        resolution.status === "forbidden"
+          ? "Canonical path escapes the workspace"
+          : "Canonical path does not exist",
+        `canonicalPath=${canonicalPath} status=${resolution.status} workspaceRoot=${root}`,
+      );
+    },
   };
-}
-
-/** One-way relocation token persisted in the manifest (never a usable path). */
-export function workspaceRootFingerprint(workspaceRoot: string): string {
-  return sha256Text(resolve(workspaceRoot).normalize("NFC"));
 }

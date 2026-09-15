@@ -76,6 +76,8 @@ export type CliCommand =
   | "index"
   | "status"
   | "migrate"
+  | "export"
+  | "import"
   | "install"
   | "uninstall"
   | "config"
