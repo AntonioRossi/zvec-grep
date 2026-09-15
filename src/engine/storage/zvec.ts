@@ -15,6 +15,11 @@ import {
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { EngineError } from "../errors.js";
+import {
+  createCanonicalPathResolver,
+  workspaceRootCrp,
+  type CanonicalPathResolver,
+} from "../utils/canonical-path.js";
 import type {
   CodeEntityModifier,
   CodeSymbolType,
@@ -94,20 +99,26 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
   readonly readOnly: boolean;
   private readonly collection: ZVecCollection;
   private readonly files: ZvecFileMetaStore;
+  private readonly resolver: CanonicalPathResolver;
   private readonly filesById = new Map<string, FileRecord>();
-  private readonly filesByAbsolutePath = new Map<string, FileRecord>();
+  private readonly filesByCanonicalPath = new Map<string, FileRecord>();
   private needsOptimize = false;
 
   constructor(options: WorkspaceIndexStorageOptions) {
     const paths = resolveWorkspaceIndexStoragePaths(options.storagePath);
     const { readOnly } = options;
     this.readOnly = readOnly;
+    this.resolver = createCanonicalPathResolver(options.workspaceRoot);
     initializeZvec();
     if (!readOnly) {
       mkdirSync(paths.storagePath, { recursive: true });
     }
 
-    this.files = new ZvecFileMetaStore(paths.filesPath, readOnly);
+    this.files = new ZvecFileMetaStore(
+      paths.filesPath,
+      readOnly,
+      this.resolver,
+    );
     for (const file of this.files.list()) {
       this.rememberFile(file);
     }
@@ -130,7 +141,11 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
   }
 
   getFileByPath(absolutePath: string): FileInfo | null {
-    const file = this.filesByAbsolutePath.get(normalizePath(absolutePath));
+    const canonicalPath = this.resolver.toCanonical(absolutePath);
+    if (canonicalPath === null) {
+      return null;
+    }
+    const file = this.filesByCanonicalPath.get(canonicalPath);
 
     return file ? fileRecordToInfo(file) : null;
   }
@@ -140,12 +155,23 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
   }
 
   listFilesByPathPrefixes(absolutePaths: readonly string[]): FileInfo[] {
-    const prefixes = new Set(absolutePaths.map((path) => normalizePath(path)));
+    const prefixes = new Set(
+      absolutePaths
+        .map((path) => {
+          if (normalizePath(path) === this.resolver.workspaceRoot) {
+            return workspaceRootCrp();
+          }
+          return this.resolver.toCanonical(path);
+        })
+        .filter((prefix): prefix is string => prefix !== null),
+    );
     if (prefixes.size === 0) {
       return [];
     }
-    return [...this.filesByAbsolutePath.entries()]
-      .filter(([path]) => hasPathPrefix(path, prefixes))
+    return [...this.filesByCanonicalPath.entries()]
+      .filter(([canonicalPath]) =>
+        hasCanonicalPathPrefix(canonicalPath, prefixes),
+      )
       .map(([, file]) => fileRecordToInfo(file));
   }
 
@@ -260,6 +286,30 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
     }
   }
 
+  refreshFileMetadata(file: FileInfo): void {
+    this.assertWritable("refreshFileMetadata");
+    const existing = this.filesById.get(file.id);
+    if (!existing) {
+      throw new EngineError(
+        "Cannot refresh metadata for an unknown index file",
+        {
+          code: "ZVEC_GREP.ENGINE.STORAGE.REFRESH_UNKNOWN_FILE",
+          context: `fileId=${file.id}`,
+        },
+      );
+    }
+    const updated: FileRecord = {
+      ...existing,
+      sizeBytes: file.sizeBytes,
+      lastModifiedTime: file.lastModifiedTime,
+      ...(file.contentHash !== undefined
+        ? { contentHash: file.contentHash }
+        : {}),
+    };
+    this.rememberFile(updated);
+    this.persistFile(updated);
+  }
+
   markFileFailed(file: FileInfo, error: string): void {
     this.assertWritable("markFileFailed");
     this.deleteFileDocuments(file.id);
@@ -283,9 +333,9 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
 
     this.deleteFileDocuments(fileId);
 
-    if (existing) {
+    if (existing?.canonicalPath) {
       this.filesById.delete(fileId);
-      this.filesByAbsolutePath.delete(normalizePath(existing.absolutePath));
+      this.filesByCanonicalPath.delete(existing.canonicalPath);
     }
     this.files.deleteFile(fileId);
   }
@@ -405,13 +455,18 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
   }
 
   private rememberFile(file: FileRecord): void {
-    const normalized = {
-      ...file,
-      absolutePath: normalizePath(file.absolutePath),
-    };
+    if (!file.canonicalPath) {
+      throw new EngineError(
+        "Workspace index file record requires a canonical path",
+        {
+          code: "ZVEC_GREP.ENGINE.STORAGE.CANONICAL_PATH_REQUIRED",
+          context: `fileId=${file.id} absolutePath=${file.absolutePath}`,
+        },
+      );
+    }
 
-    this.filesById.set(normalized.id, normalized);
-    this.filesByAbsolutePath.set(normalized.absolutePath, normalized);
+    this.filesById.set(file.id, file);
+    this.filesByCanonicalPath.set(file.canonicalPath, file);
   }
 
   private markFileDirty(file: FileInfo): void {
@@ -448,18 +503,19 @@ class ZvecWorkspaceIndexStorage implements WorkspaceIndexStorage {
   }
 }
 
-function hasPathPrefix(path: string, prefixes: ReadonlySet<string>): boolean {
-  let current = path;
-  while (true) {
-    if (prefixes.has(current)) {
+function hasCanonicalPathPrefix(
+  canonicalPath: string,
+  prefixes: ReadonlySet<string>,
+): boolean {
+  for (const prefix of prefixes) {
+    if (prefix === workspaceRootCrp()) {
       return true;
     }
-    const parent = dirname(current);
-    if (parent === current) {
-      return false;
+    if (canonicalPath === prefix || canonicalPath.startsWith(`${prefix}/`)) {
+      return true;
     }
-    current = parent;
   }
+  return false;
 }
 
 class ZvecFileMetaStore {
@@ -469,6 +525,7 @@ class ZvecFileMetaStore {
   constructor(
     private readonly path: string,
     private readonly readOnly = false,
+    private readonly resolver: CanonicalPathResolver,
   ) {
     initializeZvec();
     if (!readOnly) {
@@ -495,7 +552,7 @@ class ZvecFileMetaStore {
     const docs = queryFileMetadataDocs(this.collection, ZVEC_MAX_QUERY_TOPK);
 
     return docs
-      .map((doc) => docToFileRecord(doc))
+      .map((doc) => docToFileRecord(doc, this.resolver))
       .sort((left, right) =>
         left.relativePath.localeCompare(right.relativePath),
       );
@@ -505,7 +562,9 @@ class ZvecFileMetaStore {
     this.assertWritable("upsertFile");
     const deleteStatus = this.collection.deleteSync(file.id);
     assertZvecStatusOrNotFound(deleteStatus, "file metadata replace", file.id);
-    const status = this.collection.upsertSync(fileRecordToDoc(file));
+    const status = this.collection.upsertSync(
+      fileRecordToDoc(file, this.resolver),
+    );
     assertZvecStatus(status, "file metadata upsert", file.id);
     this.needsOptimize = true;
   }
@@ -590,12 +649,12 @@ function queryFileMetadataPartition(
   );
 }
 
-function createFilesSchema(): ZVecCollectionSchema {
+export function createFilesSchema(): ZVecCollectionSchema {
   return new ZVecCollectionSchema({
     name: "zvec_grep_files",
     fields: [
       indexedStringField("file_id"),
-      indexedStringField("absolute_path"),
+      indexedStringField("canonical_path"),
       stringField("relative_path"),
       stringField("root_path"),
       {
@@ -642,12 +701,24 @@ function createFilesSchema(): ZVecCollectionSchema {
   });
 }
 
-function fileRecordToDoc(file: FileRecord): ZVecDocInput {
+function fileRecordToDoc(
+  file: FileRecord,
+  resolver: CanonicalPathResolver,
+): ZVecDocInput {
+  if (!file.canonicalPath) {
+    throw new EngineError(
+      "Workspace index file record requires a canonical path",
+      {
+        code: "ZVEC_GREP.ENGINE.STORAGE.CANONICAL_PATH_REQUIRED",
+        context: `fileId=${file.id} absolutePath=${file.absolutePath}`,
+      },
+    );
+  }
   const fields: Record<string, string | number | boolean> = {
     file_id: file.id,
-    absolute_path: normalizePath(file.absolutePath),
+    canonical_path: file.canonicalPath,
     relative_path: file.relativePath,
-    root_path: file.rootPath,
+    root_path: rootCanonicalPath(file.rootPath, resolver),
     size_bytes: file.sizeBytes,
     last_modified_time: file.lastModifiedTime,
     kind: file.kind,
@@ -686,7 +757,27 @@ function fileRecordToDoc(file: FileRecord): ZVecDocInput {
   };
 }
 
-function docToFileRecord(doc: ZVecDoc): FileRecord {
+function rootCanonicalPath(
+  rootAbsolutePath: string,
+  resolver: CanonicalPathResolver,
+): string {
+  if (normalizePath(rootAbsolutePath) === resolver.workspaceRoot) {
+    return workspaceRootCrp();
+  }
+  const canonicalPath = resolver.toCanonical(rootAbsolutePath);
+  if (canonicalPath === null) {
+    throw new EngineError("Indexed file root is outside the workspace", {
+      code: "ZVEC_GREP.ENGINE.STORAGE.ROOT_OUTSIDE_WORKSPACE",
+      context: `rootPath=${rootAbsolutePath} workspaceRoot=${resolver.workspaceRoot}`,
+    });
+  }
+  return canonicalPath;
+}
+
+function docToFileRecord(
+  doc: ZVecDoc,
+  resolver: CanonicalPathResolver,
+): FileRecord {
   const fields = doc.fields;
   const hasIndexStatus = readBooleanFieldFromFields(fields, "has_index_status");
   const indexedTime = readNullableNumberFieldFromFields(fields, "indexed_time");
@@ -696,12 +787,19 @@ function docToFileRecord(doc: ZVecDoc): FileRecord {
     "truncated_fragment_count",
   );
   const error = readNullableStringFieldFromFields(fields, "error");
+  const canonicalPath = readStringField(doc, "canonical_path");
+  const rootCrp = readStringField(doc, "root_path");
 
   return {
     id: readStringField(doc, "file_id"),
-    absolutePath: normalizePath(readStringField(doc, "absolute_path")),
+    absolutePath:
+      resolver.resolveSync(canonicalPath) ??
+      normalizePath(join(resolver.workspaceRoot, canonicalPath)),
+    canonicalPath,
     relativePath: readStringField(doc, "relative_path"),
-    rootPath: readStringField(doc, "root_path"),
+    rootPath:
+      resolver.resolveSync(rootCrp) ??
+      normalizePath(join(resolver.workspaceRoot, rootCrp)),
     sizeBytes: readNumberFieldFromFields(fields, "size_bytes"),
     lastModifiedTime: readNumberFieldFromFields(fields, "last_modified_time"),
     contentHash:
@@ -888,7 +986,7 @@ function sleepSync(ms: number): void {
   Atomics.wait(values, 0, 0, ms);
 }
 
-function createSchema(
+export function createSchema(
   embedding: WorkspaceIndexEmbeddingSchema,
 ): ZVecCollectionSchema {
   return new ZVecCollectionSchema({

@@ -1,19 +1,65 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import type { EmbeddingRuntimeConfig } from "./config.js";
 import { EngineError } from "./errors.js";
-import type { WorkspaceIndexInfo } from "./types.js";
+import type {
+  RootPath,
+  WorkspaceIndexEmbeddingSchema,
+  WorkspaceIndexInfo,
+  WorkspaceIndexPolicy,
+} from "./types.js";
+import {
+  isCanonicalRelativePath,
+  type CanonicalPathResolver,
+} from "./utils/canonical-path.js";
 import { readJsonFileSync, writeJsonFileSync } from "./utils/json.js";
 
 export const WORKSPACE_MANIFEST_FILE = "manifest.json";
-export const CURRENT_MANIFEST_VERSION = 1;
+export const CURRENT_MANIFEST_VERSION = 2;
+export const LEGACY_MANIFEST_VERSION = 1;
 
 const WORKSPACE_DIRECTORY_MODE = 0o700;
 const WORKSPACE_MANIFEST_MODE = 0o600;
 
-export type WorkspaceManifest = WorkspaceIndexInfo & {
+/**
+ * Persisted scan root: a canonical workspace-relative path plus selection
+ * options. Absolute locations are never persisted; they are resolved against
+ * the current workspace root at open time.
+ */
+export type WorkspaceManifestRootPath = Omit<
+  RootPath,
+  "absolutePath" | "canonicalPath"
+> & {
+  path: string;
+};
+
+/**
+ * Runtime configuration persisted in the manifest. Only the embedding
+ * endpoint is portable identity (changing it requires a rebuild). API keys
+ * and device selection are host bindings and are never persisted.
+ */
+export type WorkspaceManifestEmbeddingRuntime = {
+  endpoint?: string;
+};
+
+export type WorkspaceManifest = {
   manifestVersion: typeof CURRENT_MANIFEST_VERSION;
-  embeddingRuntime: EmbeddingRuntimeConfig;
+  id: string;
+  name: string;
+  rootPaths: readonly WorkspaceManifestRootPath[];
+  indexPolicy: WorkspaceIndexPolicy;
+  embedding: WorkspaceIndexEmbeddingSchema | null;
+  indexVersion: number | null;
+  createdTime: number;
+  updatedTime: number;
+  rootFingerprint?: string;
+  embeddingRuntime: WorkspaceManifestEmbeddingRuntime;
+};
+
+export type WorkspaceManifestLocation = {
+  /** Current index home (`<workspace>/.zvec-grep`). */
+  home: string;
+  /** Current workspace root. */
+  root: string;
 };
 
 export function workspaceManifestPath(home: string): string {
@@ -25,6 +71,16 @@ export function readWorkspaceManifest(home: string): WorkspaceManifest | null {
   const value = readJsonFileSync<unknown>(path, null);
   if (value === null) {
     return null;
+  }
+
+  if (isRecord(value) && value.manifestVersion === LEGACY_MANIFEST_VERSION) {
+    throw new EngineError(
+      "Workspace index uses the legacy absolute-path format and needs migration",
+      {
+        code: "ZVEC_GREP.ENGINE.MANIFEST.MIGRATION_REQUIRED",
+        context: `path=${path}`,
+      },
+    );
   }
 
   if (!isWorkspaceManifest(value)) {
@@ -51,19 +107,37 @@ export function deleteWorkspaceManifest(home: string): void {
   rmSync(workspaceManifestPath(home), { force: true });
 }
 
+/**
+ * Resolve a persisted manifest into the runtime index info for the current
+ * workspace location: the index home, absolute root paths, and CRPs are all
+ * derived from the current location, never from serialized absolute paths.
+ */
 export function workspaceIndexInfoFromManifest(
   manifest: WorkspaceManifest,
+  location: WorkspaceManifestLocation,
+  resolver: CanonicalPathResolver,
 ): WorkspaceIndexInfo {
   return {
     id: manifest.id,
     name: manifest.name,
-    path: manifest.path,
-    rootPaths: manifest.rootPaths,
+    path: location.home,
+    rootPaths: manifest.rootPaths.map((root) => {
+      const { path, ...options } = root;
+      return {
+        ...options,
+        absolutePath:
+          resolver.resolveSync(path) ?? join(location.root, path),
+        canonicalPath: path,
+      };
+    }),
     indexPolicy: manifest.indexPolicy,
     embedding: manifest.embedding,
     indexVersion: manifest.indexVersion,
     createdTime: manifest.createdTime,
     updatedTime: manifest.updatedTime,
+    ...(manifest.rootFingerprint !== undefined
+      ? { rootFingerprint: manifest.rootFingerprint }
+      : {}),
   };
 }
 
@@ -75,7 +149,6 @@ function isWorkspaceManifest(value: unknown): value is WorkspaceManifest {
   return (
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.name) &&
-    isNonEmptyString(value.path) &&
     Array.isArray(value.rootPaths) &&
     value.rootPaths.length > 0 &&
     value.rootPaths.every(isRootPath) &&
@@ -86,6 +159,8 @@ function isWorkspaceManifest(value: unknown): value is WorkspaceManifest {
     Number.isFinite(value.createdTime) &&
     typeof value.updatedTime === "number" &&
     Number.isFinite(value.updatedTime) &&
+    (value.rootFingerprint === undefined ||
+      isNonEmptyString(value.rootFingerprint)) &&
     isEmbeddingRuntime(value.embeddingRuntime)
   );
 }
@@ -93,7 +168,8 @@ function isWorkspaceManifest(value: unknown): value is WorkspaceManifest {
 function isRootPath(value: unknown): boolean {
   return (
     isRecord(value) &&
-    isNonEmptyString(value.absolutePath) &&
+    isNonEmptyString(value.path) &&
+    isCanonicalRelativePath(value.path) &&
     typeof value.recursive === "boolean" &&
     isOptionalStringArray(value.include) &&
     isOptionalStringArray(value.exclude) &&
@@ -129,15 +205,12 @@ function isEmbeddingRuntime(value: unknown): boolean {
     return false;
   }
 
+  // Host bindings are rejected, not ignored: a manifest carrying an API key
+  // or a device must be treated as invalid rather than silently stripped.
   return (
-    (value.apiKey === undefined || typeof value.apiKey === "string") &&
-    (value.endpoint === undefined || typeof value.endpoint === "string") &&
-    (value.device === undefined ||
-      value.device === "auto" ||
-      value.device === "cpu" ||
-      value.device === "metal" ||
-      value.device === "vulkan" ||
-      value.device === "cuda")
+    value.apiKey === undefined &&
+    value.device === undefined &&
+    (value.endpoint === undefined || typeof value.endpoint === "string")
   );
 }
 
