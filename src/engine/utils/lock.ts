@@ -43,6 +43,7 @@ function acquireExclusiveDirectoryLock(
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       mkdirSync(lockPath);
+      const identity = lockDirectoryIdentity(lockPath);
       const info = currentLockInfo(options.operation);
       writeFileSync(
         lockInfoPath(lockPath),
@@ -53,7 +54,7 @@ function acquireExclusiveDirectoryLock(
       return {
         path: lockPath,
         info,
-        release: () => releaseFileLock(lockPath, info),
+        release: () => releaseFileLock(lockPath, info, identity),
       };
     } catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") {
@@ -133,6 +134,7 @@ function acquireReadLock(lockPath: string, options: FileLockOptions): FileLock {
     );
     try {
       mkdirSync(readerPath, { recursive: true });
+      const identity = lockDirectoryIdentity(readerPath);
       writeFileSync(
         lockInfoPath(readerPath),
         `${JSON.stringify(info, null, 2)}\n`,
@@ -140,7 +142,7 @@ function acquireReadLock(lockPath: string, options: FileLockOptions): FileLock {
       );
 
       if (existsSync(writePath)) {
-        releaseFileLock(readerPath, info);
+        releaseFileLock(readerPath, info, identity);
         if (cleanupStaleLock(writePath, staleMs)) {
           continue;
         }
@@ -151,10 +153,10 @@ function acquireReadLock(lockPath: string, options: FileLockOptions): FileLock {
       return {
         path: readerPath,
         info,
-        release: () => releaseFileLock(readerPath, info),
+        release: () => releaseFileLock(readerPath, info, identity),
       };
     } catch (error) {
-      releaseFileLock(readerPath, info);
+      releaseFileLock(readerPath, info, lockDirectoryIdentity(readerPath));
       if (!isNodeError(error) || error.code !== "EEXIST") {
         throw error;
       }
@@ -184,13 +186,56 @@ function acquireWriteLock(
   throw readLockBusyError(lockPath, options.operation);
 }
 
-function releaseFileLock(lockPath: string, owner: FileLockInfo): void {
+function releaseFileLock(
+  lockPath: string,
+  owner: FileLockInfo,
+  expectedIdentity: LockDirectoryIdentity | undefined,
+): void {
   const current = readLockInfo(lockPath);
   if (current?.token !== owner.token) {
     return;
   }
+  // Physical ownership: token equality alone cannot distinguish a replaced
+  // directory carrying a copied token. Never delete another directory's
+  // lock through this handle.
+  if (!lockIdentityMatches(lockPath, expectedIdentity)) {
+    return;
+  }
 
   rmSync(lockPath, { recursive: true, force: true });
+}
+
+type LockDirectoryIdentity = {
+  device: number;
+  inode: number;
+};
+
+function lockDirectoryIdentity(
+  lockPath: string,
+): LockDirectoryIdentity | undefined {
+  try {
+    const info = statSync(lockPath);
+    return { device: info.dev, inode: info.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+function lockIdentityMatches(
+  lockPath: string,
+  expected: LockDirectoryIdentity | undefined,
+): boolean {
+  if (!expected) {
+    // No reference identity was captured; only a vanished directory counts
+    // as a match (nothing remains to delete).
+    return lockDirectoryIdentity(lockPath) === undefined;
+  }
+  const current = lockDirectoryIdentity(lockPath);
+  return (
+    current !== undefined &&
+    current.device === expected.device &&
+    current.inode === expected.inode
+  );
 }
 
 function cleanupStaleLock(lockPath: string, staleMs: number): boolean {
@@ -198,8 +243,14 @@ function cleanupStaleLock(lockPath: string, staleMs: number): boolean {
     return false;
   }
 
+  const identityBefore = lockDirectoryIdentity(lockPath);
   const info = readLockInfo(lockPath);
   if (!isStaleLock(lockPath, info, staleMs)) {
+    return false;
+  }
+  // Re-check physical identity before deleting another owner's lock: a
+  // replaced directory is never reclaimed through this path.
+  if (!lockIdentityMatches(lockPath, identityBefore)) {
     return false;
   }
 
@@ -238,18 +289,20 @@ function isStaleLock(
   info: FileLockInfo | null,
   staleMs: number,
 ): boolean {
-  const now = Date.now();
-  const startedAt = info?.startedAt ?? lockDirectoryMtime(lockPath);
-  const expired = now - startedAt > staleMs;
+  void lockPath;
+  void staleMs;
+  // Age never proves inactivity: a known-live local owner is never stale at
+  // any age, and unknown ownership (foreign host, missing or corrupt
+  // metadata) must remain blocked rather than be reclaimed. Reclamation is
+  // safe only for a verified-dead local owner. Recovering any other lock is
+  // an explicit operator action after writers are quiescent.
   if (!info) {
-    return expired;
+    return false;
   }
-
-  if (info.hostname === hostname() && !processIsAlive(info.pid)) {
-    return true;
+  if (info.hostname !== hostname()) {
+    return false;
   }
-
-  return expired;
+  return !processIsAlive(info.pid);
 }
 
 function processIsAlive(pid: number): boolean {
@@ -286,14 +339,6 @@ function readLockInfo(lockPath: string): FileLockInfo | null {
   return null;
 }
 
-function lockDirectoryMtime(lockPath: string): number {
-  try {
-    return statSync(lockPath).mtimeMs;
-  } catch {
-    return Date.now();
-  }
-}
-
 function lockBusyError(
   lockPath: string,
   requestedOperation: string,
@@ -308,6 +353,10 @@ function lockBusyError(
       detail("ownerOperation", owner?.operation),
       detail("ownerPid", owner?.pid),
       detail("ownerHost", owner?.hostname),
+      detail(
+        "hint",
+        "Another operation holds or last owned this lock. Locks are never reclaimed automatically when ownership is uncertain; after all writers are quiescent, remove the lock directory shown above manually to recover.",
+      ),
     ]),
   });
 }
@@ -326,6 +375,10 @@ function readLockBusyError(
       detail("ownerOperation", owner?.operation),
       detail("ownerPid", owner?.pid),
       detail("ownerHost", owner?.hostname),
+      detail(
+        "hint",
+        "Another operation holds or last owned this lock. Locks are never reclaimed automatically when ownership is uncertain; after all writers are quiescent, remove the lock directory shown above manually to recover.",
+      ),
     ]),
   });
 }
