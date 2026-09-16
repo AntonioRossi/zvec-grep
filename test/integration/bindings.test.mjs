@@ -1,0 +1,180 @@
+import assert from "node:assert/strict";
+import {
+  cp,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
+import { join } from "node:path";
+import test from "node:test";
+import { ZVecInitialize, ZVecLogLevel } from "@zvec/zvec";
+import {
+  exportWorkspaceIndex,
+  importWorkspaceIndex,
+} from "../../dist/engine/transfer/index.js";
+import { createZvecGrep } from "../../dist/index.js";
+import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
+import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
+import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
+import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+
+useIsolatedZvecGrepHome();
+
+const NFC_E = "é";
+const NFD_E = "é";
+
+async function indexFixture(root, content = "alpha indexed document") {
+  await mkdir(join(root, "docs"), { recursive: true });
+  await writeFile(join(root, "docs", "one.md"), `${content}\n`);
+}
+
+async function sameStatReplace(target, from, to) {
+  const indexedStat = await stat(target);
+  const original = await readFile(target, "utf8");
+  const replaced = original.replace(from, to);
+  assert.equal(replaced.length, original.length);
+  await writeFile(target, replaced);
+  await utimes(target, indexedStat.atime, indexedStat.mtime);
+}
+
+test("a supported same-UUID replacement invalidates verification", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-bind-replace-");
+  const A = join(parent, "A");
+  const B = join(parent, "B");
+  await indexFixture(A, "alpha indexed document");
+  await indexFixture(B, "alpha indexed document");
+
+  // Export a closed index of A, import into B, and verify B by indexing.
+  const serviceA = await createZvecGrep({
+    root: A,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await serviceA.index();
+  await serviceA.close();
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(A, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+  await importWorkspaceIndex({ artifactPath: artifact, destinationRoot: B });
+  const modelB = new CountingEmbeddingModel();
+  const serviceB = await createZvecGrep({ root: B, embeddingModel: modelB });
+  await serviceB.index(); // establishes B's binding
+  assert.equal(modelB.counts.document, 0);
+
+  // Same-stat edit at B, then replace only B's .zvec-grep with another
+  // import of the ORIGINAL artifact (same index UUID, same workspace).
+  await sameStatReplace(join(B, "docs", "one.md"), "alpha", "omega");
+  const artifact2 = join(parent, "artifact2");
+  await rename(artifact, artifact2);
+  await exportWorkspaceIndex({
+    sourceHome: join(A, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+  await rm(join(B, ".zvec-grep"), { recursive: true, force: true });
+  await importWorkspaceIndex({ artifactPath: artifact2, destinationRoot: B });
+
+  // The replaced storage must not be trusted: the next index reconciles and
+  // finds the same-stat edit; only the changed document is embedded.
+  const modelB2 = new CountingEmbeddingModel();
+  const serviceB2 = await createZvecGrep({ root: B, embeddingModel: modelB2 });
+  const result = await serviceB2.index();
+  assert.equal(
+    result.filesModified,
+    1,
+    "the supported replacement must force reconciliation of the changed file",
+  );
+  assert.equal(modelB2.counts.document, 1);
+  const search = await serviceB2.context({ query: "omega indexed", limit: 3 });
+  assert.ok(search.items.length > 0);
+  await serviceB2.close();
+});
+
+test("unsupported in-place restore stays trusted until forced reconciliation", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-bind-manual-");
+  const root = join(parent, "W");
+  await indexFixture(root, "alpha indexed document");
+
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({ root, embeddingModel: model });
+  await service.index();
+  await service.close();
+
+  // Manual, unsupported restore: swap collection files back inside the
+  // existing storage directory (its directory inode is preserved).
+  const home = join(root, ".zvec-grep");
+  const stash = join(parent, "stash");
+  await cp(home, stash, { recursive: true });
+  await sameStatReplace(join(root, "docs", "one.md"), "alpha", "omega");
+  await cp(join(stash, "files.zvec"), join(home, "files.zvec"), {
+    recursive: true,
+  });
+  await cp(join(stash, "index.zvec"), join(home, "index.zvec"), {
+    recursive: true,
+  });
+
+  // Documented limitation: without the forced path, the unchanged binding
+  // keeps the pre-restore trust and the same-stat edit is not detected.
+  const service2 = await createZvecGrep({
+    root,
+    embeddingModel: new CountingEmbeddingModel(),
+  });
+  const trusted = await service2.index();
+  assert.equal(trusted.filesModified, 0);
+
+  // The documented forced path reconciles and detects the edit.
+  const model3 = new CountingEmbeddingModel();
+  const service3 = await createZvecGrep({ root, embeddingModel: model3 });
+  const reconciled = await service3.index({ reconcile: true });
+  assert.equal(reconciled.filesModified, 1);
+  assert.equal(model3.counts.document, 1);
+  await service3.close();
+  await service2.close();
+});
+
+test("distinct NFC and NFD workspace roots never share a binding", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-bind-unicode-");
+  const nfcRoot = join(parent, `workspac${NFC_E}`);
+  const nfdRoot = join(parent, `workspac${NFD_E}`);
+  await indexFixture(nfcRoot, "alpha indexed document");
+  await indexFixture(nfdRoot, "alpha indexed document");
+
+  const modelNfc = new CountingEmbeddingModel();
+  const serviceNfc = await createZvecGrep({
+    root: nfcRoot,
+    embeddingModel: modelNfc,
+  });
+  await serviceNfc.index();
+  await serviceNfc.close();
+
+  // The siblings are physically different directories.
+  assert.notEqual((await stat(nfdRoot)).ino, (await stat(nfcRoot)).ino);
+
+  // Copy the verified index (same UUID) to the NFD sibling and change one
+  // file there with identical stat. The NFC binding must not leak: the NFD
+  // root is inspected as itself, so its first index reconciles.
+  await cp(join(nfcRoot, ".zvec-grep"), join(nfdRoot, ".zvec-grep"), {
+    recursive: true,
+  });
+  await sameStatReplace(join(nfdRoot, "docs", "one.md"), "alpha", "omega");
+  const modelNfd = new CountingEmbeddingModel();
+  const serviceNfd = await createZvecGrep({
+    root: nfdRoot,
+    embeddingModel: modelNfd,
+  });
+  const result = await serviceNfd.index();
+  assert.equal(
+    result.filesModified,
+    1,
+    "the NFD sibling must reconcile on its own binding, not inherit NFC's",
+  );
+  assert.equal(modelNfd.counts.document, 1);
+  await serviceNfd.close();
+});

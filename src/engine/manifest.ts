@@ -107,6 +107,51 @@ export function deleteWorkspaceManifest(home: string): void {
 }
 
 /**
+ * Validate untrusted portable-manifest data and reconstruct it from the
+ * allowlist of supported fields, so nothing else is republished. Credential
+ * and device material is rejected by the shared reader contract.
+ */
+export function parsePortableManifest(
+  value: unknown,
+  context: string,
+): WorkspaceManifest {
+  if (isRecord(value) && value.manifestVersion === LEGACY_MANIFEST_VERSION) {
+    throw new EngineError(
+      "Manifest uses the legacy absolute-path format and needs migration",
+      {
+        code: "ZVEC_GREP.ENGINE.MANIFEST.MIGRATION_REQUIRED",
+        context,
+      },
+    );
+  }
+  if (!isWorkspaceManifest(value)) {
+    throw new EngineError(
+      "Portable workspace index manifest is invalid or carries unsupported data",
+      {
+        code: "ZVEC_GREP.ENGINE.MANIFEST.INVALID",
+        context,
+      },
+    );
+  }
+  return {
+    manifestVersion: CURRENT_MANIFEST_VERSION,
+    id: value.id,
+    name: value.name,
+    rootPaths: value.rootPaths.map((root) => ({ ...root })),
+    indexPolicy: value.indexPolicy,
+    embedding: value.embedding ? { ...value.embedding } : null,
+    indexVersion: value.indexVersion,
+    createdTime: value.createdTime,
+    updatedTime: value.updatedTime,
+    embeddingRuntime: {
+      ...(value.embeddingRuntime.endpoint !== undefined
+        ? { endpoint: value.embeddingRuntime.endpoint }
+        : {}),
+    },
+  };
+}
+
+/**
  * Resolve a persisted manifest into the runtime index info for the current
  * workspace location: the index home, absolute root paths, and CRPs are all
  * derived from the current location, never from serialized absolute paths.
