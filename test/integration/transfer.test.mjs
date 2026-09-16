@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -68,8 +68,13 @@ async function copySourceFiles(sourceRoot, destinationRoot) {
   });
 }
 
-async function importInSeparateProcess(artifactPath, destinationRoot) {
+async function importInSeparateProcess(artifactPath, destinationRoot, t) {
+  const resultPath = join(
+    await createTemporaryDirectory(t, "zg-transfer-result-"),
+    "result.json",
+  );
   const script = `
+    import { writeFileSync } from "node:fs";
     import { importWorkspaceIndex } from ${JSON.stringify(
       `file://${resolve("dist/engine/transfer/index.js")}`,
     )};
@@ -78,14 +83,31 @@ async function importInSeparateProcess(artifactPath, destinationRoot) {
       destinationRoot: ${JSON.stringify(destinationRoot)},
       onProgress: (stage, detail) => console.error(stage + ": " + detail),
     });
-    console.log(JSON.stringify(result));
+    writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(result));
   `;
-  const { stdout } = await execFileAsync(
-    process.execPath,
-    ["--input-type=module", "--eval", script],
-    { timeout: 120_000 },
+  // The child must exit successfully and leave a fresh, completely validated
+  // result file; stdout is not part of the exchange.
+  const started = Date.now();
+  await execFileAsync(process.execPath, ["--input-type=module", "--eval", script], {
+    timeout: 120_000,
+  });
+  const raw = JSON.parse(await readFile(resultPath, "utf8"));
+  const resultStat = await stat(resultPath);
+  assert.ok(
+    resultStat.mtimeMs >= started,
+    "the child must leave a fresh result file",
   );
-  return JSON.parse(stdout.trim().split("\n").pop());
+  for (const field of [
+    "destinationHome",
+    "indexId",
+    "filesImported",
+    "entitiesImported",
+    "missingFiles",
+    "verification",
+  ]) {
+    assert.ok(field in raw, `result file is missing ${field}`);
+  }
+  return raw;
 }
 
 test("exported v2 index imports in a separate process with source unavailable", async (t) => {
@@ -106,7 +128,7 @@ test("exported v2 index imports in a separate process with source unavailable", 
 
   const destinationRoot = join(parent, "destination");
   await copySourceFiles(sourceRoot, destinationRoot);
-  const imported = await importInSeparateProcess(artifact, destinationRoot);
+  const imported = await importInSeparateProcess(artifact, destinationRoot, t);
   assert.equal(imported.verification.countsMatch, true);
   assert.equal(imported.verification.inventoriesExact, true);
   assert.equal(imported.verification.groupIntegrity, true);
@@ -162,7 +184,7 @@ test("exported legacy v1 index imports in portable form", async (t) => {
 
   const destinationRoot = join(parent, "destination");
   await copySourceFiles(sourceRoot, destinationRoot);
-  const imported = await importInSeparateProcess(artifact, destinationRoot);
+  const imported = await importInSeparateProcess(artifact, destinationRoot, t);
   assert.equal(imported.verification.vectorsExact, true);
   assert.equal(imported.indexId, manifest.id);
 
@@ -180,6 +202,133 @@ test("exported legacy v1 index imports in portable form", async (t) => {
     "unchanged imported content must not be re-embedded",
   );
   await service.close();
+});
+
+test("import rejects a credential-bearing artifact manifest", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-transfer-credential-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(sourceRoot, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+
+  const manifestPath = join(artifact, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.embeddingRuntime.apiKey = "synthetic-review-secret";
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    importInSeparateProcess(artifact, destinationRoot, t),
+    undefined,
+    "a credential-bearing manifest must be rejected",
+  );
+  assert.equal(
+    (await readdir(destinationRoot)).filter((entry) => entry === ".zvec-grep")
+      .length,
+    0,
+    "no destination is published from invalid metadata",
+  );
+});
+
+test("import rejects internally consistent but underived identities", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-transfer-underived-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(sourceRoot, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+
+  // Rewrite every identity to be internally consistent (doc id, file_id
+  // fields, inventory references, entity ids and file links all agree) but
+  // not derived from the portable scheme (index UUID + canonical path).
+  const crypto = await import("node:crypto");
+  const wrongFileId = crypto
+    .createHash("sha256")
+    .update("internally-consistent-but-wrong")
+    .digest("hex");
+  const filesPath = join(artifact, "files.jsonl");
+  const entitiesPath = join(artifact, "entities.jsonl");
+  const fileDocs = (await readFile(filesPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const entityDocs = (await readFile(entitiesPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+
+  const idByOld = new Map();
+  const newFileDocs = fileDocs.map((doc, index) => {
+    const wrong = crypto
+      .createHash("sha256")
+      .update(`wrong-${index}`)
+      .digest("hex");
+    idByOld.set(doc.id, wrong);
+    return {
+      ...doc,
+      id: wrong,
+      fields: { ...doc.fields, file_id: wrong },
+    };
+  });
+  const newEntityDocs = entityDocs.map((doc) => {
+    const wrongFile = idByOld.get(String(doc.fields.file_id));
+    const wrongId = crypto
+      .createHash("sha256")
+      .update(`${wrongFile}\0${Number(doc.fields.fragment_index)}`)
+      .digest("hex");
+    idByOld.set(doc.id, wrongId);
+    return {
+      ...doc,
+      id: wrongId,
+      fields: {
+        ...doc.fields,
+        file_id: wrongFile,
+        ...(typeof doc.fields.group === "string" && doc.fields.group
+          ? { group: doc.fields.group }
+          : {}),
+      },
+    };
+  });
+  const remappedEntityDocs = newEntityDocs.map((doc) => ({
+    ...doc,
+    fields: {
+      ...doc.fields,
+      ...(typeof doc.fields.group === "string" && doc.fields.group
+        ? { group: idByOld.get(doc.fields.group) ?? doc.fields.group }
+        : {}),
+    },
+  }));
+  const remappedFileDocs = newFileDocs.map((doc) => ({
+    ...doc,
+    fields: {
+      ...doc.fields,
+      entity_ids_json: JSON.stringify(
+        JSON.parse(doc.fields.entity_ids_json).map((id) => idByOld.get(id) ?? id),
+      ),
+    },
+  }));
+  await writeFile(
+    filesPath,
+    remappedFileDocs.map((doc) => JSON.stringify(doc)).join("\n") + "\n",
+  );
+  await writeFile(
+    entitiesPath,
+    remappedEntityDocs.map((doc) => JSON.stringify(doc)).join("\n") + "\n",
+  );
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    importInSeparateProcess(artifact, destinationRoot, t),
+    undefined,
+    "internally consistent but underived identities must be rejected",
+  );
 });
 
 test("CLI migrate requires an explicit destination and CLI export/import works", async (t) => {

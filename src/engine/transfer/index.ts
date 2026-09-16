@@ -1,15 +1,12 @@
-import {
-  appendFileSync,
-  createReadStream,
-  existsSync,
-  mkdirSync,
-  renameSync,
-  rmSync,
-} from "node:fs";
+import { appendFileSync, createReadStream, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
+import {
+  reserveDestination,
+  type DestinationReservation,
+} from "../reservation.js";
 import {
   computeLegacyIdentityRemaps,
   convertLegacyRootPaths,
@@ -18,7 +15,11 @@ import {
   type IndexConversionVerification,
   type LegacyManifest,
 } from "../migrate/index.js";
-import { readWorkspaceManifest, writeWorkspaceManifest } from "../manifest.js";
+import {
+  parsePortableManifest,
+  readWorkspaceManifest,
+  writeWorkspaceManifest,
+} from "../manifest.js";
 import { createFilesSchema, createEntitiesSchema } from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
 import { CURRENT_INDEX_VERSION } from "../types.js";
@@ -107,16 +108,13 @@ export async function exportWorkspaceIndex(
   const report = options.onProgress ?? (() => undefined);
   const sourceHome = options.sourceHome;
 
-  if (existsSync(options.artifactPath)) {
-    throw transferError("Artifact path already exists", options.artifactPath);
-  }
-
   // Writer exclusion across the manifest and both collections, acquired
   // before any read.
   const lock = acquireReadWriteLock(join(sourceHome, "locks", "home"), "read", {
     operation: "index.export",
   });
   const openHandles: ZVecCollection[] = [];
+  let reservation: DestinationReservation | undefined;
   try {
     report("read", "Reading source index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
@@ -141,8 +139,15 @@ export async function exportWorkspaceIndex(
     }
 
     report("write", "Writing transfer artifact");
-    mkdirSync(options.artifactPath);
-    const writer = artifactWriter(options.artifactPath);
+    // The artifact directory is reserved exclusively: competing operations
+    // meet the lock, and an aborted export removes only its own staging.
+    const reserved = reserveDestination({
+      destinationHome: options.artifactPath,
+      operation: "index.export",
+      existingIndexMarkers: ["format.json", "manifest.json"],
+    });
+    reservation = reserved;
+    const writer = artifactWriter(reserved.stagingHome);
 
     let portableManifest: PortableManifest;
     let embedding: TransferFormatFile["embedding"];
@@ -227,25 +232,29 @@ export async function exportWorkspaceIndex(
     }
 
     writer.finish();
-    writeJsonFileSync(
-      join(options.artifactPath, "manifest.json"),
-      portableManifest,
-      {
-        fileMode: 0o600,
-      },
-    );
-    const formatFile: TransferFormatFile = {
-      format: TRANSFER_FORMAT,
-      formatVersion: TRANSFER_FORMAT_VERSION,
-      indexId: portableManifest.id,
-      embedding,
-      indexVersion: CURRENT_INDEX_VERSION,
-      createdTime: portableManifest.createdTime,
-      exportedTime: Date.now(),
-      counts: { files: fileDocs.length, entities: entityDocs.length },
-    };
-    writeJsonFileSync(join(options.artifactPath, "format.json"), formatFile, {
-      fileMode: 0o600,
+    // Publication: format and manifest metadata are finalized into staging
+    // and moved into place last; the reservation commits once at release.
+    reserved.publish(() => {
+      const formatFile: TransferFormatFile = {
+        format: TRANSFER_FORMAT,
+        formatVersion: TRANSFER_FORMAT_VERSION,
+        indexId: portableManifest.id,
+        embedding,
+        indexVersion: CURRENT_INDEX_VERSION,
+        createdTime: portableManifest.createdTime,
+        exportedTime: Date.now(),
+        counts: { files: fileDocs.length, entities: entityDocs.length },
+      };
+      writeJsonFileSync(
+        join(reserved.stagingHome, "format.json"),
+        formatFile,
+        { fileMode: 0o600 },
+      );
+      writeJsonFileSync(
+        join(reserved.stagingHome, "manifest.json"),
+        portableManifest,
+        { fileMode: 0o600 },
+      );
     });
     report("done", "Export complete");
 
@@ -256,7 +265,7 @@ export async function exportWorkspaceIndex(
       entitiesExported: entityDocs.length,
     };
   } catch (error) {
-    rmSync(options.artifactPath, { recursive: true, force: true });
+    reservation?.abort();
     throw error;
   } finally {
     for (const handle of openHandles.splice(0).reverse()) {
@@ -297,32 +306,58 @@ export async function importWorkspaceIndex(
       artifactPath,
     );
   }
-  const portableManifest = readJsonFileSync<PortableManifest | null>(
+  const rawManifest = readJsonFileSync<unknown>(
     join(artifactPath, "manifest.json"),
     null,
   );
-  if (!portableManifest) {
+  if (rawManifest === null) {
     throw transferError("Transfer artifact manifest is missing", artifactPath);
   }
-
-  const destinationHome = join(destinationRoot, ".zvec-grep");
-  if (existsSync(destinationHome)) {
+  // Validate and reconstruct portable metadata from the allowlist before
+  // anything is staged: invalid, credential-bearing, or legacy manifests
+  // leave the artifact and any existing destination untouched.
+  let portableManifest: PortableManifest;
+  try {
+    portableManifest = parsePortableManifest(rawManifest, artifactPath);
+  } catch {
     throw transferError(
-      "Destination already contains a workspace index",
-      destinationHome,
+      "Transfer artifact manifest is invalid or unsupported",
+      artifactPath,
+    );
+  }
+  if (formatFile.indexId !== portableManifest.id) {
+    throw transferError(
+      "Transfer artifact identity does not match its manifest",
+      artifactPath,
+    );
+  }
+  if (
+    !portableManifest.embedding ||
+    portableManifest.embedding.provider !== formatFile.embedding.provider ||
+    portableManifest.embedding.model !== formatFile.embedding.model ||
+    portableManifest.embedding.dimension !== formatFile.embedding.dimension ||
+    portableManifest.embedding.metric !== formatFile.embedding.metric
+  ) {
+    throw transferError(
+      "Transfer artifact embedding schema does not match its manifest",
+      artifactPath,
     );
   }
 
-  const stagingHome = join(
-    destinationRoot,
-    `.zvec-grep.importing-${process.pid}-${Date.now()}`,
-  );
-  mkdirSync(stagingHome);
+  const destinationHome = join(destinationRoot, ".zvec-grep");
+  const reserved = reserveDestination({
+    destinationHome,
+    operation: "index.import",
+    existingIndexMarkers: ["manifest.json", "files.zvec", "index.zvec"],
+  });
+
   const openHandles: ZVecCollection[] = [];
   try {
     report("write", "Building destination index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-    const stagingPaths = resolveWorkspaceIndexStoragePaths(stagingHome);
+    const stagingPaths = resolveWorkspaceIndexStoragePaths(
+      reserved.stagingHome,
+    );
     const destFiles = track(
       ZVecCreateAndOpen(stagingPaths.filesPath, createFilesSchema()),
     );
@@ -393,10 +428,13 @@ export async function importWorkspaceIndex(
       { files: fileDocs.length, entities: entityDocs.length },
       vectorById,
       options.verifySampleLimit ?? 256,
+      portableManifest.id,
     );
     if (
       !verification.countsMatch ||
       !verification.identitiesUnique ||
+      !verification.identitiesDerived ||
+      !verification.requiredFieldsValid ||
       !verification.ownershipValid ||
       !verification.inventoriesExact ||
       !verification.groupIntegrity ||
@@ -408,18 +446,14 @@ export async function importWorkspaceIndex(
       );
     }
 
-    writeWorkspaceManifest(stagingHome, {
-      ...portableManifest,
-      updatedTime: Date.now(),
-    });
-
-    if (existsSync(destinationHome)) {
-      throw transferError(
-        "Destination was claimed during import; staged result discarded",
-        destinationHome,
-      );
-    }
-    renameSync(stagingHome, destinationHome);
+    // Publication: finalize the manifest into staging, move children with
+    // the manifest last, and commit once at reservation release.
+    reserved.publish(() =>
+      writeWorkspaceManifest(reserved.stagingHome, {
+        ...portableManifest,
+        updatedTime: Date.now(),
+      }),
+    );
     // Supported replacement workflow: verification is explicitly invalidated
     // at publication; the imported index reconciles at its first indexing run.
     new WorkspaceBindingStore().invalidate(
@@ -437,7 +471,7 @@ export async function importWorkspaceIndex(
       verification,
     };
   } catch (error) {
-    rmSync(stagingHome, { recursive: true, force: true });
+    reserved.abort();
     throw error;
   } finally {
     for (const handle of openHandles.splice(0).reverse()) {

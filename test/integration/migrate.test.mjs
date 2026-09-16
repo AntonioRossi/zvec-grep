@@ -292,15 +292,28 @@ test("migration cleans up handles and staging after interruption, and retries", 
   assert.equal(result.verification.countsMatch, true);
 });
 
-test("migration refuses to overwrite an existing destination", async (t) => {
+test("migration claims an empty unreserved destination but rejects an indexed one", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-  const parent = await createTemporaryDirectory(t, "zg-migrate-guard-");
+  const parent = await createTemporaryDirectory(t, "zg-migrate-claim-");
   const { sourceRoot, manifest } = await makeSourceWorkspace(t, parent);
   const legacyHome = join(sourceRoot, ".zvec-grep-legacy");
   await buildLegacyHome(sourceRoot, legacyHome, manifest.id);
 
-  const destinationRoot = join(parent, "destination");
-  await mkdir(join(destinationRoot, ".zvec-grep"), { recursive: true });
+  // An empty, unreserved destination directory is claimed by the protocol.
+  const emptyRoot = join(parent, "empty-destination");
+  await mkdir(join(emptyRoot, ".zvec-grep"), { recursive: true });
+  const claimed = await migrateWorkspaceIndex({
+    sourceHome: legacyHome,
+    destinationRoot: emptyRoot,
+  });
+  assert.equal(claimed.verification.countsMatch, true);
+  assert.ok(
+    await readdir(join(emptyRoot, ".zvec-grep")).then((entries) =>
+      entries.includes("manifest.json"),
+    ),
+  );
+
+  // A destination that already holds an index is rejected, source untouched.
   const sourceManifestBefore = await readFile(
     join(legacyHome, "manifest.json"),
     "utf8",
@@ -309,7 +322,7 @@ test("migration refuses to overwrite an existing destination", async (t) => {
     () =>
       migrateWorkspaceIndex({
         sourceHome: legacyHome,
-        destinationRoot,
+        destinationRoot: emptyRoot,
       }),
     /Destination already contains a workspace index/,
   );
@@ -317,5 +330,4 @@ test("migration refuses to overwrite an existing destination", async (t) => {
     await readFile(join(legacyHome, "manifest.json"), "utf8"),
     sourceManifestBefore,
   );
-  assert.deepEqual(await readdir(destinationRoot), [".zvec-grep"]);
 });

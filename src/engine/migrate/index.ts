@@ -1,7 +1,11 @@
-import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+
 import { dirname, isAbsolute, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
+import {
+  reserveDestination,
+  type DestinationReservation,
+} from "../reservation.js";
 import { writeWorkspaceManifest } from "../manifest.js";
 import { createFilesSchema, createEntitiesSchema } from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
@@ -63,6 +67,8 @@ export type MigrateWorkspaceIndexResult = {
 export type IndexConversionVerification = {
   countsMatch: boolean;
   identitiesUnique: boolean;
+  identitiesDerived: boolean;
+  requiredFieldsValid: boolean;
   ownershipValid: boolean;
   inventoriesExact: boolean;
   groupIntegrity: boolean;
@@ -135,7 +141,7 @@ export async function migrateWorkspaceIndex(
     }
   };
 
-  let stagingHome: string | undefined;
+  let reservation: DestinationReservation | undefined;
   try {
     const raw = readJsonFileSync<unknown>(manifestPath, null);
     if (raw === null) {
@@ -153,12 +159,6 @@ export async function migrateWorkspaceIndex(
     // interpreted against it, even when it does not exist on this host.
     const originalRoot = dirname(manifest.path);
     const destinationHome = join(destinationRoot, ".zvec-grep");
-    if (existsSync(destinationHome)) {
-      throw migrationError(
-        "Destination already contains a workspace index",
-        destinationHome,
-      );
-    }
 
     report("read", "Reading legacy index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
@@ -185,14 +185,19 @@ export async function migrateWorkspaceIndex(
         entityDocs,
       );
 
-    // Stage the destination exclusively.
-    stagingHome = join(
-      destinationRoot,
-      `.zvec-grep.migrating-${process.pid}-${Date.now()}`,
-    );
-    mkdirSync(stagingHome);
+    // Reserve the destination exclusively before building anything: the
+    // write lock is the reservation, staging lives inside it, and
+    // publication commits exactly once when it is released.
+    const reserved = reserveDestination({
+      destinationHome,
+      operation: "index.migrate",
+      existingIndexMarkers: ["manifest.json", "files.zvec", "index.zvec"],
+    });
+    reservation = reserved;
     report("write", "Writing portable destination");
-    const stagingPaths = resolveWorkspaceIndexStoragePaths(stagingHome);
+    const stagingPaths = resolveWorkspaceIndexStoragePaths(
+      reserved.stagingHome,
+    );
     const destFiles = track(
       ZVecCreateAndOpen(stagingPaths.filesPath, createFilesSchema()),
     );
@@ -275,6 +280,7 @@ export async function migrateWorkspaceIndex(
       { files: fileDocs.length, entities: entityDocs.length },
       vectorById,
       options.verifySampleLimit ?? DEFAULT_VERIFY_SAMPLE_LIMIT,
+      manifest.id,
     );
     if (!verificationPassed(verification)) {
       throw migrationError(
@@ -287,35 +293,30 @@ export async function migrateWorkspaceIndex(
       typeof manifest.embeddingRuntime?.apiKey === "string";
     const droppedPersistedDevice =
       typeof manifest.embeddingRuntime?.device === "string";
-    writeWorkspaceManifest(stagingHome, {
-      manifestVersion: 2,
-      id: manifest.id,
-      name: manifest.name,
-      rootPaths: convertLegacyRootPaths(manifest.rootPaths, originalRoot),
-      indexPolicy: manifest.indexPolicy,
-      embedding: manifest.embedding,
-      indexVersion: CURRENT_INDEX_VERSION,
-      createdTime: manifest.createdTime,
-      updatedTime: Date.now(),
-      embeddingRuntime: {
-        ...(typeof manifest.embeddingRuntime?.endpoint === "string"
-          ? { endpoint: manifest.embeddingRuntime.endpoint }
-          : {}),
-      },
-    });
 
     closeTracked(sourceFiles);
     closeTracked(sourceEntities);
 
-    // Publication: re-check ownership before the destination moves into place.
-    if (existsSync(destinationHome)) {
-      throw migrationError(
-        "Destination was claimed during migration; staged result discarded",
-        destinationHome,
-      );
-    }
-    renameSync(stagingHome, destinationHome);
-    stagingHome = undefined;
+    // Publication: finalize the manifest into staging, move children with
+    // the manifest last, and commit once at reservation release.
+    reserved.publish(() =>
+      writeWorkspaceManifest(reserved.stagingHome, {
+        manifestVersion: 2,
+        id: manifest.id,
+        name: manifest.name,
+        rootPaths: convertLegacyRootPaths(manifest.rootPaths, originalRoot),
+        indexPolicy: manifest.indexPolicy,
+        embedding: manifest.embedding,
+        indexVersion: CURRENT_INDEX_VERSION,
+        createdTime: manifest.createdTime,
+        updatedTime: Date.now(),
+        embeddingRuntime: {
+          ...(typeof manifest.embeddingRuntime?.endpoint === "string"
+            ? { endpoint: manifest.embeddingRuntime.endpoint }
+            : {}),
+        },
+      }),
+    );
     // Supported replacement workflow: verification is explicitly invalidated
     // at publication; directory identity alone cannot prove non-replacement.
     new WorkspaceBindingStore().invalidate(manifest.id, destinationRoot);
@@ -332,9 +333,7 @@ export async function migrateWorkspaceIndex(
       verification,
     };
   } catch (error) {
-    if (stagingHome !== undefined) {
-      rmSync(stagingHome, { recursive: true, force: true });
-    }
+    reservation?.abort();
     throw error;
   } finally {
     closeAll();
@@ -418,6 +417,8 @@ function verificationPassed(
   return (
     verification.countsMatch &&
     verification.identitiesUnique &&
+    verification.identitiesDerived &&
+    verification.requiredFieldsValid &&
     verification.ownershipValid &&
     verification.inventoriesExact &&
     verification.groupIntegrity &&
@@ -430,6 +431,7 @@ export function verifyConvertedIndex(
   expectedCounts: { files: number; entities: number },
   vectorById: ReadonlyMap<string, unknown>,
   sampleLimit: number,
+  indexId: string,
 ): IndexConversionVerification {
   const destFiles = ZVecOpen(stagingPaths.filesPath, { readOnly: true });
   const destEntities = ZVecOpen(stagingPaths.indexPath, { readOnly: true });
@@ -448,6 +450,63 @@ export function verifyConvertedIndex(
     const identitiesUnique =
       fileIds.size === destFileDocs.length &&
       entityIds.size === destEntityDocs.length;
+
+    // Application-level identity: native IDs, stored identity fields, and
+    // the portable derivation (index UUID + canonical path) must all agree,
+    // and required fields must be present and typed.
+    const canonicalPaths = new Set<string>();
+    const derivedFileIds = new Set<string>();
+    let identitiesDerived = true;
+    let requiredFieldsValid = true;
+    for (const doc of destFileDocs) {
+      const canonicalPath = String(doc.fields.canonical_path ?? "");
+      const validPath =
+        isCanonicalRelativePath(canonicalPath) && canonicalPath !== ".";
+      if (!validPath || canonicalPaths.has(canonicalPath)) {
+        identitiesDerived = false;
+      }
+      canonicalPaths.add(canonicalPath);
+      const derived = validPath ? makeFileId(indexId, canonicalPath) : null;
+      if (
+        derived === null ||
+        doc.id !== derived ||
+        String(doc.fields.file_id ?? "") !== derived
+      ) {
+        identitiesDerived = false;
+      } else {
+        derivedFileIds.add(derived);
+      }
+      if (
+        typeof doc.fields.relative_path !== "string" ||
+        doc.fields.relative_path.length === 0 ||
+        typeof doc.fields.root_path !== "string" ||
+        !isCanonicalRelativePath(String(doc.fields.root_path)) ||
+        !Number.isInteger(doc.fields.size_bytes) ||
+        !Number.isInteger(doc.fields.last_modified_time) ||
+        typeof doc.fields.kind !== "string" ||
+        typeof doc.fields.format !== "string"
+      ) {
+        requiredFieldsValid = false;
+      }
+    }
+    for (const doc of destEntityDocs) {
+      const fileId = String(doc.fields.file_id ?? "");
+      const fragmentIndex = Number(doc.fields.fragment_index);
+      if (
+        derivedFileIds.has(fileId) &&
+        (!Number.isInteger(fragmentIndex) ||
+          fragmentIndex < 0 ||
+          doc.id !== sha256Text(`${fileId}\0${fragmentIndex}`))
+      ) {
+        identitiesDerived = false;
+      }
+      if (
+        typeof doc.fields.range_json !== "string" ||
+        doc.fields.range_json.length === 0
+      ) {
+        requiredFieldsValid = false;
+      }
+    }
 
     // Ownership: every entity belongs to a converted file, and every group
     // stays within one file with exactly one major fragment owned by it.
@@ -531,6 +590,8 @@ export function verifyConvertedIndex(
     return {
       countsMatch,
       identitiesUnique,
+      identitiesDerived,
+      requiredFieldsValid,
       ownershipValid,
       inventoriesExact,
       groupIntegrity,
