@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import {
+  cp,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -88,9 +96,13 @@ async function importInSeparateProcess(artifactPath, destinationRoot, t) {
   // The child must exit successfully and leave a fresh, completely validated
   // result file; stdout is not part of the exchange.
   const started = Date.now();
-  await execFileAsync(process.execPath, ["--input-type=module", "--eval", script], {
-    timeout: 120_000,
-  });
+  await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "--eval", script],
+    {
+      timeout: 120_000,
+    },
+  );
   const raw = JSON.parse(await readFile(resultPath, "utf8"));
   const resultStat = await stat(resultPath);
   assert.ok(
@@ -309,7 +321,9 @@ test("import rejects internally consistent but underived identities", async (t) 
     fields: {
       ...doc.fields,
       entity_ids_json: JSON.stringify(
-        JSON.parse(doc.fields.entity_ids_json).map((id) => idByOld.get(id) ?? id),
+        JSON.parse(doc.fields.entity_ids_json).map(
+          (id) => idByOld.get(id) ?? id,
+        ),
       ),
     },
   }));

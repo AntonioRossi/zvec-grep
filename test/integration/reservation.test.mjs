@@ -23,7 +23,10 @@ const FIXTURES = {
 async function makeLegacySource(t, parent) {
   const sourceRoot = join(parent, "original");
   await mkdir(join(sourceRoot, "docs"), { recursive: true });
-  await writeFile(join(sourceRoot, "docs", "guide.md"), FIXTURES["docs/guide.md"]);
+  await writeFile(
+    join(sourceRoot, "docs", "guide.md"),
+    FIXTURES["docs/guide.md"],
+  );
   const service = await createZvecGrep({
     root: sourceRoot,
     embeddingModel: new FakeEmbeddingModel(),
@@ -192,7 +195,10 @@ test("export preserves a competing claim's files in success and abort", async (t
   const parent = await createTemporaryDirectory(t, "zg-reserve-export-");
   const sourceRoot = join(parent, "original");
   await mkdir(join(sourceRoot, "docs"), { recursive: true });
-  await writeFile(join(sourceRoot, "docs", "guide.md"), FIXTURES["docs/guide.md"]);
+  await writeFile(
+    join(sourceRoot, "docs", "guide.md"),
+    FIXTURES["docs/guide.md"],
+  );
   const service = await createZvecGrep({
     root: sourceRoot,
     embeddingModel: new FakeEmbeddingModel(),

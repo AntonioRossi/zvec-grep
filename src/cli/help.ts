@@ -183,6 +183,9 @@ See zg --help environment for precedence and Server-mode scope.`;
 
 Index options:
   --rebuild                         Rebuild the existing index
+  --reconcile                       Force a full content-hash reconciliation,
+                                    ignoring stored trust (recovery path after
+                                    manually restoring index files in place)
   --drop                            Permanently remove the workspace index
   --yes                             Confirm --drop without prompting
   --debug                           Print file-scan and model failure diagnostics

@@ -100,8 +100,9 @@ paths, `device`, `apiKey`, or any verification claim.
 
 1. Verification state is a **host-local binding record** (global home, keyed
    by index UUID, bounded in size): the physical workspace binding (realpath
-   and filesystem identity) plus the time it was content-verified. It is
-   excluded from transfer artifacts by construction.
+   with actual filesystem spelling, plus the storage instance's device/inode)
+   and the time it was content-verified. It is excluded from transfer
+   artifacts by construction.
 2. An index is **unverified** whenever the current binding cannot be
    established against the record — missing, mismatched, or unreadable. Any
    doubt means unverified; no token inside the transferred data is trusted.
@@ -115,8 +116,13 @@ paths, `device`, `apiKey`, or any verification claim.
    - Changed content: normal incremental handling.
    - Missing files: normal deletion handling.
 4. The binding record is published **only after** a successful reconciliation.
-   Migrated and imported indexes start unverified and reconcile at their
-   first indexing run.
+   Every supported restore/replacement workflow (import, migrate,
+   rebuild/reset, drop) **explicitly invalidates** the workspace's binding at
+   publication, because directory identity alone cannot detect content
+   replaced inside an existing storage directory and inode numbers can be
+   reused. Manually restoring index files in place is **unsupported** and not
+   detected; the documented recovery is a forced pass:
+   `zg --index --reconcile`.
 5. Acceptance: unchanged relocated content causes **zero** document-embedding
    calls. Query embedding is separate and expected.
 
@@ -132,23 +138,44 @@ paths, `device`, `apiKey`, or any verification claim.
 3. **Converter**: an explicit operation (`zg --migrate-index <legacy-home>
    <destination-root>`; the destination is required) that reads a **closed**
    version-1 index under a lock acquired before any read, validates the
-   original source-root mapping, computes CRPs, and writes a separate
-   version-2 destination in an exclusive staging directory:
+   original source-root mapping, computes CRPs, and builds a version-2
+   destination inside an **exclusive destination reservation** (see §7a):
    - full ID remapping (file IDs, fragment IDs, group references,
      `entity_ids_json` inventories) with the index UUID preserved — the
      accepted decision; no permanent lookup table;
    - stored vectors and fragment content preserved byte-exactly, with native
      write statuses checked;
-   - verification of the destination before activation: counts, unique
-     remapped identities, per-file ownership, exact public inventories,
-     single-file groups with exactly one owned major, and vector equality
+   - verification of the destination before activation: counts, unique and
+     **correctly derived** identities (`sha256hex(index UUID + "\0" +
+     canonical path)` for files and the fragment rule for entities),
+     per-file ownership, exact public inventories, single-file groups with
+     exactly one owned major, required typed fields, and vector equality
      (sampled checks are named as such);
    - every opened handle is closed in exception-safe finalizers; the source
      is never modified; an interrupted or rejected conversion leaves no
-     staging residue and the source usable; the destination is re-validated
-     for ownership immediately before publication;
+     staging residue and the source usable;
    - the migrated index starts **unverified** and reconciles at its first
-     indexing run.
+     indexing run, with verification explicitly invalidated at publication.
+
+### 7a. Destination reservation protocol
+
+Migration, import, and export publish through one protocol:
+
+1. **Reserve at start**: create the destination and hold its write lock for
+   the whole operation. A destination that already contains an index fails;
+   a live reservation blocks competitors and discovery with a "creation in
+   progress" lock error; an abandoned reservation is reclaimed only through
+   the lock layer's verified-dead-owner rule.
+2. **Build inside the reservation** and verify the staged result.
+3. **Re-validate before publication**: the reservation's token and the home's
+   device/inode must match; any mismatch aborts without merging staged
+   content or touching the replacement.
+4. **Commit once**: finalize the manifest into staging, move staged children
+   into place (manifest last), and release the lock — release is the single
+   commit point. After commit, no error path performs cleanup of any kind.
+5. **Pre-commit abort**: only provably owned staging is removed (token-named
+   inside the reservation, physical release checks throughout); foreign
+   content always survives, including on `EEXIST` interleavings.
 
 ## 7. Export and import (logical portability)
 
@@ -168,14 +195,21 @@ artifact, never the source database.
    (no absolute location, no device, no API key, no verification claim), and
    `files.jsonl` / `entities.jsonl` with every scalar field, fragment
    content, relationships, and vectors (base64).
-4. **Import**: recreate collections with identical schema, metric, and
-   dimension in an exclusive staging directory; insert with status checks;
-   run the same verification as migration (counts, unique identities,
-   ownership, exact inventories, group integrity, vector equality); publish
-   by rename after re-checking destination ownership. Import pays structure
-   rebuild, never inference, and the imported index starts unverified.
-5. **Boundary proof**: import runs in a separate process with the source
-   unavailable, reading only the serialized artifact.
+4. **Import validation**: the artifact manifest is validated against the
+   normal reader contract and reconstructed from an allowlist before anything
+   is staged (credential-bearing, legacy, malformed, or host-bound metadata
+   is rejected); artifact and manifest must agree on identity, embedding
+   schema, and supported versions; invalid artifacts leave any existing
+   destination untouched.
+5. **Import**: build inside the destination reservation (§7a), insert with
+   status checks, and run the same verification as migration — counts, unique
+   and correctly derived identities, ownership, exact inventories, group
+   integrity, required fields, vector equality. Import pays structure
+   rebuild, never inference, and the imported index starts unverified with
+   verification explicitly invalidated at publication.
+6. **Boundary proof**: import runs in a separate process with the source
+   unavailable, reading only the serialized artifact; test results cross the
+   process boundary as fresh, validated result files.
 
 ## 8. Test obligations
 
