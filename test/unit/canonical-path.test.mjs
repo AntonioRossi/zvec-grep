@@ -117,9 +117,18 @@ test("resolver forbids symlinks escaping the workspace", async (t) => {
     () => resolver.requireContainedSync("linked/secret.md"),
     /escapes the workspace/,
   );
-  // A missing path inside an escaping tree is forbidden, not missing.
+  // A missing leaf under an escaping intermediate is also forbidden: the
+  // escape is detected at the existing component, never as a missing file.
   const missingInsideEscape = resolver.resolveDetailedSync("linked/absent.md");
-  assert.equal(missingInsideEscape.status, "missing");
+  assert.equal(missingInsideEscape.status, "forbidden");
+  const asyncMissingInsideEscape = await resolver.resolveDetailed(
+    "linked/absent.md",
+  );
+  assert.equal(asyncMissingInsideEscape.status, "forbidden");
+  assert.throws(
+    () => resolver.requireContainedSync("linked/absent.md"),
+    /escapes the workspace/,
+  );
 });
 
 test("findCanonicalNameCollisions detects Unicode and case groups", () => {

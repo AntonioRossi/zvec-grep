@@ -320,6 +320,8 @@ export function parseArgs(args: readonly string[]): ParsedArgs {
       options.color = "never";
     } else if (arg === "--rebuild") {
       options.rebuild = true;
+    } else if (arg === "--reconcile") {
+      options.reconcile = true;
     } else if (arg === "--drop") {
       options.drop = true;
     } else if (arg === "--force") {
@@ -954,6 +956,7 @@ function validateCliShape(
       [options.apiKey, "--api-key"],
       [options.endpoint, "--endpoint"],
       [options.rebuild, "--rebuild"],
+      [options.reconcile, "--reconcile"],
       [options.drop, "--drop"],
       [options.resetPaths, "--reset-paths"],
       [options.globs?.length, "--glob"],

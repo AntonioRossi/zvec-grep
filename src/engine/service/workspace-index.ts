@@ -90,8 +90,12 @@ export class WorkspaceIndex {
     // An index is unverified until the host-local binding store proves the
     // current workspace binding was content-verified. Unverified indexes
     // reconcile: every matched file is hashed, unchanged content keeps its
-    // vectors, and the binding is recorded only after success.
-    const reconcile = !this.bindings.matches(this.info.id, this.workspaceRoot);
+    // vectors, and the binding is recorded only after success. --reconcile
+    // forces the pass regardless of stored trust (the documented recovery
+    // path for unsupported in-place restores).
+    const reconcile =
+      options.reconcile === true ||
+      !this.bindings.matches(this.info.id, this.workspaceRoot);
     const context = {
       workspaceIndex: this.info,
       embeddingModel,

@@ -46,6 +46,7 @@ import {
   writeWorkspaceManifest,
 } from "../manifest.js";
 import { createCanonicalPathResolver } from "../utils/canonical-path.js";
+import { WorkspaceBindingStore } from "../bindings.js";
 import {
   manifestRootPathsFromRuntime,
   validateRootPaths,
@@ -266,6 +267,15 @@ class ZvecGrepService implements ZvecGrep {
               },
             );
             if (options.rebuild || !isWorkspaceIndexed(existingInfo)) {
+              // Supported replacement workflow: reset invalidates the old
+              // binding explicitly; directory identity alone cannot prove
+              // non-replacement.
+              if (existing?.id) {
+                new WorkspaceBindingStore().invalidate(
+                  existing.id,
+                  location.root,
+                );
+              }
               resetWorkspaceIndex(location);
             }
 
@@ -311,6 +321,7 @@ class ZvecGrepService implements ZvecGrep {
               try {
                 const result = await workspaceIndex.index({
                   rebuild: false,
+                  reconcile: options.reconcile,
                   embeddingConcurrency: options.embeddingConcurrency,
                   onProgress: options.onProgress,
                   changedPaths: options.changedPaths,
@@ -352,11 +363,13 @@ class ZvecGrepService implements ZvecGrep {
     );
     const location = workspaceIndexLocation(root);
     try {
-      if (!readWorkspaceManifest(location.home)) {
+      const existing = readWorkspaceManifest(location.home);
+      if (!existing) {
         return false;
       }
 
       return await withHomeWriteLock(location.home, "index.drop", async () => {
+        new WorkspaceBindingStore().invalidate(existing.id, location.root);
         resetWorkspaceIndex(location);
         return true;
       });

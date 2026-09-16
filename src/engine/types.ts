@@ -253,6 +253,8 @@ export type IndexProgress = {
 export type IndexOptions = {
   name?: string;
   rebuild?: boolean;
+  /** Force a full content-hash reconciliation, ignoring stored trust. */
+  reconcile?: boolean;
   embeddingConcurrency?: number;
   onProgress?: (progress: IndexProgress) => void;
   changedPaths?: readonly string[];

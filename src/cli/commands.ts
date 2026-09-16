@@ -530,6 +530,7 @@ async function runDirectIndex(
           root: rootPath.absolutePath,
           rootPaths: explicitRoot ? [rootPath] : undefined,
           rebuild: parsed.options.rebuild,
+          reconcile: parsed.options.reconcile,
           resetPaths: parsed.options.resetPaths,
           globs: parsed.options.globs,
           insensitiveGlobs: parsed.options.insensitiveGlobs,

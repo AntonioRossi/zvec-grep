@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
+import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
 import {
   computeLegacyIdentityRemaps,
@@ -419,6 +420,12 @@ export async function importWorkspaceIndex(
       );
     }
     renameSync(stagingHome, destinationHome);
+    // Supported replacement workflow: verification is explicitly invalidated
+    // at publication; the imported index reconciles at its first indexing run.
+    new WorkspaceBindingStore().invalidate(
+      portableManifest.id,
+      destinationRoot,
+    );
     report("done", "Import complete");
 
     return {

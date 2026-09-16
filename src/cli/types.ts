@@ -50,6 +50,7 @@ export type CliOptions = {
   routes?: ZvecGrepContextRoute[];
   fuse?: boolean;
   rebuild?: boolean;
+  reconcile?: boolean;
   drop?: boolean;
   force?: boolean;
   resetPaths?: boolean;
