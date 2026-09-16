@@ -200,7 +200,9 @@ test("reader locks follow the same three-state rule", async (t) => {
   writer.release();
 
   // A live local reader can be taken and released normally.
-  const reader = acquireReadWriteLock(lockPath, "read", { operation: "reader" });
+  const reader = acquireReadWriteLock(lockPath, "read", {
+    operation: "reader",
+  });
   reader.release();
 });
 

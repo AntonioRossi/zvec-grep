@@ -117,6 +117,7 @@ Core options:
 | --- | --- |
 | `--embedding <model>` | Model for a new or rebuilt index |
 | `--rebuild` | Recreate an existing index |
+| `--reconcile` | Force a full content-hash reconciliation, ignoring stored trust |
 | `--drop` | Permanently remove the Workspace index |
 | `--yes` | Confirm `--drop` without a prompt |
 | `--reset-paths` | Replace stored file-selection settings |
