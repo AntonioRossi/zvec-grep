@@ -1,22 +1,26 @@
 import { readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { tryRealpathSync } from "./utils/canonical-path.js";
 import { readJsonFileSync, writeJsonFileSync } from "./utils/json.js";
-import { defaultHome, normalizePath } from "./utils/path.js";
+import { defaultHome } from "./utils/path.js";
 
 /**
- * Host-local workspace binding records: which physical workspace locations
- * have been content-verified for a given portable index. This store lives in
- * the global home, never inside the workspace, so transferred indexes carry
- * no verification claim. Whenever the current binding cannot be established
- * against the record, the index is treated as unverified and its next
- * indexing run reconciles by content hash.
+ * Host-local workspace binding records: which physical workspace and storage
+ * instances have been content-verified for a given portable index. This
+ * store lives in the global home, never inside the workspace, so transferred
+ * indexes carry no verification claim. Whenever the current binding cannot
+ * be established against the record, the index is treated as unverified and
+ * its next indexing run reconciles by content hash.
  */
 
 export type WorkspaceBinding = {
-  /** NFC realpath of the verified workspace root. */
+  /** Actual filesystem spelling (realpath) of the verified workspace root. */
   rootPath: string;
-  device: number;
-  inode: number;
+  rootDevice: number;
+  rootInode: number;
+  /** Storage instance identity (`<root>/.zvec-grep` at verification time). */
+  homeDevice: number;
+  homeInode: number;
   verifiedTime: number;
 };
 
@@ -32,13 +36,39 @@ const MAX_INDEX_ENTRIES = 1024;
 export function currentWorkspaceBinding(
   workspaceRoot: string,
 ): Omit<WorkspaceBinding, "verifiedTime"> | null {
+  // Resolve the actual filesystem spelling before recording identity: NFC
+  // canonical document identities must not change which physical root gets
+  // inspected (distinct NFC/NFD root directories are different bindings).
+  const rootPath = tryRealpathSync(workspaceRoot);
+  if (rootPath === undefined) {
+    return null;
+  }
   try {
-    const realRoot = normalizePath(workspaceRoot).normalize("NFC");
-    const info = statSync(realRoot);
-    return { rootPath: realRoot, device: info.dev, inode: info.ino };
+    const rootInfo = statSync(rootPath);
+    const homeInfo = statSync(join(rootPath, ".zvec-grep"));
+    return {
+      rootPath,
+      rootDevice: rootInfo.dev,
+      rootInode: rootInfo.ino,
+      homeDevice: homeInfo.dev,
+      homeInode: homeInfo.ino,
+    };
   } catch {
     return null;
   }
+}
+
+function sameBinding(
+  binding: WorkspaceBinding,
+  current: Omit<WorkspaceBinding, "verifiedTime">,
+): boolean {
+  return (
+    binding.rootPath === current.rootPath &&
+    binding.rootDevice === current.rootDevice &&
+    binding.rootInode === current.rootInode &&
+    binding.homeDevice === current.homeDevice &&
+    binding.homeInode === current.homeInode
+  );
 }
 
 export class WorkspaceBindingStore {
@@ -57,8 +87,10 @@ export class WorkspaceBindingStore {
     return this.readBindings(indexId).some(
       (binding) =>
         binding.rootPath === current.rootPath &&
-        binding.device === current.device &&
-        binding.inode === current.inode,
+        binding.rootDevice === current.rootDevice &&
+        binding.rootInode === current.rootInode &&
+        binding.homeDevice === current.homeDevice &&
+        binding.homeInode === current.homeInode,
     );
   }
 
@@ -69,12 +101,7 @@ export class WorkspaceBindingStore {
       return;
     }
     const bindings = this.readBindings(indexId).filter(
-      (binding) =>
-        !(
-          binding.rootPath === current.rootPath &&
-          binding.device === current.device &&
-          binding.inode === current.inode
-        ),
+      (binding) => !sameBinding(binding, current),
     );
     bindings.push({ ...current, verifiedTime: Date.now() });
     const trimmed = bindings.slice(-MAX_BINDINGS_PER_INDEX);
@@ -84,6 +111,35 @@ export class WorkspaceBindingStore {
       { directoryMode: 0o700, fileMode: 0o600 },
     );
     this.evictOldIndexes();
+  }
+
+  /**
+   * Explicitly drop verification for this workspace path. Called by every
+   * supported restore/replacement workflow at publication: directory identity
+   * alone cannot detect content replaced inside an existing storage
+   * directory, and inode numbers can be reused.
+   */
+  invalidate(indexId: string, workspaceRoot: string): void {
+    const rootPath = tryRealpathSync(workspaceRoot);
+    if (rootPath === undefined) {
+      return;
+    }
+    const remaining = this.readBindings(indexId).filter(
+      (binding) => binding.rootPath !== rootPath,
+    );
+    if (remaining.length === 0) {
+      try {
+        unlinkSync(this.recordPath(indexId));
+      } catch {
+        // Already absent.
+      }
+      return;
+    }
+    writeJsonFileSync(
+      this.recordPath(indexId),
+      { version: 1, bindings: remaining } satisfies BindingRecord,
+      { directoryMode: 0o700, fileMode: 0o600 },
+    );
   }
 
   private recordPath(indexId: string): string {
@@ -109,8 +165,10 @@ export class WorkspaceBindingStore {
     return value.bindings.filter(
       (binding) =>
         typeof binding?.rootPath === "string" &&
-        typeof binding.device === "number" &&
-        typeof binding.inode === "number" &&
+        typeof binding.rootDevice === "number" &&
+        typeof binding.rootInode === "number" &&
+        typeof binding.homeDevice === "number" &&
+        typeof binding.homeInode === "number" &&
         typeof binding.verifiedTime === "number",
     );
   }

@@ -231,10 +231,38 @@ export function createCanonicalPathResolver(
     if (realPath === undefined) {
       return { status: "missing" };
     }
-    if (!isPathInside(realRoot, realPath)) {
+    if (!isContained(realPath)) {
       return { status: "forbidden", path };
     }
     return { status: "ok", path };
+  }
+
+  // Containment of every existing traversed component is checked before
+  // descending or returning a missing result: an escaping intermediate
+  // symlink is always forbidden, never a missing file.
+  const containmentCache = new Map<string, boolean>();
+  function isContained(realPath: string): boolean {
+    const cached = containmentCache.get(realPath);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const contained = isPathInside(realRoot, realPath);
+    containmentCache.set(realPath, contained);
+    return contained;
+  }
+
+  function descend(
+    current: string,
+    next: string | null,
+  ): { action: "missing" } | { action: "forbidden"; path: string } | { action: "ok"; path: string } {
+    if (next === null) {
+      return { action: "missing" };
+    }
+    const realNext = tryRealpathSync(next);
+    if (realNext !== undefined && !isContained(realNext)) {
+      return { action: "forbidden", path: next };
+    }
+    return { action: "ok", path: next };
   }
 
   function resolveDetailedSync(canonicalPath: string): CanonicalResolution {
@@ -244,11 +272,16 @@ export function createCanonicalPathResolver(
     }
     let current = root;
     for (const segment of canonicalPath.split("/")) {
-      const next = select(current, segment, entriesFor(current));
-      if (next === null) {
-        return { status: "missing" };
+      const step = descend(
+        current,
+        select(current, segment, entriesFor(current)),
+      );
+      if (step.action !== "ok") {
+        return step.action === "missing"
+          ? { status: "missing" }
+          : { status: "forbidden", path: step.path };
       }
-      current = next;
+      current = step.path;
     }
     return finish(current);
   }
@@ -282,11 +315,13 @@ export function createCanonicalPathResolver(
         }
         cache.set(current, entries);
       }
-      const next = select(current, segment, entries);
-      if (next === null) {
-        return { status: "missing" };
+      const step = descend(current, select(current, segment, entries));
+      if (step.action !== "ok") {
+        return step.action === "missing"
+          ? { status: "missing" }
+          : { status: "forbidden", path: step.path };
       }
-      current = next;
+      current = step.path;
     }
     return finish(current);
   }

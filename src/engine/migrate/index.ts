@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
 import { writeWorkspaceManifest } from "../manifest.js";
 import { createFilesSchema, createEntitiesSchema } from "../storage/index.js";
@@ -315,6 +316,9 @@ export async function migrateWorkspaceIndex(
     }
     renameSync(stagingHome, destinationHome);
     stagingHome = undefined;
+    // Supported replacement workflow: verification is explicitly invalidated
+    // at publication; directory identity alone cannot prove non-replacement.
+    new WorkspaceBindingStore().invalidate(manifest.id, destinationRoot);
     report("done", "Migration complete");
 
     return {
