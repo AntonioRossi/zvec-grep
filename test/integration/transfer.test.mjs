@@ -260,10 +260,6 @@ test("import rejects internally consistent but underived identities", async (t) 
   // fields, inventory references, entity ids and file links all agree) but
   // not derived from the portable scheme (index UUID + canonical path).
   const crypto = await import("node:crypto");
-  const wrongFileId = crypto
-    .createHash("sha256")
-    .update("internally-consistent-but-wrong")
-    .digest("hex");
   const filesPath = join(artifact, "files.jsonl");
   const entitiesPath = join(artifact, "entities.jsonl");
   const fileDocs = (await readFile(filesPath, "utf8"))

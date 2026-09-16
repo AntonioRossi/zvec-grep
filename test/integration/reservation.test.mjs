@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { ZVecInitialize, ZVecLogLevel } from "@zvec/zvec";
@@ -42,7 +42,7 @@ async function makeLegacySource(t, parent) {
 test("reservation blocks competing writers and discovery during migration", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-block-");
-  const { sourceRoot, legacyHome } = await makeLegacySource(t, parent);
+  const { legacyHome } = await makeLegacySource(t, parent);
   const destinationRoot = join(parent, "destination");
   await mkdir(join(destinationRoot, "docs"), { recursive: true });
   await writeFile(
@@ -81,7 +81,7 @@ test("reservation blocks competing writers and discovery during migration", asyn
 test("a replaced reservation aborts without merging or deleting foreign content", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-replace-");
-  const { sourceRoot, legacyHome } = await makeLegacySource(t, parent);
+  const { legacyHome } = await makeLegacySource(t, parent);
   const destinationRoot = join(parent, "destination");
   await mkdir(join(destinationRoot, "docs"), { recursive: true });
   await writeFile(
@@ -125,7 +125,7 @@ test("a replaced reservation aborts without merging or deleting foreign content"
 test("an error after commit never touches the published result", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-commit-");
-  const { sourceRoot, legacyHome } = await makeLegacySource(t, parent);
+  const { legacyHome } = await makeLegacySource(t, parent);
   const destinationRoot = join(parent, "destination");
   await mkdir(join(destinationRoot, "docs"), { recursive: true });
   await writeFile(
@@ -157,7 +157,7 @@ test("an error after commit never touches the published result", async (t) => {
 test("an abandoned reservation is reclaimed through the dead-owner rule", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-abandon-");
-  const { sourceRoot, legacyHome } = await makeLegacySource(t, parent);
+  const { legacyHome } = await makeLegacySource(t, parent);
   const destinationRoot = join(parent, "destination");
   await mkdir(join(destinationRoot, "docs"), { recursive: true });
   await writeFile(

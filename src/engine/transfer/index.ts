@@ -1,4 +1,4 @@
-import { appendFileSync, createReadStream, existsSync } from "node:fs";
+import { appendFileSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
