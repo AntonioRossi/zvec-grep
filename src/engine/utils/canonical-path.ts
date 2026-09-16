@@ -254,7 +254,10 @@ export function createCanonicalPathResolver(
   function descend(
     current: string,
     next: string | null,
-  ): { action: "missing" } | { action: "forbidden"; path: string } | { action: "ok"; path: string } {
+  ):
+    | { action: "missing" }
+    | { action: "forbidden"; path: string }
+    | { action: "ok"; path: string } {
     if (next === null) {
       return { action: "missing" };
     }

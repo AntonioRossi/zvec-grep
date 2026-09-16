@@ -245,11 +245,9 @@ export async function exportWorkspaceIndex(
         exportedTime: Date.now(),
         counts: { files: fileDocs.length, entities: entityDocs.length },
       };
-      writeJsonFileSync(
-        join(reserved.stagingHome, "format.json"),
-        formatFile,
-        { fileMode: 0o600 },
-      );
+      writeJsonFileSync(join(reserved.stagingHome, "format.json"), formatFile, {
+        fileMode: 0o600,
+      });
       writeJsonFileSync(
         join(reserved.stagingHome, "manifest.json"),
         portableManifest,

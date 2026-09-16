@@ -1,4 +1,3 @@
-
 import { dirname, isAbsolute, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";

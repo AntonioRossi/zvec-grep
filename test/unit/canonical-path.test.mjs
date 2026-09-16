@@ -121,9 +121,8 @@ test("resolver forbids symlinks escaping the workspace", async (t) => {
   // escape is detected at the existing component, never as a missing file.
   const missingInsideEscape = resolver.resolveDetailedSync("linked/absent.md");
   assert.equal(missingInsideEscape.status, "forbidden");
-  const asyncMissingInsideEscape = await resolver.resolveDetailed(
-    "linked/absent.md",
-  );
+  const asyncMissingInsideEscape =
+    await resolver.resolveDetailed("linked/absent.md");
   assert.equal(asyncMissingInsideEscape.status, "forbidden");
   assert.throws(
     () => resolver.requireContainedSync("linked/absent.md"),
