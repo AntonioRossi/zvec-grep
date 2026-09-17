@@ -242,3 +242,14 @@ raw paths where identity is sufficient.
 
 Use `ZVEC_GREP_HOME` to relocate Server state. Check `zg --server status` before
 reading logs; routine searches do not need a status preflight.
+## Index locks
+
+Writers hold a file lock at `<workspace>/.zvec-grep/locks/`. A known-live
+local owner keeps its lock regardless of age, and a verified-dead local owner
+is reclaimed safely; locks are **never** reclaimed automatically when
+ownership is uncertain (a foreign host, or missing or corrupt lock metadata),
+so a crashed or externally modified lock blocks the workspace instead of
+risking concurrent writers. Recovery is an explicit operator action: after
+all writers are quiescent, remove the lock directory shown in the
+`ZVEC_GREP.ENGINE.LOCK.BUSY` error. This replaces earlier automatic age-based
+eviction as an intentional behavior change.
