@@ -109,7 +109,9 @@ export function deleteWorkspaceManifest(home: string): void {
 /**
  * Validate untrusted portable-manifest data and reconstruct it from the
  * allowlist of supported fields, so nothing else is republished. Credential
- * and device material is rejected by the shared reader contract.
+ * and device material is rejected by the shared reader contract, and
+ * unsupported fields at any nesting level are rejected rather than passed
+ * through.
  */
 export function parsePortableManifest(
   value: unknown,
@@ -133,13 +135,66 @@ export function parsePortableManifest(
       },
     );
   }
+
+  const ROOT_OPTION_KEYS = new Set([
+    "path",
+    "recursive",
+    "include",
+    "exclude",
+    "globs",
+    "insensitiveGlobs",
+    "fileTypes",
+    "excludedFileTypes",
+    "hidden",
+    "noIgnore",
+    "ignoreFiles",
+    "maxDepth",
+    "maxFileSizeBytes",
+    "follow",
+  ]);
+  const rootPaths: WorkspaceManifest["rootPaths"] = value.rootPaths.map(
+    (root) => {
+      for (const key of Object.keys(root)) {
+        if (!ROOT_OPTION_KEYS.has(key)) {
+          throw new EngineError(
+            "Portable manifest root carries an unsupported field",
+            {
+              code: "ZVEC_GREP.ENGINE.MANIFEST.INVALID",
+              context: `${context} root=${root.path} field=${key}`,
+            },
+          );
+        }
+      }
+      const { path, ...options } = root;
+      return { ...options, path };
+    },
+  );
+
+  const EMBEDDING_KEYS = new Set(["provider", "model", "dimension", "metric"]);
+  const embedding = value.embedding
+    ? (() => {
+        for (const key of Object.keys(value.embedding)) {
+          if (!EMBEDDING_KEYS.has(key)) {
+            throw new EngineError(
+              "Portable manifest embedding schema carries an unsupported field",
+              {
+                code: "ZVEC_GREP.ENGINE.MANIFEST.INVALID",
+                context: `${context} field=${key}`,
+              },
+            );
+          }
+        }
+        return { ...value.embedding };
+      })()
+    : null;
+
   return {
     manifestVersion: CURRENT_MANIFEST_VERSION,
     id: value.id,
     name: value.name,
-    rootPaths: value.rootPaths.map((root) => ({ ...root })),
+    rootPaths,
     indexPolicy: value.indexPolicy,
-    embedding: value.embedding ? { ...value.embedding } : null,
+    embedding,
     indexVersion: value.indexVersion,
     createdTime: value.createdTime,
     updatedTime: value.updatedTime,

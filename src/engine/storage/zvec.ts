@@ -1175,7 +1175,7 @@ function optionalFields(
   return result;
 }
 
-function parseContent(fields: Record<string, unknown>): Content {
+export function parseContent(fields: Record<string, unknown>): Content {
   const kind = fields.content_kind;
 
   if (kind === "text") {
@@ -1202,7 +1202,7 @@ function parseContent(fields: Record<string, unknown>): Content {
   });
 }
 
-function parseMetadata(
+export function parseMetadata(
   fields: Record<string, unknown>,
 ): EntityMetadata | undefined {
   const kind = fields.metadata_kind;
@@ -1256,7 +1256,7 @@ function readCodeModifiers(value: string | null): CodeEntityModifier[] {
     );
 }
 
-function parseRange(value: string): Range {
+export function parseRange(value: string): Range {
   return JSON.parse(value) as Range;
 }
 

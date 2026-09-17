@@ -161,6 +161,41 @@ test("resolver toCanonical round-trips within the workspace", async (t) => {
   assert.equal(resolver.toCanonical(join(root, "..", "outside.md")), null);
 });
 
+test("permission and I/O failures are explicit errors, never missing paths", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "crp-eacces-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "docs"));
+  await writeFile(join(root, "docs", "one.md"), "x");
+  const { chmod } = await import("node:fs/promises");
+  const resolver = createCanonicalPathResolver(root);
+  await chmod(join(root, "docs"), 0o000);
+
+  try {
+    assert.throws(
+      () => resolver.resolveDetailedSync("docs/one.md"),
+      /Filesystem error/,
+      "an unreadable directory is an error, not a missing file",
+    );
+    assert.throws(
+      () => resolver.resolveDetailedSync("docs/absent.md"),
+      /Filesystem error/,
+      "even a would-be-absent leaf reports the access failure",
+    );
+    await assert.rejects(
+      resolver.resolveDetailed("docs/one.md"),
+      /Filesystem error/,
+    );
+  } finally {
+    await chmod(join(root, "docs"), 0o700);
+  }
+
+  // Restored access resolves normally again.
+  assert.deepEqual(resolver.resolveDetailedSync("docs/one.md"), {
+    status: "ok",
+    path: join(root, "docs", "one.md"),
+  });
+});
+
 test("contained symlink entries resolve through their link path", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "crp-link-"));
   t.after(() => rm(root, { recursive: true, force: true }));

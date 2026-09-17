@@ -6,7 +6,13 @@ import {
   type DestinationReservation,
 } from "../reservation.js";
 import { writeWorkspaceManifest } from "../manifest.js";
-import { createFilesSchema, createEntitiesSchema } from "../storage/index.js";
+import {
+  createFilesSchema,
+  createEntitiesSchema,
+  parseContent,
+  parseMetadata,
+  parseRange,
+} from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
 import { CURRENT_INDEX_VERSION } from "../types.js";
 import {
@@ -296,6 +302,9 @@ export async function migrateWorkspaceIndex(
     closeTracked(sourceFiles);
     closeTracked(sourceEntities);
 
+    // Supported replacement workflow: verification is invalidated before
+    // publication releases its reservation, never after the commit window.
+    new WorkspaceBindingStore().invalidate(manifest.id, destinationRoot);
     // Publication: finalize the manifest into staging, move children with
     // the manifest last, and commit once at reservation release.
     reserved.publish(() =>
@@ -316,9 +325,6 @@ export async function migrateWorkspaceIndex(
         },
       }),
     );
-    // Supported replacement workflow: verification is explicitly invalidated
-    // at publication; directory identity alone cannot prove non-replacement.
-    new WorkspaceBindingStore().invalidate(manifest.id, destinationRoot);
     report("done", "Migration complete");
 
     return {
@@ -332,10 +338,11 @@ export async function migrateWorkspaceIndex(
       verification,
     };
   } catch (error) {
+    // Native handles close before any filesystem cleanup.
+    closeAll();
     reservation?.abort();
     throw error;
   } finally {
-    closeAll();
     lock.release();
   }
 
@@ -499,11 +506,21 @@ export function verifyConvertedIndex(
       ) {
         identitiesDerived = false;
       }
+      // Serialized fields must parse through the application's reader
+      // schemas; nonempty text alone does not make the record usable.
       if (
         typeof doc.fields.range_json !== "string" ||
         doc.fields.range_json.length === 0
       ) {
         requiredFieldsValid = false;
+      } else {
+        try {
+          parseRange(doc.fields.range_json);
+          parseContent(doc.fields);
+          parseMetadata(doc.fields);
+        } catch {
+          requiredFieldsValid = false;
+        }
       }
     }
 

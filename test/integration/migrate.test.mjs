@@ -251,7 +251,16 @@ test("migration rejects a cross-file inventory", async (t) => {
       }),
     /failed verification|inventoriesExact.*false/i,
   );
-  assert.deepEqual(await readdir(destinationRoot), ["docs", "src"]);
+  // The rejected conversion publishes nothing; only the reservation's lock
+  // scaffolding remains in the destination home.
+  const homeEntries = await readdir(join(destinationRoot, ".zvec-grep"));
+  assert.ok(!homeEntries.includes("manifest.json"));
+  assert.ok(!homeEntries.includes("files.zvec"));
+  assert.ok(!homeEntries.includes("index.zvec"));
+  assert.ok(
+    !homeEntries.some((entry) => entry.startsWith("staging-")),
+    "no staging residue may remain",
+  );
 });
 
 test("migration cleans up handles and staging after interruption, and retries", async (t) => {
@@ -277,7 +286,14 @@ test("migration cleans up handles and staging after interruption, and retries", 
     }),
   );
   assert.equal(fdCount(), fdsBefore, "no native descriptors may leak");
-  assert.deepEqual(await readdir(destinationRoot), ["docs", "src"]);
+  const homeEntriesAfterAbort = await readdir(
+    join(destinationRoot, ".zvec-grep"),
+  );
+  assert.ok(!homeEntriesAfterAbort.includes("manifest.json"));
+  assert.ok(
+    !homeEntriesAfterAbort.some((entry) => entry.startsWith("staging-")),
+    "no staging residue may remain after interruption",
+  );
 
   // The source remains readable, and a retry succeeds.
   const legacyPaths = resolveWorkspaceIndexStoragePaths(legacyHome);

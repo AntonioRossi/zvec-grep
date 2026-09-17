@@ -88,6 +88,9 @@ export { createWorkspaceIndexStorage } from "./zvec.js";
 export {
   createFilesSchema,
   createSchema as createEntitiesSchema,
+  parseContent,
+  parseMetadata,
+  parseRange,
 } from "./zvec.js";
 export {
   deleteWorkspaceIndexStorage,

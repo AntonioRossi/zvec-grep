@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
@@ -13,10 +14,11 @@ import { acquireReadWriteLock, type FileLock } from "./utils/lock.js";
 /**
  * Exclusive destination-ownership protocol for staging-based publication
  * (migration, import, export). The destination is reserved at the start via
- * its write lock, staged content is built inside the reservation, and
- * publication commits exactly once when the reservation is released after
- * the manifest is written. A competing writer or reader meets the lock;
- * a replaced reservation aborts without merging or deleting foreign content.
+ * its write lock; destination contents are validated under that lock; staged
+ * content is built inside the reservation; ownership (home identity, lock
+ * identity, and the operation's token) is re-verified before publication and
+ * before any cleanup; and the operation commits only when its release
+ * actually releases. Foreign content is never deleted and never overwritten.
  */
 
 export type DestinationReservation = {
@@ -25,32 +27,36 @@ export type DestinationReservation = {
   /** Owned staging directory inside the reservation. */
   readonly stagingHome: string;
   /**
-   * Verify the reservation is intact, run `finalize` (which must write the
-   * manifest/metadata into the staging directory), move staged children
-   * into place with the manifest last, and commit by releasing the
-   * reservation. After commit, no error path cleans the result.
+   * Verify ownership, run `finalize` (which must write the manifest/metadata
+   * into the staging directory), move staged children into place with the
+   * manifest last — rejecting any child-name collision rather than
+   * overwriting — and commit by releasing the reservation. The commit point
+   * is a verified successful release; after it, no error path cleans the
+   * result. A failed release leaves everything in place for operator review.
    */
   publish(finalize: () => void): void;
   /**
-   * Abort before commit: remove only provably owned staging, preserve
-   * anything not created by this operation, and release the reservation
+   * Abort before commit: remove only provably owned staging while ownership
+   * is verifiable, preserve everything else, and release the reservation
    * through the physical-ownership-checked release.
    */
   abort(): void;
+};
+
+type DirectoryIdentity = {
+  device: number;
+  inode: number;
 };
 
 type ReservationState = {
   destinationHome: string;
   stagingHome: string;
   homeIdentity: DirectoryIdentity | undefined;
-  createdHome: boolean;
+  lockDir: string;
+  lockIdentity: DirectoryIdentity | undefined;
+  token: string;
   lock: FileLock;
   committed: boolean;
-};
-
-type DirectoryIdentity = {
-  device: number;
-  inode: number;
 };
 
 export function reserveDestination(options: {
@@ -60,100 +66,147 @@ export function reserveDestination(options: {
   existingIndexMarkers?: readonly string[];
 }): DestinationReservation {
   const markers = options.existingIndexMarkers ?? ["manifest.json"];
-  if (
-    markers.some((marker) => existsSync(join(options.destinationHome, marker)))
-  ) {
-    throw reservationError(
-      "Destination already contains a workspace index",
-      options.destinationHome,
-    );
-  }
-
-  const preExisted = existsSync(options.destinationHome);
+  const lockDir = join(options.destinationHome, "locks", "home.write");
   const lock = acquireReadWriteLock(
     join(options.destinationHome, "locks", "home"),
     "write",
     { operation: options.operation },
   );
 
-  const state: ReservationState = {
-    destinationHome: options.destinationHome,
-    stagingHome: "",
-    homeIdentity: directoryIdentity(options.destinationHome),
-    createdHome: !preExisted,
-    lock,
-    committed: false,
-  };
-  state.stagingHome = join(
-    options.destinationHome,
-    `staging-${state.lock.info.token}`,
-  );
-
   try {
+    // Destination validation happens under the acquired lock, never from an
+    // absence check or existence observed before it.
+    const indexMarkers = markers.filter((marker) =>
+      existsSync(join(options.destinationHome, marker)),
+    );
+    if (indexMarkers.length > 0) {
+      throw reservationError(
+        "Destination already contains a workspace index",
+        `${options.destinationHome} markers=${indexMarkers.join(",")}`,
+      );
+    }
+    const unrelated = readdirSync(options.destinationHome).filter(
+      (entry) => entry !== "locks",
+    );
+    if (unrelated.length > 0) {
+      throw reservationError(
+        "Destination contains unrelated contents and cannot be claimed",
+        `${options.destinationHome} entries=${unrelated.join(",")}`,
+      );
+    }
+
+    const state: ReservationState = {
+      destinationHome: options.destinationHome,
+      stagingHome: join(
+        options.destinationHome,
+        `staging-${lock.info.token}`,
+      ),
+      homeIdentity: directoryIdentity(options.destinationHome),
+      lockDir,
+      lockIdentity: directoryIdentity(lockDir),
+      token: lock.info.token,
+      lock,
+      committed: false,
+    };
     mkdirSync(state.stagingHome);
+
+    return {
+      destinationHome: state.destinationHome,
+      stagingHome: state.stagingHome,
+      publish(finalize) {
+        publishReservation(state, finalize);
+      },
+      abort() {
+        abortReservation(state);
+      },
+    };
   } catch (error) {
-    state.lock.release();
+    lock.release();
     throw error;
   }
+}
 
-  return {
-    destinationHome: state.destinationHome,
-    stagingHome: state.stagingHome,
-    publish(finalize) {
-      assertReservationIntact(state);
-      // Finalize first: the manifest/metadata is written into staging, then
-      // moved last so readers never see a manifest without its content.
-      finalize();
-      const children = readdirSync(state.stagingHome).sort((left, right) =>
-        left === "manifest.json" ? 1 : right === "manifest.json" ? -1 : 0,
+function publishReservation(
+  state: ReservationState,
+  finalize: () => void,
+): void {
+  assertReservationIntact(state);
+  // Finalize first: the manifest/metadata is written into staging, then
+  // moved last so readers never see a manifest without its content.
+  finalize();
+  const children = readdirSync(state.stagingHome).sort((left, right) =>
+    left === "manifest.json" ? 1 : right === "manifest.json" ? -1 : 0,
+  );
+  for (const child of children) {
+    const target = join(state.destinationHome, child);
+    if (existsSync(target)) {
+      throw reservationError(
+        "Destination child already exists; refusing to overwrite",
+        `child=${child} destination=${state.destinationHome}`,
       );
-      for (const child of children) {
-        renameSync(
-          join(state.stagingHome, child),
-          join(state.destinationHome, child),
-        );
-      }
+    }
+    renameSync(join(state.stagingHome, child), target);
+  }
+  rmSync(state.stagingHome, { recursive: true, force: true });
+
+  // The commit point is a verified successful release. A failed release is
+  // ownership loss: nothing is deleted, the result stays for operator
+  // review, and the operation reports failure.
+  const released = state.lock.release();
+  if (!released) {
+    throw reservationError(
+      "Reservation ownership was lost at commit; published content left in place",
+      `destination=${state.destinationHome}`,
+    );
+  }
+  state.committed = true;
+}
+
+function abortReservation(state: ReservationState): void {
+  // Never clean a committed result; never touch a reservation whose
+  // ownership cannot be verified.
+  if (state.committed) {
+    return;
+  }
+  try {
+    if (reservationIntact(state)) {
       rmSync(state.stagingHome, { recursive: true, force: true });
-      // Single commit point: availability begins at reservation release.
-      state.committed = true;
-      state.lock.release();
-    },
-    abort() {
-      // Never clean a committed result; never touch a replaced reservation.
-      if (state.committed) {
-        return;
-      }
-      try {
-        if (reservationIntact(state)) {
-          rmSync(state.stagingHome, { recursive: true, force: true });
-          if (state.createdHome) {
-            rmSync(state.destinationHome, { recursive: true, force: true });
-          }
-        }
-      } finally {
-        state.lock.release();
-      }
-    },
-  };
+    }
+  } finally {
+    state.lock.release();
+  }
 }
 
 function reservationIntact(state: ReservationState): boolean {
-  const current = directoryIdentity(state.destinationHome);
-  return (
-    state.homeIdentity !== undefined &&
-    current !== undefined &&
-    current.device === state.homeIdentity.device &&
-    current.inode === state.homeIdentity.inode
-  );
+  if (!identityMatches(directoryIdentity(state.destinationHome), state.homeIdentity)) {
+    return false;
+  }
+  if (!identityMatches(directoryIdentity(state.lockDir), state.lockIdentity)) {
+    return false;
+  }
+  const info = readLockInfoSafe(state.lockDir);
+  return info?.token === state.token;
 }
 
 function assertReservationIntact(state: ReservationState): void {
   if (!reservationIntact(state)) {
     throw reservationError(
-      "Destination reservation was replaced before publication; aborting without touching the replacement",
+      "Destination reservation ownership was lost; aborting without touching the destination",
       `destination=${state.destinationHome}`,
     );
   }
+}
+
+function identityMatches(
+  current: DirectoryIdentity | undefined,
+  expected: DirectoryIdentity | undefined,
+): boolean {
+  return (
+    current !== undefined &&
+    expected !== undefined &&
+    current.device === expected.device &&
+    current.inode === expected.inode
+  );
 }
 
 function directoryIdentity(path: string): DirectoryIdentity | undefined {
@@ -162,6 +215,16 @@ function directoryIdentity(path: string): DirectoryIdentity | undefined {
     return { device: info.dev, inode: info.ino };
   } catch {
     return undefined;
+  }
+}
+
+function readLockInfoSafe(lockDir: string): { token?: string } | null {
+  try {
+    return JSON.parse(readFileSync(join(lockDir, "lock.json"), "utf8")) as {
+      token?: string;
+    };
+  } catch {
+    return null;
   }
 }
 

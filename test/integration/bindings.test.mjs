@@ -138,6 +138,90 @@ test("unsupported in-place restore stays trusted until forced reconciliation", a
   await service2.close();
 });
 
+test("cancelled forced reconciliation leaves the index unverified for retry", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-bind-cancel-");
+  const root = join(parent, "W");
+  await indexFixture(root, "alpha indexed document");
+
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({ root, embeddingModel: model });
+  await service.index();
+  await service.close();
+
+  await sameStatReplace(join(root, "docs", "one.md"), "alpha", "omega");
+
+  // Start a forced reconciliation and cancel it after scanning begins.
+  const controller = new AbortController();
+  const cancelling = new CountingEmbeddingModel();
+  const service2 = await createZvecGrep({
+    root,
+    embeddingModel: cancelling,
+  });
+  await assert.rejects(
+    service2.index({
+      reconcile: true,
+      signal: controller.signal,
+      onProgress: () => controller.abort(),
+    }),
+    undefined,
+    "the forced reconciliation is cancelled",
+  );
+  await service2.close();
+
+  // The prior verification was dropped when the forced run started, so the
+  // ordinary retry reconciles and detects the same-stat edit.
+  const model3 = new CountingEmbeddingModel();
+  const service3 = await createZvecGrep({ root, embeddingModel: model3 });
+  const result = await service3.index();
+  assert.equal(
+    result.filesModified,
+    1,
+    "the ordinary retry must reconcile after a cancelled forced run",
+  );
+  assert.equal(model3.counts.document, 1);
+  const search = await service3.context({ query: "omega indexed", limit: 3 });
+  assert.ok(search.items.length > 0);
+  await service3.close();
+});
+
+test("binding updates are serialized and never resurrect an invalidation", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-bind-serialize-");
+  const root = join(parent, "W");
+  await indexFixture(root, "alpha indexed document");
+
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({ root, embeddingModel: model });
+  await service.index();
+  await service.close();
+
+  const { WorkspaceBindingStore } = await import(
+    "../../dist/engine/bindings.js"
+  );
+  const manifest = await import("../../dist/engine/manifest.js");
+  const info = manifest.readWorkspaceManifest(join(root, ".zvec-grep"));
+  const store = new WorkspaceBindingStore();
+
+  // Parallel record/invalidate cycles on the same index UUID must leave a
+  // readable, consistent record — never a torn or resurrected state.
+  await Promise.all(
+    Array.from({ length: 12 }, (_, index) =>
+      index % 2 === 0
+        ? Promise.resolve(store.record(info.id, root))
+        : Promise.resolve(store.invalidate(info.id, root)),
+    ),
+  );
+  store.invalidate(info.id, root);
+  assert.equal(
+    store.matches(info.id, root),
+    false,
+    "the final invalidation stands; no earlier snapshot can resurrect it",
+  );
+  store.record(info.id, root);
+  assert.equal(store.matches(info.id, root), true);
+});
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
 test("distinct NFC and NFD workspace roots never share a binding", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-bind-unicode-");

@@ -21,6 +21,7 @@ import {
   writeWorkspaceManifest,
 } from "../manifest.js";
 import { createFilesSchema, createEntitiesSchema } from "../storage/index.js";
+import { createWorkspaceIndexStorage } from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
 import { CURRENT_INDEX_VERSION } from "../types.js";
 import { createCanonicalPathResolver } from "../utils/canonical-path.js";
@@ -289,6 +290,32 @@ export async function importWorkspaceIndex(
   const artifactPath = options.artifactPath;
   const destinationRoot = options.destinationRoot;
 
+  // The artifact's read lock is held for the whole operation: consumers
+  // respect the exporter's release-as-commit boundary, and no writer may
+  // change the artifact while it is consumed.
+  const artifactLock = acquireReadWriteLock(
+    join(artifactPath, "locks", "home"),
+    "read",
+    { operation: "index.import" },
+  );
+  try {
+    return await importWorkspaceIndexLocked(
+      options,
+      report,
+      artifactPath,
+      destinationRoot,
+    );
+  } finally {
+    artifactLock.release();
+  }
+}
+
+async function importWorkspaceIndexLocked(
+  options: ImportWorkspaceIndexOptions,
+  report: (stage: string, detail: string) => void,
+  artifactPath: string,
+  destinationRoot: string,
+): Promise<ImportWorkspaceIndexResult> {
   report("read", "Reading transfer artifact");
   const formatFile = readJsonFileSync<TransferFormatFile | null>(
     join(artifactPath, "format.json"),
@@ -301,6 +328,12 @@ export async function importWorkspaceIndex(
   ) {
     throw transferError(
       "Transfer artifact is missing or has an unsupported format version",
+      artifactPath,
+    );
+  }
+  if (formatFile.indexVersion !== CURRENT_INDEX_VERSION) {
+    throw transferError(
+      "Transfer artifact uses an unsupported index version",
       artifactPath,
     );
   }
@@ -326,6 +359,12 @@ export async function importWorkspaceIndex(
   if (formatFile.indexId !== portableManifest.id) {
     throw transferError(
       "Transfer artifact identity does not match its manifest",
+      artifactPath,
+    );
+  }
+  if (portableManifest.indexVersion !== CURRENT_INDEX_VERSION) {
+    throw transferError(
+      "Transfer artifact manifest uses an unsupported index version",
       artifactPath,
     );
   }
@@ -444,6 +483,45 @@ export async function importWorkspaceIndex(
       );
     }
 
+    // The staged index must also answer through the application's normal
+    // readers — without model inference or automatic indexing.
+    report("verify", "Checking staged index through normal readers");
+    const stagedStorage = createWorkspaceIndexStorage({
+      storagePath: reserved.stagingHome,
+      workspaceRoot: destinationRoot,
+      readOnly: true,
+    });
+    try {
+      const stagedFiles = stagedStorage.listFiles();
+      if (stagedFiles.length !== fileDocs.length) {
+        throw transferError(
+          "Staged index file count does not match through normal readers",
+          artifactPath,
+        );
+      }
+      if (entityDocs.length > 0) {
+        const probe = Array.from(base64ToVector(entityDocs[0].vector));
+        const hits = stagedStorage.searchVector(
+          probe,
+          Math.min(5, entityDocs.length),
+        );
+        if (hits.length === 0) {
+          throw transferError(
+            "Staged index returns no results through normal search",
+            artifactPath,
+          );
+        }
+      }
+    } finally {
+      stagedStorage.close();
+    }
+
+    // Supported replacement workflow: verification is invalidated before
+    // publication releases its reservation, never after the commit window.
+    new WorkspaceBindingStore().invalidate(
+      portableManifest.id,
+      destinationRoot,
+    );
     // Publication: finalize the manifest into staging, move children with
     // the manifest last, and commit once at reservation release.
     reserved.publish(() =>
@@ -451,12 +529,6 @@ export async function importWorkspaceIndex(
         ...portableManifest,
         updatedTime: Date.now(),
       }),
-    );
-    // Supported replacement workflow: verification is explicitly invalidated
-    // at publication; the imported index reconciles at its first indexing run.
-    new WorkspaceBindingStore().invalidate(
-      portableManifest.id,
-      destinationRoot,
     );
     report("done", "Import complete");
 
@@ -469,9 +541,7 @@ export async function importWorkspaceIndex(
       verification,
     };
   } catch (error) {
-    reserved.abort();
-    throw error;
-  } finally {
+    // Native handles close before any filesystem cleanup.
     for (const handle of openHandles.splice(0).reverse()) {
       try {
         handle.closeSync();
@@ -479,6 +549,8 @@ export async function importWorkspaceIndex(
         // Cleanup is best-effort.
       }
     }
+    reserved.abort();
+    throw error;
   }
 
   function track(collection: ZVecCollection): ZVecCollection {

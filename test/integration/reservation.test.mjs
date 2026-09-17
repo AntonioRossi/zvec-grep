@@ -5,7 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { ZVecInitialize, ZVecLogLevel } from "@zvec/zvec";
 import { migrateWorkspaceIndex } from "../../dist/engine/migrate/index.js";
-import { exportWorkspaceIndex } from "../../dist/engine/transfer/index.js";
+import { reserveDestination } from "../../dist/engine/reservation.js";
+import {
+  exportWorkspaceIndex,
+  importWorkspaceIndex,
+} from "../../dist/engine/transfer/index.js";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
 import { assertNoWriteLock } from "../../dist/engine/utils/lock.js";
 import { createZvecGrep } from "../../dist/index.js";
@@ -190,7 +194,7 @@ test("an abandoned reservation is reclaimed through the dead-owner rule", async 
   assert.equal(result.verification.countsMatch, true);
 });
 
-test("export preserves a competing claim's files in success and abort", async (t) => {
+test("export rejects a destination with unrelated contents without touching them", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-export-");
   const sourceRoot = join(parent, "original");
@@ -206,48 +210,146 @@ test("export preserves a competing claim's files in success and abort", async (t
   await service.index();
   await service.close();
 
-  // Success case: a competitor created the artifact path first; its
-  // sentinel survives beside the completed export.
+  // A competitor already claimed the artifact path with its own content:
+  // export must reject the destination and preserve the foreign files.
   const claimedArtifact = join(parent, "claimed-artifact");
   await mkdir(claimedArtifact, { recursive: true });
   await writeFile(join(claimedArtifact, "owner.txt"), "competitor");
-  await exportWorkspaceIndex({
-    sourceHome: join(sourceRoot, ".zvec-grep"),
-    artifactPath: claimedArtifact,
-  });
+  await assert.rejects(
+    exportWorkspaceIndex({
+      sourceHome: join(sourceRoot, ".zvec-grep"),
+      artifactPath: claimedArtifact,
+    }),
+    /unrelated contents/,
+  );
   assert.equal(
     await readFile(join(claimedArtifact, "owner.txt"), "utf8"),
     "competitor",
   );
   assert.ok(
-    (await readdir(claimedArtifact)).includes("format.json"),
-    "the export completes beside the foreign claim",
+    !(await readdir(claimedArtifact)).includes("entities.jsonl"),
+    "no export content is written beside the foreign claim",
   );
 
-  // Abort case: only the operation's own staging is removed.
-  const abortArtifact = join(parent, "abort-artifact");
-  await mkdir(abortArtifact, { recursive: true });
-  await writeFile(join(abortArtifact, "owner.txt"), "competitor");
+  // A foreign colliding child inside the reserved destination is rejected
+  // at publication and never overwritten (direct protocol exercise).
+  const collisionHome = join(parent, "collision-home");
+  const reservation = reserveDestination({
+    destinationHome: collisionHome,
+    operation: "test.collision",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(join(reservation.stagingHome, "entities.jsonl"), "ours\n");
+  await writeFile(join(collisionHome, "entities.jsonl"), "foreign entities\n");
+  assert.throws(
+    () => reservation.publish(() => undefined),
+    /already exists|refusing to overwrite/i,
+  );
+  assert.equal(
+    await readFile(join(collisionHome, "entities.jsonl"), "utf8"),
+    "foreign entities\n",
+    "the colliding foreign child is never overwritten",
+  );
+  reservation.abort();
+});
+
+test("a lost reservation lock fences publication and abort preserves foreign data", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-lostlock-");
+  const { legacyHome } = await makeLegacySource(t, parent);
+  const destinationRoot = join(parent, "destination");
+  await mkdir(join(destinationRoot, "docs"), { recursive: true });
+  await writeFile(
+    join(destinationRoot, "docs", "guide.md"),
+    FIXTURES["docs/guide.md"],
+  );
+  const destinationHome = join(destinationRoot, ".zvec-grep");
+  const lockDir = join(destinationHome, "locks", "home.write");
+
+  const replaceLock = () => {
+    rmSync(lockDir, { recursive: true, force: true });
+    for (let i = 0; i < 64; i++) {
+      mkdirSync(join(destinationRoot, `churn-${i}`));
+    }
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(
+      join(lockDir, "lock.json"),
+      `${JSON.stringify(
+        {
+          token: "competitor-token",
+          pid: process.pid,
+          hostname: "this-host",
+          startedAt: Date.now(),
+          operation: "competitor",
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    writeFileSync(join(destinationHome, "foreign.txt"), "competitor data");
+  };
+
+  // Publication with a replaced lock: fenced, competitor's lock preserved,
+  // nothing merged.
   await assert.rejects(
-    exportWorkspaceIndex({
-      sourceHome: join(sourceRoot, ".zvec-grep"),
-      artifactPath: abortArtifact,
+    migrateWorkspaceIndex({
+      sourceHome: legacyHome,
+      destinationRoot,
       onProgress: (stage) => {
-        if (stage === "write") {
-          throw new Error("injected export failure");
+        if (stage === "verify") {
+          replaceLock();
         }
       },
     }),
+    /ownership.*lost|RESERVATION/i,
   );
   assert.equal(
-    await readFile(join(abortArtifact, "owner.txt"), "utf8"),
-    "competitor",
+    await readFile(join(destinationHome, "foreign.txt"), "utf8"),
+    "competitor data",
   );
   assert.deepEqual(
-    (await readdir(abortArtifact)).filter(
-      (entry) => entry !== "owner.txt" && entry !== "locks",
-    ),
-    [],
-    "abort removes only the operation's own staging",
+    JSON.parse(await readFile(join(lockDir, "lock.json"), "utf8")).token,
+    "competitor-token",
+    "the competitor's lock must survive the fenced publication",
   );
+  assert.ok(
+    !(await readdir(destinationHome)).includes("manifest.json"),
+    "nothing is published after ownership loss",
+  );
+});
+
+test("import honors the artifact's writer lock", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-artifact-lock-");
+  const { sourceRoot, legacyHome } = await makeLegacySource(t, parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({ sourceHome: legacyHome, artifactPath: artifact });
+
+  const { acquireReadWriteLock } = await import(
+    "../../dist/engine/utils/lock.js"
+  );
+  const writer = acquireReadWriteLock(
+    join(artifact, "locks", "home"),
+    "write",
+    { operation: "index.export" },
+  );
+  try {
+    await assert.rejects(
+      importWorkspaceIndex({
+        artifactPath: artifact,
+        destinationRoot: join(parent, "destination"),
+      }),
+      (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+      "import must not consume an artifact while its writer lock is held",
+    );
+  } finally {
+    writer.release();
+  }
+
+  // After the writer releases (commit), the same artifact imports cleanly.
+  const result = await importWorkspaceIndex({
+    artifactPath: artifact,
+    destinationRoot: join(parent, "destination"),
+  });
+  assert.equal(result.verification.countsMatch, true);
 });

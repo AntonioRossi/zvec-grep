@@ -92,7 +92,12 @@ export class WorkspaceIndex {
     // reconcile: every matched file is hashed, unchanged content keeps its
     // vectors, and the binding is recorded only after success. --reconcile
     // forces the pass regardless of stored trust (the documented recovery
-    // path for unsupported in-place restores).
+    // path for unsupported in-place restores); a forced run first drops the
+    // prior verification so cancellation or failure leaves the index
+    // unverified rather than trusted.
+    if (options.reconcile === true) {
+      this.bindings.invalidate(this.info.id, this.workspaceRoot);
+    }
     const reconcile =
       options.reconcile === true ||
       !this.bindings.matches(this.info.id, this.workspaceRoot);
