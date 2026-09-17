@@ -115,14 +115,20 @@ paths, `device`, `apiKey`, or any verification claim.
      mtime metadata are refreshed. No embedding calls occur.
    - Changed content: normal incremental handling.
    - Missing files: normal deletion handling.
-4. The binding record is published **only after** a successful reconciliation.
+4. The binding record is published **only after** a successful reconciliation,
+   and per-UUID updates are **serialized** (a per-index lock guards the
+   read-modify-write, always taken inside workspace locks, never around them),
+   so a concurrent or stale update cannot resurrect an invalidated record.
    Every supported restore/replacement workflow (import, migrate,
-   rebuild/reset, drop) **explicitly invalidates** the workspace's binding at
-   publication, because directory identity alone cannot detect content
-   replaced inside an existing storage directory and inode numbers can be
-   reused. Manually restoring index files in place is **unsupported** and not
-   detected; the documented recovery is a forced pass:
-   `zg --index --reconcile`.
+   rebuild/reset, drop) **explicitly invalidates** the workspace's binding
+   before publication releases its reservation, because directory identity
+   alone cannot detect content replaced inside an existing storage directory
+   and inode numbers can be reused. A forced pass (`zg --index --reconcile`)
+   invalidates the prior verification **when it starts**, so cancellation or
+   failure leaves the index unverified rather than trusted; a genuine
+   absent record is the only ignored case during invalidation. Manually
+   restoring index files in place is **unsupported** and not detected; the
+   documented recovery is the forced pass.
 5. Acceptance: unchanged relocated content causes **zero** document-embedding
    calls. Query embedding is separate and expected.
 
@@ -162,20 +168,28 @@ paths, `device`, `apiKey`, or any verification claim.
 Migration, import, and export publish through one protocol:
 
 1. **Reserve at start**: create the destination and hold its write lock for
-   the whole operation. A destination that already contains an index fails;
-   a live reservation blocks competitors and discovery with a "creation in
-   progress" lock error; an abandoned reservation is reclaimed only through
-   the lock layer's verified-dead-owner rule.
-2. **Build inside the reservation** and verify the staged result.
-3. **Re-validate before publication**: the reservation's token and the home's
-   device/inode must match; any mismatch aborts without merging staged
-   content or touching the replacement.
-4. **Commit once**: finalize the manifest into staging, move staged children
-   into place (manifest last), and release the lock — release is the single
-   commit point. After commit, no error path performs cleanup of any kind.
-5. **Pre-commit abort**: only provably owned staging is removed (token-named
-   inside the reservation, physical release checks throughout); foreign
-   content always survives, including on `EEXIST` interleavings.
+   the whole operation. Validation happens **under** the lock: a destination
+   containing index markers fails; a destination containing anything other
+   than lock scaffolding is rejected as unrelated contents and preserved
+   untouched. An abandoned reservation is reclaimed only through the lock
+   layer's verified-dead-owner rule.
+2. **Build inside the reservation** and verify the staged result. Import
+   additionally holds the artifact's read lock while consuming it, so
+   consumers respect the exporter's release-as-commit boundary.
+3. **Re-verify ownership before publication and before any cleanup**: the
+   home's device/inode, the write lock's device/inode, and the operation's
+   token must all match. Ownership loss fences the operation; nothing is
+   merged, published, or deleted on someone else's behalf.
+4. **Publish without overwriting**: finalize the manifest into staging, then
+   move staged children (manifest last); a child-name collision is an
+   explicit error and the foreign child is never replaced.
+5. **Commit once**: the operation commits only when its release **actually
+   releases** — a failed release is ownership loss, leaves everything in
+   place for operator review, and reports failure. After a successful
+   release, no error path cleans the result.
+6. **Pre-commit abort**: only provably owned staging is removed, after
+   native handles are closed and only while ownership remains verifiable;
+   the destination home itself is never recursively deleted.
 
 ## 7. Export and import (logical portability)
 

@@ -97,10 +97,7 @@ export function reserveDestination(options: {
 
     const state: ReservationState = {
       destinationHome: options.destinationHome,
-      stagingHome: join(
-        options.destinationHome,
-        `staging-${lock.info.token}`,
-      ),
+      stagingHome: join(options.destinationHome, `staging-${lock.info.token}`),
       homeIdentity: directoryIdentity(options.destinationHome),
       lockDir,
       lockIdentity: directoryIdentity(lockDir),
@@ -178,7 +175,12 @@ function abortReservation(state: ReservationState): void {
 }
 
 function reservationIntact(state: ReservationState): boolean {
-  if (!identityMatches(directoryIdentity(state.destinationHome), state.homeIdentity)) {
+  if (
+    !identityMatches(
+      directoryIdentity(state.destinationHome),
+      state.homeIdentity,
+    )
+  ) {
     return false;
   }
   if (!identityMatches(directoryIdentity(state.lockDir), state.lockIdentity)) {

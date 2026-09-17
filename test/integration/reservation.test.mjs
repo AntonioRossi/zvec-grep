@@ -321,13 +321,15 @@ test("a lost reservation lock fences publication and abort preserves foreign dat
 test("import honors the artifact's writer lock", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-artifact-lock-");
-  const { sourceRoot, legacyHome } = await makeLegacySource(t, parent);
+  const { legacyHome } = await makeLegacySource(t, parent);
   const artifact = join(parent, "artifact");
-  await exportWorkspaceIndex({ sourceHome: legacyHome, artifactPath: artifact });
+  await exportWorkspaceIndex({
+    sourceHome: legacyHome,
+    artifactPath: artifact,
+  });
 
-  const { acquireReadWriteLock } = await import(
-    "../../dist/engine/utils/lock.js"
-  );
+  const { acquireReadWriteLock } =
+    await import("../../dist/engine/utils/lock.js");
   const writer = acquireReadWriteLock(
     join(artifact, "locks", "home"),
     "write",
