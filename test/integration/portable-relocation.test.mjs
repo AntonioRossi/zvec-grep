@@ -14,6 +14,7 @@ import test from "node:test";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
 import { createZvecGrep } from "../../dist/index.js";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
+import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
 
@@ -239,7 +240,7 @@ test("reconciliation detects changed content with unchanged size and mtime", asy
   const replaced = original.replace("portable", "PORTABLE");
   assert.equal(replaced.length, original.length);
   await writeFile(target, replaced);
-  await utimes(target, indexedStat.atime, indexedStat.mtime);
+  await restoreIndexedMtime(target, indexedStat.mtimeMs);
 
   const modelB = new CountingEmbeddingModel();
   const serviceB = await createZvecGrep({ root: B, embeddingModel: modelB });

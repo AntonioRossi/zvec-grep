@@ -6,7 +6,6 @@ import {
   rename,
   rm,
   stat,
-  utimes,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -19,6 +18,7 @@ import {
 import { createZvecGrep } from "../../dist/index.js";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
+import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
 
@@ -38,7 +38,7 @@ async function sameStatReplace(target, from, to) {
   const replaced = original.replace(from, to);
   assert.equal(replaced.length, original.length);
   await writeFile(target, replaced);
-  await utimes(target, indexedStat.atime, indexedStat.mtime);
+  await restoreIndexedMtime(target, indexedStat.mtimeMs);
 }
 
 test("a supported same-UUID replacement invalidates verification", async (t) => {
@@ -196,9 +196,8 @@ test("binding updates are serialized and never resurrect an invalidation", async
   await service.index();
   await service.close();
 
-  const { WorkspaceBindingStore } = await import(
-    "../../dist/engine/bindings.js"
-  );
+  const { WorkspaceBindingStore } =
+    await import("../../dist/engine/bindings.js");
   const manifest = await import("../../dist/engine/manifest.js");
   const info = manifest.readWorkspaceManifest(join(root, ".zvec-grep"));
   const store = new WorkspaceBindingStore();
@@ -221,7 +220,7 @@ test("binding updates are serialized and never resurrect an invalidation", async
   store.record(info.id, root);
   assert.equal(store.matches(info.id, root), true);
 });
-  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
 test("distinct NFC and NFD workspace roots never share a binding", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-bind-unicode-");

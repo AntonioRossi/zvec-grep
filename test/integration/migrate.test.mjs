@@ -6,7 +6,6 @@ import {
   readFile,
   readdir,
   stat,
-  utimes,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -18,6 +17,7 @@ import { resolveWorkspaceIndexStoragePaths } from "../../dist/engine/storage/lay
 import { createZvecGrep } from "../../dist/index.js";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
+import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
@@ -211,7 +211,7 @@ test("migrated index is unverified: first index reconciles same-stat edits", asy
   const replaced = original.replace("Configuration", "CONFIGURATION");
   assert.equal(replaced.length, original.length);
   await writeFile(target, replaced);
-  await utimes(target, indexedStat.atime, indexedStat.mtime);
+  await restoreIndexedMtime(target, indexedStat.mtimeMs);
 
   const model = new CountingEmbeddingModel();
   const service = await createZvecGrep({
