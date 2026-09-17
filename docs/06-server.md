@@ -277,3 +277,15 @@ Successful `GET /healthz` completion events have level `debug` and are omitted
 at the default `info` level. Set `level` to `debug` to include them for diagnostics.
 Unsuccessful health checks and other requests continue to be logged at `info`.
 Each record includes a `level` field alongside the existing event fields.
+
+## Index locks
+
+Writers hold a file lock at `<workspace>/.zvec-grep/locks/`. A known-live
+local owner keeps its lock regardless of age, and a verified-dead local owner
+is reclaimed safely; locks are **never** reclaimed automatically when
+ownership is uncertain (a foreign host, or missing or corrupt lock metadata),
+so a crashed or externally modified lock blocks the workspace instead of
+risking concurrent writers. Recovery is an explicit operator action: after
+all writers are quiescent, remove the lock directory shown in the
+`ZVEC_GREP.ENGINE.LOCK.BUSY` error. This replaces earlier automatic age-based
+eviction as an intentional behavior change.
