@@ -113,6 +113,46 @@ test("search does not follow a directory swapped for an escaping symlink", async
   await service3.close();
 });
 
+test("storage and search fail loudly under permission errors, then recover", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-contain-eacces-");
+  const root = join(parent, "W");
+  await mkdir(root, { recursive: true });
+  await writeFiles(root, DOCS);
+
+  const model = new FakeEmbeddingModel();
+  const service = await createZvecGrep({ root, embeddingModel: model });
+  await service.index();
+  await service.close();
+
+  const { chmod } = await import("node:fs/promises");
+  await chmod(join(root, "docs"), 0o000);
+  try {
+    const service2 = await createZvecGrep({ root, embeddingModel: model });
+    await assert.rejects(
+      () =>
+        service2.context({
+          query: "contained content marker",
+          limit: 3,
+          autoUpdate: false,
+        }),
+      /Filesystem error/,
+      "an unreadable indexed directory must surface as an error, not silence",
+    );
+    await service2.close();
+  } finally {
+    await chmod(join(root, "docs"), 0o700);
+  }
+
+  const service3 = await createZvecGrep({ root, embeddingModel: model });
+  const result = await service3.context({
+    query: "contained content marker",
+    limit: 3,
+    autoUpdate: false,
+  });
+  assert.ok(result.items.length > 0);
+  await service3.close();
+});
+
 test("a changed parent symlink is caught when refreshing a copied workspace", async (t) => {
   const parent = await createTemporaryDirectory(t, "zg-contain-refresh-");
   const E = join(parent, "E");

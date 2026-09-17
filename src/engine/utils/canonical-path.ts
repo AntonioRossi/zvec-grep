@@ -167,6 +167,22 @@ export function tryRealpathSync(path: string): string | undefined {
   }
 }
 
+function isAbsenceError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    ((error as { code?: string }).code === "ENOENT" ||
+      (error as { code?: string }).code === "ENOTDIR")
+  );
+}
+
+function errorCode(error: unknown): string {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: string }).code)
+    : "unknown";
+}
+
 export function createCanonicalPathResolver(
   workspaceRoot: string,
 ): CanonicalPathResolver {
@@ -183,8 +199,14 @@ export function createCanonicalPathResolver(
     let names: string[] = [];
     try {
       names = readdirSync(directory);
-    } catch {
-      // Missing or unreadable directory: every segment misses.
+    } catch (error) {
+      if (!isAbsenceError(error)) {
+        throw new CanonicalPathResolutionError(
+          "Filesystem error while reading a directory",
+          `directory=${directory} code=${errorCode(error)}`,
+        );
+      }
+      // Genuine absence only: every segment misses.
     }
     for (const name of names) {
       const key = name.normalize("NFC");
@@ -227,7 +249,7 @@ export function createCanonicalPathResolver(
   }
 
   function finish(path: string): CanonicalResolution {
-    const realPath = tryRealpathSync(path);
+    const realPath = realpathForResolve(path);
     if (realPath === undefined) {
       return { status: "missing" };
     }
@@ -235,6 +257,22 @@ export function createCanonicalPathResolver(
       return { status: "forbidden", path };
     }
     return { status: "ok", path };
+  }
+
+  // Genuine absence (ENOENT/ENOTDIR) resolves to undefined; permission and
+  // I/O failures are explicit errors, never missing-path evidence.
+  function realpathForResolve(path: string): string | undefined {
+    try {
+      return realpathSync(path);
+    } catch (error) {
+      if (isAbsenceError(error)) {
+        return undefined;
+      }
+      throw new CanonicalPathResolutionError(
+        "Filesystem error while resolving a canonical path",
+        `path=${path} code=${errorCode(error)}`,
+      );
+    }
   }
 
   // Containment of every existing traversed component is checked before
@@ -261,7 +299,7 @@ export function createCanonicalPathResolver(
     if (next === null) {
       return { action: "missing" };
     }
-    const realNext = tryRealpathSync(next);
+    const realNext = realpathForResolve(next);
     if (realNext !== undefined && !isContained(realNext)) {
       return { action: "forbidden", path: next };
     }
@@ -303,8 +341,14 @@ export function createCanonicalPathResolver(
         let names: string[] = [];
         try {
           names = await readdir(current);
-        } catch {
-          // Missing or unreadable directory: every segment misses.
+        } catch (error) {
+          if (!isAbsenceError(error)) {
+            throw new CanonicalPathResolutionError(
+              "Filesystem error while reading a directory",
+              `directory=${current} code=${errorCode(error)}`,
+            );
+          }
+          // Genuine absence only: every segment misses.
         }
         entries = new Map();
         for (const name of names) {

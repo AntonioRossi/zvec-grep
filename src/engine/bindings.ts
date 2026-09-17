@@ -2,6 +2,7 @@ import { readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tryRealpathSync } from "./utils/canonical-path.js";
 import { readJsonFileSync, writeJsonFileSync } from "./utils/json.js";
+import { acquireReadWriteLock } from "./utils/lock.js";
 import { defaultHome } from "./utils/path.js";
 
 /**
@@ -58,6 +59,10 @@ export function currentWorkspaceBinding(
   }
 }
 
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error;
+}
+
 function sameBinding(
   binding: WorkspaceBinding,
   current: Omit<WorkspaceBinding, "verifiedTime">,
@@ -100,46 +105,75 @@ export class WorkspaceBindingStore {
     if (!current) {
       return;
     }
-    const bindings = this.readBindings(indexId).filter(
-      (binding) => !sameBinding(binding, current),
-    );
-    bindings.push({ ...current, verifiedTime: Date.now() });
-    const trimmed = bindings.slice(-MAX_BINDINGS_PER_INDEX);
-    writeJsonFileSync(
-      this.recordPath(indexId),
-      { version: 1, bindings: trimmed } satisfies BindingRecord,
-      { directoryMode: 0o700, fileMode: 0o600 },
-    );
-    this.evictOldIndexes();
+    this.withBindingLock(indexId, () => {
+      const bindings = this.readBindings(indexId).filter(
+        (binding) => !sameBinding(binding, current),
+      );
+      bindings.push({ ...current, verifiedTime: Date.now() });
+      const trimmed = bindings.slice(-MAX_BINDINGS_PER_INDEX);
+      writeJsonFileSync(
+        this.recordPath(indexId),
+        { version: 1, bindings: trimmed } satisfies BindingRecord,
+        { directoryMode: 0o700, fileMode: 0o600 },
+      );
+      this.evictOldIndexes();
+    });
   }
 
   /**
    * Explicitly drop verification for this workspace path. Called by every
-   * supported restore/replacement workflow at publication: directory identity
-   * alone cannot detect content replaced inside an existing storage
-   * directory, and inode numbers can be reused.
+   * supported restore/replacement workflow before publication, and when
+   * forced reconciliation starts. Serialized with `record` per index UUID so
+   * a concurrent update cannot resurrect an invalidated record. Only a
+   * genuinely absent record is ignored; other I/O failures propagate.
    */
   invalidate(indexId: string, workspaceRoot: string): void {
     const rootPath = tryRealpathSync(workspaceRoot);
     if (rootPath === undefined) {
       return;
     }
-    const remaining = this.readBindings(indexId).filter(
-      (binding) => binding.rootPath !== rootPath,
-    );
-    if (remaining.length === 0) {
-      try {
-        unlinkSync(this.recordPath(indexId));
-      } catch {
-        // Already absent.
+    this.withBindingLock(indexId, () => {
+      const remaining = this.readBindings(indexId).filter(
+        (binding) => binding.rootPath !== rootPath,
+      );
+      if (remaining.length === 0) {
+        try {
+          unlinkSync(this.recordPath(indexId));
+        } catch (error) {
+          if (isNodeError(error) && error.code === "ENOENT") {
+            return;
+          }
+          throw error;
+        }
+        return;
       }
-      return;
+      writeJsonFileSync(
+        this.recordPath(indexId),
+        { version: 1, bindings: remaining } satisfies BindingRecord,
+        { directoryMode: 0o700, fileMode: 0o600 },
+      );
+    });
+  }
+
+  /**
+   * Serialize read-modify-write cycles of the per-UUID record. Binding locks
+   * are always taken inside (never around) workspace home locks and
+   * destination reservations, keeping a consistent order.
+   */
+  private withBindingLock<T>(indexId: string, operation: () => T): T {
+    if (!/^[A-Za-z0-9_-]+$/.test(indexId)) {
+      throw new Error(`Invalid index id for binding record: ${indexId}`);
     }
-    writeJsonFileSync(
-      this.recordPath(indexId),
-      { version: 1, bindings: remaining } satisfies BindingRecord,
-      { directoryMode: 0o700, fileMode: 0o600 },
+    const lock = acquireReadWriteLock(
+      join(this.home, BINDINGS_DIRECTORY, `${indexId}.lock`),
+      "write",
+      { operation: "bindings.update" },
     );
+    try {
+      return operation();
+    } finally {
+      lock.release();
+    }
   }
 
   private recordPath(indexId: string): string {

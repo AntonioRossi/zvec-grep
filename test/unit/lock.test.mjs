@@ -205,6 +205,88 @@ test("reader locks follow the same three-state rule", async (t) => {
   reader.release();
 });
 
+test("invalid ownership metadata stays blocked instead of reclaimed as dead", async (t) => {
+  const variants = {
+    pid_zero: { pid: 0 },
+    pid_negative: { pid: -42 },
+    empty_token: { token: "" },
+    non_finite_start: { startedAt: Number.NaN },
+  };
+
+  for (const [name, overrides] of Object.entries(variants)) {
+    const home = await makeHome(t, `zg-lock-invalid-${name}-`);
+    const lockPath = lockPathFor(home);
+    await writeOwnerInfo(`${lockPath}.write`, {
+      hostname: hostname(),
+      ...overrides,
+    });
+
+    assert.throws(
+      () => assertNoWriteLock(lockPath, `probe-${name}`),
+      (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+      `${name} metadata must be unknown, not reclaimed`,
+    );
+    assert.ok(
+      await stat(`${lockPath}.write`).then(
+        (s) => s.isDirectory(),
+        () => false,
+      ),
+      `${name} lock directory must survive`,
+    );
+  }
+});
+
+test("an unreadable readers directory blocks writers instead of reporting none", async (t) => {
+  const home = await makeHome(t, "zg-lock-eacces-");
+  const lockPath = lockPathFor(home);
+  const reader = acquireReadWriteLock(lockPath, "read", {
+    operation: "reader",
+  });
+
+  const readersDir = `${lockPath}.readers`;
+  const { chmod, stat: statFs } = await import("node:fs/promises");
+  const before = await statFs(readersDir);
+  const originalMode = before.mode;
+  await chmod(readersDir, 0o000);
+
+  try {
+    assert.throws(
+      () => acquireReadWriteLock(lockPath, "write", { operation: "writer" }),
+      (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+      "an unreadable readers directory must block the writer",
+    );
+  } finally {
+    // Restore access eagerly so cleanup hooks never meet the locked-down
+    // directory.
+    await chmod(readersDir, originalMode & 0o777);
+  }
+  reader.release();
+});
+
+test("stale cleanup does not delete after the observed token changes", async (t) => {
+  const home = await makeHome(t, "zg-lock-token-");
+  const lockPath = lockPathFor(home);
+  await writeOwnerInfo(`${lockPath}.write`, { pid: DEAD_PID });
+
+  // Swap in a different live token between observation and cleanup: the
+  // directory must not be reclaimed, and the writer stays blocked.
+  await writeOwnerInfo(`${lockPath}.write`, {
+    token: "different-live-token",
+    pid: process.pid,
+  });
+
+  assert.throws(
+    () => acquireReadWriteLock(lockPath, "write", { operation: "competitor" }),
+    (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+  );
+  assert.deepEqual(
+    JSON.parse(await readFile(join(`${lockPath}.write`, "lock.json"), "utf8"))
+      .token,
+    "different-live-token",
+    "the changed token's lock must survive",
+  );
+});
+
 test("busy errors carry explicit recovery guidance", async (t) => {
   const home = await makeHome(t, "zg-lock-hint-");
   const lockPath = lockPathFor(home);

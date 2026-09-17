@@ -15,7 +15,13 @@ import { detail, EngineError, errorDetails } from "../errors.js";
 export type FileLock = {
   readonly path: string;
   readonly info: FileLockInfo;
-  release(): void;
+  /**
+   * True when this handle actually released its lock; false when the lock
+   * was already gone or ownership evidence no longer matches (in which case
+   * nothing was deleted). Callers that treat release as a commit point must
+   * check this result.
+   */
+  release(): boolean;
 };
 
 export type FileLockInfo = {
@@ -132,9 +138,12 @@ function acquireReadLock(lockPath: string, options: FileLockOptions): FileLock {
       readersLockPath(lockPath),
       `${info.pid}-${info.token}`,
     );
+    // The acquisition identity is retained for every release path: never
+    // recapture identity at cleanup time.
+    let identity: LockDirectoryIdentity | undefined;
     try {
       mkdirSync(readerPath, { recursive: true });
-      const identity = lockDirectoryIdentity(readerPath);
+      identity = lockDirectoryIdentity(readerPath);
       writeFileSync(
         lockInfoPath(readerPath),
         `${JSON.stringify(info, null, 2)}\n`,
@@ -156,7 +165,7 @@ function acquireReadLock(lockPath: string, options: FileLockOptions): FileLock {
         release: () => releaseFileLock(readerPath, info, identity),
       };
     } catch (error) {
-      releaseFileLock(readerPath, info, lockDirectoryIdentity(readerPath));
+      releaseFileLock(readerPath, info, identity);
       if (!isNodeError(error) || error.code !== "EEXIST") {
         throw error;
       }
@@ -190,19 +199,20 @@ function releaseFileLock(
   lockPath: string,
   owner: FileLockInfo,
   expectedIdentity: LockDirectoryIdentity | undefined,
-): void {
+): boolean {
   const current = readLockInfo(lockPath);
   if (current?.token !== owner.token) {
-    return;
+    return false;
   }
   // Physical ownership: token equality alone cannot distinguish a replaced
   // directory carrying a copied token. Never delete another directory's
   // lock through this handle.
   if (!lockIdentityMatches(lockPath, expectedIdentity)) {
-    return;
+    return false;
   }
 
   rmSync(lockPath, { recursive: true, force: true });
+  return true;
 }
 
 type LockDirectoryIdentity = {
@@ -248,8 +258,13 @@ function cleanupStaleLock(lockPath: string, staleMs: number): boolean {
   if (!isStaleLock(lockPath, info, staleMs)) {
     return false;
   }
-  // Re-check physical identity before deleting another owner's lock: a
-  // replaced directory is never reclaimed through this path.
+  // Re-verify the observed token and physical identity before deleting
+  // another owner's lock: a changed or replaced directory is never reclaimed
+  // through this path.
+  const infoNow = readLockInfo(lockPath);
+  if (infoNow?.token !== info?.token) {
+    return false;
+  }
   if (!lockIdentityMatches(lockPath, identityBefore)) {
     return false;
   }
@@ -267,8 +282,13 @@ function hasActiveReaders(lockPath: string, staleMs: number): boolean {
   let entries: string[];
   try {
     entries = readdirSync(readersPath);
-  } catch {
-    return false;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return false;
+    }
+    // Enumeration/access failures are uncertainty, not an empty directory:
+    // block the writer rather than admit it beside unreadable readers.
+    return true;
   }
 
   let active = false;
@@ -284,6 +304,30 @@ function hasActiveReaders(lockPath: string, staleMs: number): boolean {
   return active;
 }
 
+type LockLiveness = "alive" | "dead" | "unknown";
+
+function processLiveness(pid: number): LockLiveness {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return "unknown";
+  }
+
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    if (isNodeError(error)) {
+      if (error.code === "ESRCH") {
+        return "dead";
+      }
+      if (error.code === "EPERM") {
+        return "alive";
+      }
+    }
+    // Unexpected probe failures are unknown, never evidence of death.
+    return "unknown";
+  }
+}
+
 function isStaleLock(
   lockPath: string,
   info: FileLockInfo | null,
@@ -293,29 +337,17 @@ function isStaleLock(
   void staleMs;
   // Age never proves inactivity: a known-live local owner is never stale at
   // any age, and unknown ownership (foreign host, missing or corrupt
-  // metadata) must remain blocked rather than be reclaimed. Reclamation is
-  // safe only for a verified-dead local owner. Recovering any other lock is
-  // an explicit operator action after writers are quiescent.
+  // metadata, invalid fields, unexpected probe failures) must remain blocked
+  // rather than be reclaimed. Reclamation is safe only for a verified-dead
+  // local owner. Recovering any other lock is an explicit operator action
+  // after writers are quiescent.
   if (!info) {
     return false;
   }
   if (info.hostname !== hostname()) {
     return false;
   }
-  return !processIsAlive(info.pid);
-}
-
-function processIsAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return isNodeError(error) && error.code === "EPERM";
-  }
+  return processLiveness(info.pid) === "dead";
 }
 
 function readLockInfo(lockPath: string): FileLockInfo | null {
@@ -323,11 +355,16 @@ function readLockInfo(lockPath: string): FileLockInfo | null {
     const parsed = JSON.parse(
       readFileSync(lockInfoPath(lockPath), "utf8"),
     ) as Partial<FileLockInfo>;
+    // Semantic validation: invalid ownership metadata is unknown, never
+    // evidence about the owner's state.
     if (
       typeof parsed.token === "string" &&
-      typeof parsed.pid === "number" &&
+      parsed.token.length > 0 &&
+      Number.isInteger(parsed.pid) &&
+      (parsed.pid as number) > 0 &&
       typeof parsed.hostname === "string" &&
-      typeof parsed.startedAt === "number" &&
+      parsed.hostname.length > 0 &&
+      Number.isFinite(parsed.startedAt) &&
       typeof parsed.operation === "string"
     ) {
       return parsed as FileLockInfo;
