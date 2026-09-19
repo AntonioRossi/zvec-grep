@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   acquireReadWriteLock,
@@ -302,6 +302,67 @@ test("stale cleanup does not delete after the observed token changes", async (t)
     "different-live-token",
     "the changed token's lock must survive",
   );
+});
+
+test("a held write lock blocks a separate process; death does not unlock it", async (t) => {
+  const home = await makeHome(t, "zg-lock-process-");
+  const lockPath = lockPathFor(home);
+  const resultPath = join(home, "child-result.json");
+
+  // A child process acquires the write lock and reports through a fresh
+  // result file, per the harness discipline.
+  const childScript = `
+    import { writeFileSync } from "node:fs";
+    import { acquireReadWriteLock } from ${JSON.stringify(
+      `file://${resolve("dist/engine/utils/lock.js")}`,
+    )};
+    const lock = acquireReadWriteLock(${JSON.stringify(lockPath)}, "write", { operation: "child" });
+    writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({ acquired: true, pid: process.pid }));
+    // Hold the lock until killed.
+    setInterval(() => {}, 60_000);
+  `;
+  const { execFile } = await import("node:child_process");
+  const child = execFile(
+    process.execPath,
+    ["--input-type=module", "--eval", childScript],
+    { timeout: 60_000 },
+    () => undefined,
+  );
+  try {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const written = await readFile(resultPath, "utf8").catch(() => null);
+      if (written && JSON.parse(written).acquired === true) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(JSON.parse(await readFile(resultPath, "utf8")).acquired);
+
+    // A separate process is blocked while the child holds the lock.
+    assert.throws(
+      () => acquireReadWriteLock(lockPath, "write", { operation: "parent" }),
+      (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+    );
+
+    // Kill the child: the lock it held is not reclaimed automatically; the
+    // dead owner's write lock keeps blocking.
+    child.kill("SIGKILL");
+    await new Promise((resolve) => child.once("exit", resolve));
+    assert.throws(
+      () => acquireReadWriteLock(lockPath, "write", { operation: "parent" }),
+      (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+      "the dead child's write lock must remain blocked until recovery",
+    );
+
+    // Documented operator recovery: quiesce writers, remove the lock.
+    await rm(`${lockPath}.write`, { recursive: true, force: true });
+    const recovered = acquireReadWriteLock(lockPath, "write", {
+      operation: "parent",
+    });
+    recovered.release();
+  } finally {
+    child.kill("SIGKILL");
+  }
 });
 
 test("busy errors carry explicit recovery guidance", async (t) => {
