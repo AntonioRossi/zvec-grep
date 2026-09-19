@@ -234,6 +234,58 @@ test("an incomplete destination stays blocked after lock cleanup, with no ancest
   assert.equal(result.verification.countsMatch, true);
 });
 
+test("a crashed destination stays blocked even with an ancestor index present", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-ancestor-");
+
+  // The parent workspace has a working index (the ancestor fallback).
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  // The child workspace has an incomplete reserved destination.
+  const child = join(parent, "child");
+  const childHome = join(child, ".zvec-grep");
+  await mkdir(childHome, { recursive: true });
+  await writeFile(join(child, "docs.md"), "# Child\n\nChild content.\n");
+  await writeFile(
+    join(childHome, "INCOMPLETE"),
+    `${JSON.stringify({ token: "crashed", operation: "index.import" })}\n`,
+  );
+
+  // Discovery from inside the child must not fall back to the parent's index.
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "ancestor content", limit: 3 }),
+    /incomplete|INCOMPLETE/i,
+    "the incomplete child must block instead of falling back to the ancestor",
+  );
+  await service.close();
+
+  // The parent's own index still works normally.
+  const parentSearch = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  const result = await parentSearch.context({
+    query: "ancestor content",
+    limit: 3,
+  });
+  assert.ok(result.items.length > 0);
+  await parentSearch.close();
+});
+
 test("ownership loss during finalization publishes nothing", async (t) => {
   const parent = await createTemporaryDirectory(t, "zg-reserve-finalize-");
   const destinationHome = join(parent, "destination", ".zvec-grep");
