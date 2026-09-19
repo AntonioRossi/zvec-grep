@@ -248,7 +248,19 @@ function lockIdentityMatches(
   );
 }
 
-function cleanupStaleLock(lockPath: string, staleMs: number): boolean {
+function cleanupStaleLock(
+  lockPath: string,
+  staleMs: number,
+  options: { allowReclaim: boolean } = { allowReclaim: false },
+): boolean {
+  // Write locks are never reclaimed automatically: removal of another
+  // process's lock cannot be made race-free, so any held or uncertain write
+  // lock blocks until an operator recovers it after writers are quiescent.
+  // Only uniquely-named reader entries may be reclaimed, and only for a
+  // verified-dead local owner.
+  if (!options.allowReclaim) {
+    return false;
+  }
   if (!existsSync(lockPath)) {
     return false;
   }
@@ -294,7 +306,7 @@ function hasActiveReaders(lockPath: string, staleMs: number): boolean {
   let active = false;
   for (const entry of entries) {
     const readerPath = join(readersPath, entry);
-    if (cleanupStaleLock(readerPath, staleMs)) {
+    if (cleanupStaleLock(readerPath, staleMs, { allowReclaim: true })) {
       continue;
     }
 
@@ -392,7 +404,7 @@ function lockBusyError(
       detail("ownerHost", owner?.hostname),
       detail(
         "hint",
-        "Another operation holds or last owned this lock. Locks are never reclaimed automatically when ownership is uncertain; after all writers are quiescent, remove the lock directory shown above manually to recover.",
+        "Another operation holds or last owned this lock. Write locks are never reclaimed automatically; after all writers are quiescent, remove the lock directory shown above manually to recover.",
       ),
     ]),
   });
@@ -414,7 +426,7 @@ function readLockBusyError(
       detail("ownerHost", owner?.hostname),
       detail(
         "hint",
-        "Another operation holds or last owned this lock. Locks are never reclaimed automatically when ownership is uncertain; after all writers are quiescent, remove the lock directory shown above manually to recover.",
+        "Another operation holds or last owned this lock. Write locks are never reclaimed automatically; after all writers are quiescent, remove the lock directory shown above manually to recover.",
       ),
     ]),
   });

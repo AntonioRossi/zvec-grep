@@ -280,12 +280,14 @@ Each record includes a `level` field alongside the existing event fields.
 
 ## Index locks
 
-Writers hold a file lock at `<workspace>/.zvec-grep/locks/`. A known-live
-local owner keeps its lock regardless of age, and a verified-dead local owner
-is reclaimed safely; locks are **never** reclaimed automatically when
-ownership is uncertain (a foreign host, or missing or corrupt lock metadata),
-so a crashed or externally modified lock blocks the workspace instead of
-risking concurrent writers. Recovery is an explicit operator action: after
-all writers are quiescent, remove the lock directory shown in the
-`ZVEC_GREP.ENGINE.LOCK.BUSY` error. This replaces earlier automatic age-based
-eviction as an intentional behavior change.
+Writers hold a file lock at `<workspace>/.zvec-grep/locks/`. A write lock is
+**never** reclaimed automatically — not for age, and not even when its local
+owner has verifiably exited: no reclamation-by-deletion can be made safe
+against racing a successor's fresh acquisition, so a crashed or abandoned
+write operation blocks the workspace instead of risking concurrent writers.
+Uniquely-named reader entries are reclaimed only for a verified-dead local
+owner, with physical ownership checks. Recovery is an explicit operator
+action: after all writers are quiescent, remove the lock directory shown in
+the `ZVEC_GREP.ENGINE.LOCK.BUSY` error. This intentionally replaces earlier
+automatic age-based eviction, including automatic recovery of crashed local
+writers.
