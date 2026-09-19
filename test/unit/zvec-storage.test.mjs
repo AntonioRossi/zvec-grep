@@ -9,7 +9,10 @@ import {
   ZVecDataType,
 } from "@zvec/zvec";
 import { createWorkspaceIndexStorage } from "../../dist/engine/storage/index.js";
-import { queryFileMetadataDocs } from "../../dist/engine/storage/zvec.js";
+import {
+  parseRange,
+  queryFileMetadataDocs,
+} from "../../dist/engine/storage/zvec.js";
 
 function doc(id) {
   return {
@@ -140,6 +143,81 @@ test("file metadata supports one batched path-prefix lookup", async (t) => {
     "src/nested/b.ts",
   ]);
 });
+
+test("parseRange accepts every supported well-formed range", () => {
+  assert.deepEqual(parseRange('{"kind":"file"}'), { kind: "file" });
+  assert.deepEqual(
+    parseRange(
+      '{"kind":"text","startLine":1,"endLine":3,"startOffset":0,"endOffset":42}',
+    ),
+    { kind: "text", startLine: 1, endLine: 3, startOffset: 0, endOffset: 42 },
+  );
+  assert.deepEqual(
+    parseRange('{"kind":"byte","startOffset":0,"endOffset":10}'),
+    {
+      kind: "byte",
+      startOffset: 0,
+      endOffset: 10,
+    },
+  );
+  assert.deepEqual(parseRange('{"kind":"page","page":2}'), {
+    kind: "page",
+    page: 2,
+  });
+  assert.deepEqual(
+    parseRange('{"kind":"page_text","page":1,"startOffset":0,"endOffset":5}'),
+    { kind: "page_text", page: 1, startOffset: 0, endOffset: 5 },
+  );
+  assert.deepEqual(
+    parseRange(
+      '{"kind":"page_region","page":0,"x":0.5,"y":1,"width":2.5,"height":3}',
+    ),
+    { kind: "page_region", page: 0, x: 0.5, y: 1, width: 2.5, height: 3 },
+  );
+});
+
+test("parseRange rejects non-object serialized ranges", () => {
+  for (const value of ["null", "42", '"text"', "true", '[{"kind":"file"}]']) {
+    assertInvalidRange(value);
+  }
+  assert.throws(() => parseRange("{not json"), "malformed JSON must not parse");
+});
+
+test("parseRange rejects unknown kinds and invalid fields", () => {
+  assertInvalidRange('{"kind":"wat"}');
+  assertInvalidRange('{"kind":"text","startLine":1}');
+  assertInvalidRange(
+    '{"kind":"text","startLine":-1,"endLine":1,"startOffset":0,"endOffset":1}',
+  );
+  assertInvalidRange(
+    '{"kind":"text","startLine":1.5,"endLine":2,"startOffset":0,"endOffset":1}',
+  );
+  assertInvalidRange('{"kind":"page","page":"2"}');
+  assertInvalidRange(
+    '{"kind":"page_region","page":0,"x":-1,"y":0,"width":1,"height":1}',
+  );
+  assertInvalidRange(
+    '{"kind":"page_region","page":0,"x":1e999,"y":0,"width":1,"height":1}',
+  );
+});
+
+test("parseRange rejects inverted ranges", () => {
+  assertInvalidRange(
+    '{"kind":"text","startLine":3,"endLine":1,"startOffset":0,"endOffset":1}',
+  );
+  assertInvalidRange('{"kind":"byte","startOffset":10,"endOffset":5}');
+  assertInvalidRange(
+    '{"kind":"page_text","page":1,"startOffset":5,"endOffset":0}',
+  );
+});
+
+function assertInvalidRange(value) {
+  assert.throws(
+    () => parseRange(value),
+    (error) => error?.code === "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+    `range must be rejected with INVALID_RANGE: ${value}`,
+  );
+}
 
 function fileInfo(id, root, relativePath) {
   return {
