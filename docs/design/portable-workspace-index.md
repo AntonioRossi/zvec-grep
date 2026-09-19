@@ -190,6 +190,14 @@ Migration, import, and export publish through one protocol:
 6. **Pre-commit abort**: only provably owned staging is removed, after
    native handles are closed and only while ownership remains verifiable;
    the destination home itself is never recursively deleted.
+7. **Durable incomplete state**: a reservation writes an `INCOMPLETE` marker
+   into the destination at start and removes it only at commit. Readers,
+   discovery, and writers treat any home carrying the marker as an explicit
+   error — never an ancestor fallback — across process death and lock
+   cleanup. Recovery is the documented operator action: with writers
+   quiescent, remove the marker and partial contents, then retry. Since
+   write locks are never reclaimed automatically, an abandoned reservation
+   blocks until that recovery.
 
 ## 7. Export and import (logical portability)
 
