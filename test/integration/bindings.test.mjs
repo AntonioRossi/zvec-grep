@@ -185,6 +185,44 @@ test("cancelled forced reconciliation leaves the index unverified for retry", as
   await service3.close();
 });
 
+test("invalidation propagates access failures and never silently keeps trust", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-bind-eacces-");
+  const root = join(parent, "W");
+  await indexFixture(root, "alpha indexed document");
+
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({ root, embeddingModel: model });
+  await service.index();
+  await service.close();
+
+  const { readWorkspaceManifest } =
+    await import("../../dist/engine/manifest.js");
+  const { WorkspaceBindingStore } =
+    await import("../../dist/engine/bindings.js");
+  const manifest = readWorkspaceManifest(join(root, ".zvec-grep"));
+  const store = new WorkspaceBindingStore();
+  assert.equal(store.matches(manifest.id, root), true);
+
+  // With the workspace unreadable, invalidation must fail loudly instead of
+  // reporting a revocation that never happened.
+  const { chmod } = await import("node:fs/promises");
+  await chmod(parent, 0o000);
+  try {
+    assert.throws(
+      () => store.invalidate(manifest.id, root),
+      /EACCES|permission denied/i,
+      "an access failure during invalidation must propagate",
+    );
+  } finally {
+    await chmod(parent, 0o755);
+  }
+
+  // Restored access: invalidation works, and verification is really gone.
+  store.invalidate(manifest.id, root);
+  assert.equal(store.matches(manifest.id, root), false);
+});
+
 test("binding updates are serialized and never resurrect an invalidation", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-bind-serialize-");
