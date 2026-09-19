@@ -1257,7 +1257,108 @@ function readCodeModifiers(value: string | null): CodeEntityModifier[] {
 }
 
 export function parseRange(value: string): Range {
-  return JSON.parse(value) as Range;
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new EngineError("Stored fragment range is not an object", {
+      code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+      context: `value=${value.slice(0, 64)}`,
+    });
+  }
+  const record = parsed as Record<string, unknown>;
+  const requireIntegers = (fields: readonly string[]): number[] =>
+    fields.map((field) => {
+      const fieldValue = record[field];
+      if (
+        typeof fieldValue !== "number" ||
+        !Number.isInteger(fieldValue) ||
+        fieldValue < 0
+      ) {
+        throw new EngineError("Stored fragment range field is invalid", {
+          code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+          context: `kind=${String(record.kind)} field=${field}`,
+        });
+      }
+      return fieldValue;
+    });
+  switch (record.kind) {
+    case "file":
+      return { kind: "file" };
+    case "text": {
+      const [startLine, endLine, startOffset, endOffset] = requireIntegers([
+        "startLine",
+        "endLine",
+        "startOffset",
+        "endOffset",
+      ]);
+      if (endLine < startLine) {
+        throw new EngineError("Stored fragment text range is inverted", {
+          code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+          context: `startLine=${startLine} endLine=${endLine}`,
+        });
+      }
+      return { kind: "text", startLine, endLine, startOffset, endOffset };
+    }
+    case "byte": {
+      const [startOffset, endOffset] = requireIntegers([
+        "startOffset",
+        "endOffset",
+      ]);
+      if (endOffset < startOffset) {
+        throw new EngineError("Stored fragment byte range is inverted", {
+          code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+          context: `startOffset=${startOffset} endOffset=${endOffset}`,
+        });
+      }
+      return { kind: "byte", startOffset, endOffset };
+    }
+    case "page": {
+      const [page] = requireIntegers(["page"]);
+      return { kind: "page", page };
+    }
+    case "page_text": {
+      const [page, startOffset, endOffset] = requireIntegers([
+        "page",
+        "startOffset",
+        "endOffset",
+      ]);
+      if (endOffset < startOffset) {
+        throw new EngineError("Stored fragment page-text range is inverted", {
+          code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+          context: `startOffset=${startOffset} endOffset=${endOffset}`,
+        });
+      }
+      return { kind: "page_text", page, startOffset, endOffset };
+    }
+    case "page_region": {
+      const [page] = requireIntegers(["page"]);
+      for (const field of ["x", "y", "width", "height"] as const) {
+        const fieldValue = record[field];
+        if (
+          typeof fieldValue !== "number" ||
+          !Number.isFinite(fieldValue) ||
+          fieldValue < 0
+        ) {
+          throw new EngineError("Stored fragment region field is invalid", {
+            code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+            context: `kind=page_region field=${field}`,
+          });
+        }
+      }
+      return {
+        kind: "page_region",
+        page,
+        x: record.x as number,
+        y: record.y as number,
+        width: record.width as number,
+        height: record.height as number,
+      };
+    }
+    default:
+      throw new EngineError("Stored fragment range kind is unknown", {
+        code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+        context: `kind=${String(record.kind)}`,
+      });
+  }
 }
 
 function docsToHits(

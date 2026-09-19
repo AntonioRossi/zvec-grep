@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { EngineError } from "./errors.js";
 import type {
@@ -66,6 +66,17 @@ export function workspaceManifestPath(home: string): string {
 }
 
 export function readWorkspaceManifest(home: string): WorkspaceManifest | null {
+  // A durable INCOMPLETE marker blocks readers even after process death or
+  // lock cleanup; recovery is the documented operator action.
+  if (existsSync(join(home, "INCOMPLETE"))) {
+    throw new EngineError(
+      "Workspace index destination is incomplete from an interrupted reservation",
+      {
+        code: "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+        context: `home=${home} hint=recover by removing the INCOMPLETE marker and partial contents after all writers are quiescent, then retry the operation`,
+      },
+    );
+  }
   const path = workspaceManifestPath(home);
   const value = readJsonFileSync<unknown>(path, null);
   if (value === null) {

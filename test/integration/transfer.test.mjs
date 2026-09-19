@@ -341,6 +341,44 @@ test("import rejects internally consistent but underived identities", async (t) 
   );
 });
 
+test("import rejects entities with unusable serialized ranges", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-transfer-range-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(sourceRoot, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+
+  // Corrupt one entity's range_json with data that parses but is not a
+  // usable Range.
+  const entitiesPath = join(artifact, "entities.jsonl");
+  const entityDocs = (await readFile(entitiesPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  entityDocs[0].fields.range_json = "null";
+  await writeFile(
+    entitiesPath,
+    entityDocs.map((doc) => JSON.stringify(doc)).join("\n") + "\n",
+  );
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    importInSeparateProcess(artifact, destinationRoot, t),
+    undefined,
+    "a structurally unusable range must fail verification",
+  );
+  // Verification fails inside the reservation, so nothing is published: the
+  // destination home may retain lock scaffolding but never an index.
+  const homeEntries = await readdir(join(destinationRoot, ".zvec-grep"));
+  assert.ok(!homeEntries.includes("manifest.json"));
+  assert.ok(!homeEntries.includes("files.zvec"));
+  assert.ok(!homeEntries.includes("index.zvec"));
+});
+
 test("CLI migrate requires an explicit destination and CLI export/import works", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-transfer-cli-");

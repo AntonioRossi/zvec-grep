@@ -78,15 +78,32 @@ test("a live local owner's write lock is never reclaimed at any age", async (t) 
   competitor.release();
 });
 
-test("a verified-dead local owner's lock is reclaimed", async (t) => {
+test("a verified-dead local owner's write lock stays blocked until operator recovery", async (t) => {
   const home = await makeHome(t);
   const lockPath = lockPathFor(home);
   await writeOwnerInfo(`${lockPath}.write`, { pid: DEAD_PID });
 
-  const lock = acquireReadWriteLock(lockPath, "write", {
+  // Automatic reclamation is intentionally removed: even a verified-dead
+  // local owner's write lock blocks until the operator removes it.
+  assert.throws(
+    () => acquireReadWriteLock(lockPath, "write", { operation: "successor" }),
+    (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+  );
+  assert.ok(
+    await stat(`${lockPath}.write`).then(
+      (s) => s.isDirectory(),
+      () => false,
+    ),
+    "the dead owner's write lock must remain until explicit recovery",
+  );
+
+  // Documented operator recovery: with writers quiescent, remove the lock
+  // directory; availability is restored.
+  await rm(`${lockPath}.write`, { recursive: true, force: true });
+  const recovered = acquireReadWriteLock(lockPath, "write", {
     operation: "successor",
   });
-  lock.release();
+  recovered.release();
 });
 
 test("unknown ownership remains blocked and is never auto-reclaimed", async (t) => {

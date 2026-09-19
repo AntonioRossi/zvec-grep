@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { ZVecInitialize, ZVecLogLevel } from "@zvec/zvec";
@@ -158,7 +158,148 @@ test("an error after commit never touches the published result", async (t) => {
   assert.ok(entries.includes("index.zvec"));
 });
 
-test("an abandoned reservation is reclaimed through the dead-owner rule", async (t) => {
+test("an incomplete destination stays blocked after lock cleanup, with no ancestor fallback", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-incomplete-");
+  const { legacyHome } = await makeLegacySource(t, parent);
+  const destinationRoot = join(parent, "destination");
+  await mkdir(join(destinationRoot, "docs"), { recursive: true });
+  await writeFile(
+    join(destinationRoot, "docs", "guide.md"),
+    FIXTURES["docs/guide.md"],
+  );
+  const destinationHome = join(destinationRoot, ".zvec-grep");
+
+  // Simulate a crashed operation: the durable marker and a dead owner's
+  // write lock persist; partial staged content is present.
+  const lockDir = join(destinationHome, "locks", "home.write");
+  await mkdir(lockDir, { recursive: true });
+  await writeFile(
+    join(lockDir, "lock.json"),
+    `${JSON.stringify(
+      {
+        token: "crashed-token",
+        pid: 99_999_999,
+        hostname: (await import("node:os")).hostname(),
+        startedAt: Date.now(),
+        operation: "index.import",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  await mkdir(join(destinationHome, "staging-crashed"), { recursive: true });
+  await writeFile(
+    join(destinationHome, "INCOMPLETE"),
+    `${JSON.stringify({ token: "crashed-token", operation: "index.import" })}\n`,
+  );
+
+  const service = await createZvecGrep({
+    root: destinationRoot,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "guide", limit: 3 }),
+    /incomplete|INCOMPLETE|Index unavailable/i,
+    "readers are blocked while the abandoned reservation's lock persists",
+  );
+  await service.close();
+
+  // The operator removes the lock directory during recovery; the marker
+  // alone still blocks readers and writers (no ancestor fallback).
+  await rm(join(destinationHome, "locks"), { recursive: true, force: true });
+  const service2 = await createZvecGrep({
+    root: destinationRoot,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service2.context({ query: "guide", limit: 3 }),
+    /incomplete|INCOMPLETE/i,
+    "the durable marker alone keeps the destination blocked",
+  );
+  await assert.rejects(
+    service2.index(),
+    /incomplete|INCOMPLETE|busy|BUSY/i,
+    "writers are blocked by the durable marker",
+  );
+  await service2.close();
+
+  // Documented recovery: with writers quiescent, remove the marker and the
+  // partial contents; the workspace is usable again.
+  await rm(destinationHome, { recursive: true, force: true });
+  const result = await migrateWorkspaceIndex({
+    sourceHome: legacyHome,
+    destinationRoot,
+  });
+  assert.equal(result.verification.countsMatch, true);
+});
+
+test("ownership loss during finalization publishes nothing", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-reserve-finalize-");
+  const destinationHome = join(parent, "destination", ".zvec-grep");
+  await mkdir(join(parent, "destination"), { recursive: true });
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.finalize-loss",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "staged");
+  const lockDir = join(destinationHome, "locks", "home.write");
+
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      reservation.publish(() => {
+        // Ownership is lost while finalization runs.
+        rmSync(lockDir, { recursive: true, force: true });
+        mkdirSync(lockDir, { recursive: true });
+        writeFileSync(
+          join(lockDir, "lock.json"),
+          `${JSON.stringify({ token: "competitor" })}\n`,
+        );
+      }),
+    ),
+    /ownership.*lost|RESERVATION/i,
+  );
+  const destinationEntries = await readdir(destinationHome);
+  assert.ok(!destinationEntries.includes("manifest.json"));
+  assert.ok(
+    !destinationEntries.includes("payload.txt"),
+    "nothing was published into the compromised destination",
+  );
+  assert.deepEqual(
+    JSON.parse(await readFile(join(lockDir, "lock.json"), "utf8")).token,
+    "competitor",
+    "the replacement lock survives the fenced publication",
+  );
+});
+
+test("an aborted staging replacement preserves the foreign file", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-reserve-staging-");
+  const destinationHome = join(parent, "destination", ".zvec-grep");
+  await mkdir(join(parent, "destination"), { recursive: true });
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.staging-replace",
+    existingIndexMarkers: ["manifest.json"],
+  });
+
+  // Replace only the staging directory with foreign content.
+  rmSync(reservation.stagingHome, { recursive: true, force: true });
+  for (let i = 0; i < 64; i++) {
+    mkdirSync(join(parent, `churn-${i}`));
+  }
+  mkdirSync(reservation.stagingHome, { recursive: true });
+  writeFileSync(join(reservation.stagingHome, "foreign.txt"), "not ours");
+
+  reservation.abort();
+  assert.equal(
+    await readFile(join(reservation.stagingHome, "foreign.txt"), "utf8"),
+    "not ours",
+    "abort must not delete a staging replacement",
+  );
+});
+
+test("an abandoned reservation stays blocked until the documented operator recovery", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
   const parent = await createTemporaryDirectory(t, "zg-reserve-abandon-");
   const { legacyHome } = await makeLegacySource(t, parent);
@@ -170,6 +311,7 @@ test("an abandoned reservation is reclaimed through the dead-owner rule", async 
   );
 
   // Simulate an abandoned reservation: a write lock whose owner is dead.
+  // Automatic reclamation is intentionally removed, so this stays blocked.
   const lockDir = join(destinationRoot, ".zvec-grep", "locks", "home.write");
   await mkdir(lockDir, { recursive: true });
   await writeFile(
@@ -187,6 +329,21 @@ test("an abandoned reservation is reclaimed through the dead-owner rule", async 
     )}\n`,
   );
 
+  await assert.rejects(
+    migrateWorkspaceIndex({
+      sourceHome: legacyHome,
+      destinationRoot,
+    }),
+    (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+    "an abandoned write lock blocks until operator recovery",
+  );
+
+  // Documented recovery: with writers quiescent, the operator removes the
+  // lock directory; the operation then proceeds.
+  await rm(join(destinationRoot, ".zvec-grep", "locks"), {
+    recursive: true,
+    force: true,
+  });
   const result = await migrateWorkspaceIndex({
     sourceHome: legacyHome,
     destinationRoot,

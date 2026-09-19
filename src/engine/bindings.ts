@@ -1,4 +1,4 @@
-import { readdirSync, statSync, unlinkSync } from "node:fs";
+import { readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tryRealpathSync } from "./utils/canonical-path.js";
 import { readJsonFileSync, writeJsonFileSync } from "./utils/json.js";
@@ -56,6 +56,25 @@ export function currentWorkspaceBinding(
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Resolve the workspace root for invalidation. Genuine absence returns
+ * undefined; permission and I/O failures propagate — invalidation must never
+ * report success when identity could not be resolved.
+ */
+function resolveBindingRoot(workspaceRoot: string): string | undefined {
+  try {
+    return realpathSync(workspaceRoot);
+  } catch (error) {
+    if (
+      isNodeError(error) &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      return undefined;
+    }
+    throw error;
   }
 }
 
@@ -128,7 +147,7 @@ export class WorkspaceBindingStore {
    * genuinely absent record is ignored; other I/O failures propagate.
    */
   invalidate(indexId: string, workspaceRoot: string): void {
-    const rootPath = tryRealpathSync(workspaceRoot);
+    const rootPath = resolveBindingRoot(workspaceRoot);
     if (rootPath === undefined) {
       return;
     }
