@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
 import {
+  appendReservationCleanup,
   reserveDestination,
   type DestinationReservation,
 } from "../reservation.js";
@@ -16,6 +17,7 @@ import {
   type LegacyManifest,
 } from "../migrate/index.js";
 import {
+  assertHomeNotIncomplete,
   parsePortableManifest,
   readWorkspaceManifest,
   writeWorkspaceManifest,
@@ -117,6 +119,10 @@ export async function exportWorkspaceIndex(
   const openHandles: ZVecCollection[] = [];
   let reservation: DestinationReservation | undefined;
   try {
+    // The incomplete-home guard runs under the source lock before any
+    // collection or metadata read: a crashed reservation blocks consumption
+    // even after its owner is gone.
+    assertHomeNotIncomplete(sourceHome);
     report("read", "Reading source index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
     const sourcePaths = resolveWorkspaceIndexStoragePaths(sourceHome);
@@ -264,7 +270,10 @@ export async function exportWorkspaceIndex(
       entitiesExported: entityDocs.length,
     };
   } catch (error) {
-    reservation?.abort();
+    const cleanup = reservation?.abort();
+    if (cleanup) {
+      throw appendReservationCleanup(error, cleanup);
+    }
     throw error;
   } finally {
     for (const handle of openHandles.splice(0).reverse()) {
@@ -299,6 +308,10 @@ export async function importWorkspaceIndex(
     { operation: "index.import" },
   );
   try {
+    // A crashed export leaves a durable INCOMPLETE marker behind even after
+    // its lock is gone; such artifacts are rejected before any metadata read
+    // or destination staging.
+    assertHomeNotIncomplete(artifactPath);
     return await importWorkspaceIndexLocked(
       options,
       report,
@@ -549,7 +562,10 @@ async function importWorkspaceIndexLocked(
         // Cleanup is best-effort.
       }
     }
-    reserved.abort();
+    const cleanup = reserved.abort();
+    if (cleanup) {
+      throw appendReservationCleanup(error, cleanup);
+    }
     throw error;
   }
 

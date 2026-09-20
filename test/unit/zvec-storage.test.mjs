@@ -205,9 +205,32 @@ test("parseRange rejects inverted ranges", () => {
   assertInvalidRange(
     '{"kind":"text","startLine":3,"endLine":1,"startOffset":0,"endOffset":1}',
   );
+  assertInvalidRange(
+    '{"kind":"text","startLine":1,"endLine":1,"startOffset":20,"endOffset":1}',
+  );
   assertInvalidRange('{"kind":"byte","startOffset":10,"endOffset":5}');
   assertInvalidRange(
     '{"kind":"page_text","page":1,"startOffset":5,"endOffset":0}',
+  );
+});
+
+test("parseRange retains convention-dependent text offsets", () => {
+  // Same-line offsets may be equal (an empty span is not inverted).
+  assert.deepEqual(
+    parseRange(
+      '{"kind":"text","startLine":2,"endLine":2,"startOffset":5,"endOffset":5}',
+    ),
+    { kind: "text", startLine: 2, endLine: 2, startOffset: 5, endOffset: 5 },
+  );
+  // Multi-line ranges carry producer-dependent offsets (absolute document
+  // positions from extraction, line columns from lexical expansion); until
+  // the recorded convention reconciliation, cross-line ordering is not
+  // enforced and such ranges parse unchanged.
+  assert.deepEqual(
+    parseRange(
+      '{"kind":"text","startLine":1,"endLine":3,"startOffset":50,"endOffset":10}',
+    ),
+    { kind: "text", startLine: 1, endLine: 3, startOffset: 50, endOffset: 10 },
   );
 });
 

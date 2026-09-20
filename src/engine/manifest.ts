@@ -65,9 +65,14 @@ export function workspaceManifestPath(home: string): string {
   return join(home, WORKSPACE_MANIFEST_FILE);
 }
 
-export function readWorkspaceManifest(home: string): WorkspaceManifest | null {
-  // A durable INCOMPLETE marker blocks readers even after process death or
-  // lock cleanup; recovery is the documented operator action.
+/**
+ * A durable INCOMPLETE marker blocks readers, writers and discovery even
+ * after process death or lock cleanup; recovery is the documented operator
+ * action. Every entry path that reads an index home — including raw-manifest
+ * readers such as export, import and migration — must run this guard under
+ * the source lock before reading anything.
+ */
+export function assertHomeNotIncomplete(home: string): void {
   if (existsSync(join(home, "INCOMPLETE"))) {
     throw new EngineError(
       "Workspace index destination is incomplete from an interrupted reservation",
@@ -77,6 +82,10 @@ export function readWorkspaceManifest(home: string): WorkspaceManifest | null {
       },
     );
   }
+}
+
+export function readWorkspaceManifest(home: string): WorkspaceManifest | null {
+  assertHomeNotIncomplete(home);
   const path = workspaceManifestPath(home);
   const value = readJsonFileSync<unknown>(path, null);
   if (value === null) {

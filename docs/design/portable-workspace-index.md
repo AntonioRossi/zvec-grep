@@ -171,33 +171,42 @@ Migration, import, and export publish through one protocol:
    the whole operation. Validation happens **under** the lock: a destination
    containing index markers fails; a destination containing anything other
    than lock scaffolding is rejected as unrelated contents and preserved
-   untouched. An abandoned reservation is reclaimed only through the lock
-   layer's verified-dead-owner rule.
+   untouched. An abandoned reservation is never reclaimed automatically: it
+   stays blocked until the documented operator recovery (point 7).
 2. **Build inside the reservation** and verify the staged result. Import
    additionally holds the artifact's read lock while consuming it, so
-   consumers respect the exporter's release-as-commit boundary.
+   consumers respect the exporter's release-as-commit boundary. Export,
+   import, and migration all run the incomplete-home guard under the source
+   lock before any source read.
 3. **Re-verify ownership before publication and before any cleanup**: the
    home's device/inode, the write lock's device/inode, and the operation's
    token must all match. Ownership loss fences the operation; nothing is
    merged, published, or deleted on someone else's behalf.
 4. **Publish without overwriting**: finalize the manifest into staging, then
    move staged children (manifest last); a child-name collision is an
-   explicit error and the foreign child is never replaced.
+   explicit error and the foreign child is never replaced. Each moved child
+   is recorded with the identity it had in staging; rollback compares against
+   that recorded identity, never adopts a post-move observation as ownership,
+   and never overwrites content found at a staging target.
 5. **Commit once**: the operation commits only when its release **actually
    releases** — a failed release is ownership loss, leaves everything in
    place for operator review, and reports failure. After a successful
    release, no error path cleans the result.
 6. **Pre-commit abort**: only provably owned staging is removed, after
    native handles are closed and only while ownership remains verifiable;
-   the destination home itself is never recursively deleted.
+   the destination home itself is never recursively deleted. If rollback
+   cannot complete, blockage is preserved: the INCOMPLETE marker while it
+   stands, otherwise the write lock is retained as the last block, and the
+   failure reports the actual state left and the required operator recovery.
 7. **Durable incomplete state**: a reservation writes an `INCOMPLETE` marker
-   into the destination at start and removes it only at commit. Readers,
-   discovery, and writers treat any home carrying the marker as an explicit
-   error — never an ancestor fallback — across process death and lock
-   cleanup. Recovery is the documented operator action: with writers
-   quiescent, remove the marker and partial contents, then retry. Since
-   write locks are never reclaimed automatically, an abandoned reservation
-   blocks until that recovery.
+   into the destination at start and removes it only through a checked
+   transition at commit — absence, replacement, or removal failure can never
+   be converted into successful publication. Readers, discovery, and writers
+   treat any home carrying the marker as an explicit error — never an
+   ancestor fallback — across process death and lock cleanup. Recovery is
+   the documented operator action: with writers quiescent, remove the marker
+   and partial contents, then retry. Since write locks are never reclaimed
+   automatically, an abandoned reservation blocks until that recovery.
 
 ## 7. Export and import (logical portability)
 
