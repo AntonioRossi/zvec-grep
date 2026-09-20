@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
   readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -595,27 +597,49 @@ test("a failed rollback keeps the destination blocked instead of serving the anc
   await mkdir(child, { recursive: true });
   await writeFile(join(child, "docs.md"), "# Child\n\nChild content.\n");
 
+  const danglingTarget = join(parent, "no-such-target");
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.failed-rollback",
     existingIndexMarkers: ["manifest.json"],
+    testHooks: {
+      afterChildMove(child) {
+        if (child !== "payload.txt") {
+          return;
+        }
+        // Between the first move and the next: a foreign dangling link
+        // appears at the moved child's staging target, and a foreign file
+        // occupies the next move's destination. Rollback must refuse to
+        // overwrite the link instead of carrying it into staging.
+        symlinkSync(danglingTarget, join(reservation.stagingHome, child));
+        writeFileSync(join(destinationHome, "manifest.json"), "foreign\n");
+      },
+    },
   });
-  // A staged child whose identity can never verify after the move (a
-  // dangling symlink): publication reaches the move loop, then rollback must
-  // refuse to adopt it instead of carrying it into staging.
-  const danglingTarget = join(parent, "no-such-target");
-  symlinkSync(danglingTarget, join(reservation.stagingHome, "ghost.txt"));
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
   assert.throws(
-    () => reservation.publish(() => undefined),
+    () =>
+      reservation.publish(() => {
+        writeFileSync(join(reservation.stagingHome, "manifest.json"), "{}");
+      }),
     /rollback is incomplete/i,
   );
 
-  // The unverifiable child remains at the destination; it is neither moved
-  // into staging nor deleted.
+  // The foreign link is preserved at the staging target; the published child
+  // remains at the destination (not moved back, not deleted); the foreign
+  // destination entry is preserved.
   assert.equal(
-    readlinkSync(join(destinationHome, "ghost.txt")),
+    readlinkSync(join(reservation.stagingHome, "payload.txt")),
     danglingTarget,
+  );
+  assert.equal(
+    await readFile(join(destinationHome, "payload.txt"), "utf8"),
+    "ours",
+  );
+  assert.equal(
+    await readFile(join(destinationHome, "manifest.json"), "utf8"),
+    "foreign\n",
   );
   // Blockage is preserved by the durable marker.
   assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
@@ -633,7 +657,9 @@ test("a failed rollback keeps the destination blocked instead of serving the anc
 
   // Abort after the failed publish does not weaken the blockage.
   reservation.abort();
-  assert.ok(lstatSync(join(destinationHome, "ghost.txt")).isSymbolicLink());
+  assert.ok(
+    lstatSync(join(reservation.stagingHome, "payload.txt")).isSymbolicLink(),
+  );
   assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
 });
 
@@ -712,31 +738,41 @@ test("an incomplete rollback with a missing marker restores the marker and repor
   const parent = await createTemporaryDirectory(t, "zg-reserve-remarker-");
   const destinationHome = join(parent, "destination", ".zvec-grep");
   await mkdir(join(parent, "destination"), { recursive: true });
+  const danglingTarget = join(parent, "no-such-target");
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.remarker",
     existingIndexMarkers: ["manifest.json"],
+    testHooks: {
+      afterChildMove(child) {
+        // Block the child's return and remove the durable marker.
+        symlinkSync(danglingTarget, join(reservation.stagingHome, child));
+        rmSync(join(destinationHome, "INCOMPLETE"));
+      },
+    },
   });
-  symlinkSync(
-    join(parent, "no-such-target"),
-    join(reservation.stagingHome, "ghost.txt"),
-  );
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
   assert.throws(
-    () =>
-      reservation.publish(() => {
-        rmSync(join(destinationHome, "INCOMPLETE"));
-      }),
+    () => reservation.publish(() => undefined),
     /rollback is incomplete/i,
   );
 
   // The marker is restored (ownership was verifiable) and the destination
-  // stays blocked with the partial payload in place.
+  // stays blocked with the partial payload in place; the foreign link at the
+  // staging target is preserved.
   const marker = JSON.parse(
     await readFile(join(destinationHome, "INCOMPLETE"), "utf8"),
   );
   assert.equal(marker.operation, "rollback-block");
-  assert.ok(lstatSync(join(destinationHome, "ghost.txt")).isSymbolicLink());
+  assert.equal(
+    readlinkSync(join(reservation.stagingHome, "payload.txt")),
+    danglingTarget,
+  );
+  assert.equal(
+    await readFile(join(destinationHome, "payload.txt"), "utf8"),
+    "ours",
+  );
   assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
 });
 
@@ -744,22 +780,23 @@ test("an incomplete rollback preserves a foreign marker and releases the lock", 
   const parent = await createTemporaryDirectory(t, "zg-reserve-foreignkeep-");
   const destinationHome = join(parent, "destination", ".zvec-grep");
   await mkdir(join(parent, "destination"), { recursive: true });
+  const danglingTarget = join(parent, "no-such-target");
+  const foreignMarker = `${JSON.stringify({ token: "foreign-token" })}\n`;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.foreignkeep",
     existingIndexMarkers: ["manifest.json"],
+    testHooks: {
+      afterChildMove(child) {
+        symlinkSync(danglingTarget, join(reservation.stagingHome, child));
+        writeFileSync(join(destinationHome, "INCOMPLETE"), foreignMarker);
+      },
+    },
   });
-  symlinkSync(
-    join(parent, "no-such-target"),
-    join(reservation.stagingHome, "ghost.txt"),
-  );
-  const foreignMarker = `${JSON.stringify({ token: "foreign-token" })}\n`;
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
   assert.throws(
-    () =>
-      reservation.publish(() => {
-        writeFileSync(join(destinationHome, "INCOMPLETE"), foreignMarker);
-      }),
+    () => reservation.publish(() => undefined),
     /rollback is incomplete/i,
   );
 
@@ -769,7 +806,10 @@ test("an incomplete rollback preserves a foreign marker and releases the lock", 
     await readFile(join(destinationHome, "INCOMPLETE"), "utf8"),
     foreignMarker,
   );
-  assert.ok(lstatSync(join(destinationHome, "ghost.txt")).isSymbolicLink());
+  assert.equal(
+    readlinkSync(join(reservation.stagingHome, "payload.txt")),
+    danglingTarget,
+  );
   assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
   assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
 });
@@ -782,25 +822,24 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
     destinationHome,
     operation: "test.retainlock",
     existingIndexMarkers: ["manifest.json"],
+    testHooks: {
+      afterChildMove() {
+        // The marker vanishes and the home becomes unwritable: rollback
+        // cannot move the child back and the marker cannot be restored.
+        rmSync(join(destinationHome, "INCOMPLETE"));
+        chmodSync(destinationHome, 0o555);
+      },
+    },
   });
-  symlinkSync(
-    join(parent, "no-such-target"),
-    join(reservation.stagingHome, "ghost.txt"),
-  );
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
   assert.throws(
-    () =>
-      reservation.publish(() => {
-        rmSync(join(destinationHome, "INCOMPLETE"));
-        // A dangling symlink at the marker path: no marker can be read or
-        // restored through it, and it is never overwritten.
-        symlinkSync(
-          join(parent, "no-such-marker-target"),
-          join(destinationHome, "INCOMPLETE"),
-        );
-      }),
+    () => reservation.publish(() => undefined),
     /retained as the last block/i,
   );
+  // The unwritable home was only needed to fail the rollback and restore;
+  // restore permissions before assertions and cleanup.
+  chmodSync(destinationHome, 0o755);
 
   // The write lock is retained as the last block; nothing else was written.
   const lockInfo = JSON.parse(
@@ -810,8 +849,11 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
     ),
   );
   assert.equal(typeof lockInfo.token, "string");
-  assert.ok(lstatSync(join(destinationHome, "INCOMPLETE")).isSymbolicLink());
-  assert.ok(lstatSync(join(destinationHome, "ghost.txt")).isSymbolicLink());
+  assert.ok(!existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.equal(
+    await readFile(join(destinationHome, "payload.txt"), "utf8"),
+    "ours",
+  );
 
   // Abort must not release the retained lock or weaken the blockage.
   reservation.abort();
@@ -831,6 +873,213 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
   await assert.rejects(
     service.context({ query: "anything", limit: 1 }),
     (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+  );
+  await service.close();
+});
+
+test("publication rejects a dangling destination child without overwriting it", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-reserve-dangling-");
+  const destinationHome = join(parent, "destination", ".zvec-grep");
+  await mkdir(join(parent, "destination"), { recursive: true });
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.dangling-target",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+  // A foreign dangling link already occupies the publication target: it is
+  // an occupied pathname, never an empty destination.
+  const danglingTarget = join(parent, "no-such-target");
+  symlinkSync(danglingTarget, join(destinationHome, "payload.txt"));
+
+  assert.throws(
+    () =>
+      reservation.publish(() => {
+        writeFileSync(join(reservation.stagingHome, "manifest.json"), "{}");
+      }),
+    /already exists|refusing to overwrite/i,
+  );
+
+  // The foreign link's target and entry identity are unchanged.
+  assert.equal(
+    readlinkSync(join(destinationHome, "payload.txt")),
+    danglingTarget,
+  );
+  assert.ok(lstatSync(join(destinationHome, "payload.txt")).isSymbolicLink());
+  // Nothing moved; the staged payload remains in staging and the destination
+  // stays blocked.
+  assert.equal(
+    await readFile(join(reservation.stagingHome, "payload.txt"), "utf8"),
+    "ours",
+  );
+  assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
+});
+
+test("publication validates every staged entry type before the first move", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-reserve-types-");
+  const destinationHome = join(parent, "destination", ".zvec-grep");
+  await mkdir(join(parent, "destination"), { recursive: true });
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.entry-types",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  // Directories are legitimate staged children (native collections); a
+  // symlink is not. Validation happens before any move, so the legitimate
+  // child must not move either.
+  await mkdir(join(reservation.stagingHome, "collection.zvec"), {
+    recursive: true,
+  });
+  const linkTarget = join(parent, "elsewhere.txt");
+  await writeFile(linkTarget, "elsewhere");
+  symlinkSync(linkTarget, join(reservation.stagingHome, "evil.txt"));
+
+  assert.throws(
+    () =>
+      reservation.publish(() => {
+        writeFileSync(join(reservation.stagingHome, "manifest.json"), "{}");
+      }),
+    /unsupported entry type/i,
+  );
+
+  assert.equal(
+    readlinkSync(join(reservation.stagingHome, "evil.txt")),
+    linkTarget,
+  );
+  assert.ok(
+    !existsSync(join(destinationHome, "collection.zvec")),
+    "no child moved before the type rejection",
+  );
+  assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
+});
+
+test("replacement staging installed before publish is rejected before any move", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-reserve-swap-pre-");
+  const destinationHome = join(parent, "destination", ".zvec-grep");
+  await mkdir(join(parent, "destination"), { recursive: true });
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.staging-swap-pre",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+
+  // Move the original staging aside and install a replacement with foreign
+  // content before publication starts.
+  const asideHome = `${reservation.stagingHome}-aside`;
+  renameSync(reservation.stagingHome, asideHome);
+  await mkdir(reservation.stagingHome, { recursive: true });
+  await writeFile(join(reservation.stagingHome, "foreign.txt"), "not ours");
+
+  assert.throws(
+    () => reservation.publish(() => undefined),
+    /staging.*(lost|replaced)|ownership/i,
+  );
+
+  // The replacement's content is preserved in place; the original staging
+  // is preserved aside; nothing was moved into the destination.
+  assert.equal(
+    await readFile(join(reservation.stagingHome, "foreign.txt"), "utf8"),
+    "not ours",
+  );
+  assert.equal(await readFile(join(asideHome, "payload.txt"), "utf8"), "ours");
+  assert.ok(!existsSync(join(destinationHome, "foreign.txt")));
+  assert.ok(!existsSync(join(destinationHome, "payload.txt")));
+});
+
+test("replacement staging installed inside finalization is rejected before enumeration", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-reserve-swap-fin-");
+  const destinationHome = join(parent, "destination", ".zvec-grep");
+  await mkdir(join(parent, "destination"), { recursive: true });
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.staging-swap-finalize",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+  const asideHome = `${reservation.stagingHome}-aside`;
+
+  assert.throws(
+    () =>
+      reservation.publish(() => {
+        renameSync(reservation.stagingHome, asideHome);
+        mkdirSync(reservation.stagingHome, { recursive: true });
+        writeFileSync(join(reservation.stagingHome, "foreign.txt"), "not ours");
+      }),
+    /staging.*(lost|replaced)|ownership/i,
+  );
+
+  assert.equal(
+    await readFile(join(reservation.stagingHome, "foreign.txt"), "utf8"),
+    "not ours",
+  );
+  assert.equal(await readFile(join(asideHome, "payload.txt"), "utf8"), "ours");
+  assert.ok(!existsSync(join(destinationHome, "foreign.txt")));
+});
+
+test("a complete rollback with an unreadable marker stays blocked with a live ancestor", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-unread-marker-");
+
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  const child = join(parent, "child");
+  const destinationHome = join(child, ".zvec-grep");
+  await mkdir(child, { recursive: true });
+  await writeFile(join(child, "docs.md"), "# Child\n\nChild content.\n");
+
+  const danglingMarkerTarget = join(parent, "no-such-marker-target");
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.unreadable-marker",
+    existingIndexMarkers: ["manifest.json"],
+    testHooks: {
+      afterChildMove() {
+        // Replace the marker with a dangling symlink: present as an entry,
+        // unreadable as a marker, and never overwritten.
+        rmSync(join(destinationHome, "INCOMPLETE"));
+        symlinkSync(danglingMarkerTarget, join(destinationHome, "INCOMPLETE"));
+      },
+    },
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+
+  assert.throws(
+    () => reservation.publish(() => undefined),
+    /unreadable at publication/i,
+  );
+
+  // The payload rolled back into staging; the unreadable marker entry is
+  // preserved exactly; the lock was released because the entry blocks.
+  assert.equal(
+    await readFile(join(reservation.stagingHome, "payload.txt"), "utf8"),
+    "ours",
+  );
+  assert.equal(
+    readlinkSync(join(destinationHome, "INCOMPLETE")),
+    danglingMarkerTarget,
+  );
+  assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+
+  // Readers from the child are blocked rather than served by the ancestor.
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "ancestor content", limit: 3 }),
+    /incomplete|INCOMPLETE/i,
+    "an unreadable marker entry must keep blocking discovery",
   );
   await service.close();
 });

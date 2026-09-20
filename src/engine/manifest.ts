@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from "node:fs";
+import { lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { EngineError } from "./errors.js";
 import type {
@@ -65,6 +65,32 @@ export function workspaceManifestPath(home: string): string {
   return join(home, WORKSPACE_MANIFEST_FILE);
 }
 
+export type MarkerEntryStatus = "present" | "absent" | "unverifiable";
+
+/**
+ * Non-following inspection of the durable INCOMPLETE marker: any entry at
+ * the marker path — file, directory, or symlink, including a dangling one —
+ * is blockage. Only ENOENT/ENOTDIR count as absence; any other inspection
+ * failure is "unverifiable" and must fail closed, never read as absence.
+ */
+export function incompleteMarkerEntry(home: string): MarkerEntryStatus {
+  try {
+    lstatSync(join(home, "INCOMPLETE"));
+    return "present";
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      ((error as { code: unknown }).code === "ENOENT" ||
+        (error as { code: unknown }).code === "ENOTDIR")
+    ) {
+      return "absent";
+    }
+    return "unverifiable";
+  }
+}
+
 /**
  * A durable INCOMPLETE marker blocks readers, writers and discovery even
  * after process death or lock cleanup; recovery is the documented operator
@@ -73,12 +99,22 @@ export function workspaceManifestPath(home: string): string {
  * the source lock before reading anything.
  */
 export function assertHomeNotIncomplete(home: string): void {
-  if (existsSync(join(home, "INCOMPLETE"))) {
+  const status = incompleteMarkerEntry(home);
+  if (status === "present") {
     throw new EngineError(
       "Workspace index destination is incomplete from an interrupted reservation",
       {
         code: "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
         context: `home=${home} hint=recover by removing the INCOMPLETE marker and partial contents after all writers are quiescent, then retry the operation`,
+      },
+    );
+  }
+  if (status === "unverifiable") {
+    throw new EngineError(
+      "Workspace index incomplete-marker state cannot be inspected; treating the destination as blocked",
+      {
+        code: "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+        context: `home=${home} hint=the INCOMPLETE marker could not be inspected; recover by removing it and partial contents after all writers are quiescent, then retry the operation`,
       },
     );
   }

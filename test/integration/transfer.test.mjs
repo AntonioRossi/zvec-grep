@@ -7,6 +7,7 @@ import {
   readdir,
   rename,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -505,4 +506,48 @@ test("import rejects entities with inverted same-line text offsets", async (t) =
   );
   const homeEntries = await readdir(join(destinationRoot, ".zvec-grep"));
   assert.ok(!homeEntries.includes("manifest.json"));
+});
+
+test("import rejects an artifact whose INCOMPLETE marker is a dangling symlink", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-transfer-dangling-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(sourceRoot, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+
+  // A dangling symlink at the marker path is still an occupied marker entry:
+  // it must block consumption, not read as absence.
+  await symlink(join(parent, "no-such-target"), join(artifact, "INCOMPLETE"));
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    importWorkspaceIndex({ artifactPath: artifact, destinationRoot }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+    "a dangling marker entry must block import",
+  );
+  assert.ok(!(await readdir(destinationRoot)).includes(".zvec-grep"));
+});
+
+test("export rejects a source whose INCOMPLETE marker is a dangling symlink", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-export-dangling-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  await symlink(
+    join(parent, "no-such-target"),
+    join(sourceRoot, ".zvec-grep", "INCOMPLETE"),
+  );
+
+  await assert.rejects(
+    exportWorkspaceIndex({
+      sourceHome: join(sourceRoot, ".zvec-grep"),
+      artifactPath: join(parent, "artifact"),
+    }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+  );
 });

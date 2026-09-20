@@ -6,6 +6,7 @@ import {
   readFile,
   readdir,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -361,6 +362,24 @@ test("migration rejects a legacy home marked INCOMPLETE", async (t) => {
     join(legacyHome, "INCOMPLETE"),
     `${JSON.stringify({ token: "crashed", operation: "index.migrate" })}\n`,
   );
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    migrateWorkspaceIndex({ sourceHome: legacyHome, destinationRoot }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+  );
+  assert.ok(!(await readdir(destinationRoot)).includes(".zvec-grep"));
+});
+
+test("migration rejects a legacy home whose INCOMPLETE marker is a dangling symlink", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-migrate-dangling-");
+  const { sourceRoot, manifest } = await makeSourceWorkspace(t, parent);
+  const legacyHome = join(sourceRoot, ".zvec-grep-legacy");
+  await buildLegacyHome(sourceRoot, legacyHome, manifest.id);
+  await symlink(join(parent, "no-such-target"), join(legacyHome, "INCOMPLETE"));
 
   const destinationRoot = join(parent, "destination");
   await copySourceFiles(sourceRoot, destinationRoot);

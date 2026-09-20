@@ -1,5 +1,5 @@
 import {
-  existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { EngineError } from "./errors.js";
+import { incompleteMarkerEntry } from "./manifest.js";
 import { acquireReadWriteLock, type FileLock } from "./utils/lock.js";
 
 /**
@@ -24,19 +25,26 @@ import { acquireReadWriteLock, type FileLock } from "./utils/lock.js";
  *   contents are validated under that lock; a durable INCOMPLETE marker
  *   blocks readers, discovery and writers across process death and lock
  *   cleanup until verified completion or operator recovery.
- * - Ownership (home identity, lock identity, token) is verified before
- *   finalization, before every mutation, and before any cleanup. Every
- *   published child is recorded with the identity it had in staging; rollback
- *   compares against that recorded identity, never against a post-move
- *   observation, and never overwrites content found at a staging target.
+ * - Ownership (home identity, lock identity, token, staging identity) is
+ *   verified before finalization, after finalization, before enumeration,
+ *   before every mutation, and before any cleanup.
+ * - Entry inspection never follows symlinks: any existing directory entry —
+ *   including a dangling symlink — is occupied, and an inspection failure is
+ *   unverifiable, never proven absence. Every published child is recorded
+ *   with the entry identity it had in staging; rollback compares against
+ *   that recorded identity, never adopts a post-move observation, and never
+ *   overwrites content found at a staging target. Only regular files and
+ *   directories are published; every staged entry's type is validated before
+ *   the first move.
  * - The marker is removed only by a checked transition: access errors,
  *   unexpected absence or a foreign token fail publication instead of being
  *   converted into success.
  * - Commit is a verified successful release. On ownership loss the operation
- *   performs no further writes into the destination. When rollback cannot
- *   complete and the marker is missing and unrestorable, the write lock is
- *   retained as the last block and the failure reports the required operator
- *   recovery. Foreign content is never deleted, overwritten, or merged into.
+ *   performs no further writes into the destination. When a rollback leaves
+ *   recoverable state and the marker cannot be preserved or restored, the
+ *   write lock is retained as the last effective block and the failure
+ *   reports the required operator recovery. Foreign content is never
+ *   deleted, overwritten, or merged into.
  *
  * These are best-effort fencing checks against filesystem interleavings,
  * not atomic protection against arbitrary external mutation.
@@ -44,20 +52,32 @@ import { acquireReadWriteLock, type FileLock } from "./utils/lock.js";
 
 const INCOMPLETE_MARKER = "INCOMPLETE";
 
+/**
+ * Test-only fault-injection seam for the reservation protocol. Normal
+ * callers omit it entirely. `afterChildMove` is invoked synchronously after
+ * each child's move has been recorded and its destination identity verified;
+ * exceptions route through ordinary rollback and failure handling, and
+ * ownership is rechecked before every subsequent mutation.
+ */
+export type ReservationTestHooks = {
+  afterChildMove?(childName: string): void;
+};
+
 export type DestinationReservation = {
   /** The reserved destination directory. */
   readonly destinationHome: string;
   /** Owned staging directory inside the reservation. */
   readonly stagingHome: string;
   /**
-   * Verify ownership, run `finalize` (which must write the manifest/metadata
-   * into the staging directory), move staged children into place with the
-   * manifest last — rejecting any child-name collision rather than
-   * overwriting — remove the incomplete marker through a checked transition,
-   * and commit by releasing the reservation. After a verified successful
-   * release, no error path cleans the result. Any failure rolls back what it
-   * provably owns, preserves blockage otherwise, and throws an error that
-   * describes the state actually left behind.
+   * Verify ownership and staging integrity, run `finalize` (which must write
+   * the manifest/metadata into the staging directory), validate every staged
+   * entry's type, then move staged children into place with the manifest
+   * last — rejecting any occupied or unverifiable destination name rather
+   * than overwriting — remove the incomplete marker through a checked
+   * transition, and commit by releasing the reservation. After a verified
+   * successful release, no error path cleans the result. Any failure rolls
+   * back what it provably owns, preserves blockage otherwise, and throws an
+   * error that describes the state actually left behind.
    */
   publish(finalize: () => void): void;
   /**
@@ -76,11 +96,18 @@ type DirectoryIdentity = {
   inode: number;
 };
 
+type EntryKind = "file" | "directory" | "symlink" | "other";
+
+type EntryInspection =
+  | { status: "present"; kind: EntryKind; identity: DirectoryIdentity }
+  | { status: "absent" }
+  | { status: "unverifiable"; code: string };
+
 type PublishedChild = {
   name: string;
-  /** Identity captured in staging before the move; rollback's ownership
-   * reference, never a re-observation after the fact. */
-  stagedIdentity: DirectoryIdentity | undefined;
+  /** Entry identity captured in staging before the move; rollback's
+   * ownership reference, never a re-observation after the fact. */
+  stagedIdentity: DirectoryIdentity;
   returned: boolean;
 };
 
@@ -99,6 +126,7 @@ type ReservationState = {
   finalized: boolean;
   /** Set when the write lock is deliberately retained as the last block. */
   lockRetainedForBlockage: boolean;
+  testHooks: ReservationTestHooks | undefined;
 };
 
 export function reserveDestination(options: {
@@ -106,6 +134,8 @@ export function reserveDestination(options: {
   operation: string;
   /** Children whose presence marks an existing index. */
   existingIndexMarkers?: readonly string[];
+  /** Test-only fault-injection seam; normal callers omit it. */
+  testHooks?: ReservationTestHooks;
 }): DestinationReservation {
   const markers = options.existingIndexMarkers ?? ["manifest.json"];
   const lockDir = join(options.destinationHome, "locks", "home.write");
@@ -118,8 +148,9 @@ export function reserveDestination(options: {
   try {
     // Destination validation happens under the acquired lock, never from an
     // absence check or existence observed before it.
-    const indexMarkers = markers.filter((marker) =>
-      existsSync(join(options.destinationHome, marker)),
+    const indexMarkers = markers.filter(
+      (marker) =>
+        inspectEntry(join(options.destinationHome, marker)).status !== "absent",
     );
     if (indexMarkers.length > 0) {
       throw reservationError(
@@ -127,9 +158,12 @@ export function reserveDestination(options: {
         `${options.destinationHome} markers=${indexMarkers.join(",")}`,
       );
     }
-    if (existsSync(join(options.destinationHome, INCOMPLETE_MARKER))) {
+    const markerStatus = incompleteMarkerEntry(options.destinationHome);
+    if (markerStatus !== "absent") {
       throw reservationError(
-        "Destination contains an incomplete reserved result; recover it manually after writers are quiescent (remove the INCOMPLETE marker and its partial contents, then retry)",
+        markerStatus === "present"
+          ? "Destination contains an incomplete reserved result; recover it manually after writers are quiescent (remove the INCOMPLETE marker and its partial contents, then retry)"
+          : "Destination incomplete-marker state cannot be inspected; refusing to claim it",
         options.destinationHome,
       );
     }
@@ -156,6 +190,7 @@ export function reserveDestination(options: {
       published: [],
       finalized: false,
       lockRetainedForBlockage: false,
+      testHooks: options.testHooks,
     };
     mkdirSync(state.stagingHome);
     state.stagingIdentity = directoryIdentity(state.stagingHome);
@@ -219,39 +254,105 @@ function publishReservation(
   finalize: () => void,
 ): void {
   assertReservationIntact(state);
+  assertStagingIntact(state);
   // Finalize first: the manifest/metadata is written into staging, then
   // moved last so readers never see a manifest without its content.
   finalize();
-  // Ownership is verified again after finalization and before every
-  // mutation; any loss stops the operation without publishing.
+  // Ownership and staging integrity are verified again after finalization
+  // and before every mutation; any loss stops the operation without
+  // publishing.
   assertReservationIntact(state);
+  assertStagingIntact(state);
   const children = readdirSync(state.stagingHome).sort((left, right) =>
     left === "manifest.json" ? 1 : right === "manifest.json" ? -1 : 0,
   );
+  // Every staged entry's type and identity is validated before the first
+  // move: only regular files and directories are published, and replacement
+  // staging content is never adopted as owned.
+  const stagedByName = new Map<
+    string,
+    { kind: EntryKind; identity: DirectoryIdentity }
+  >();
+  for (const child of children) {
+    const inspection = inspectEntry(join(state.stagingHome, child));
+    if (inspection.status !== "present") {
+      throw failWithRollback(
+        state,
+        reservationError(
+          `Staged child cannot be inspected before publication (${inspection.status === "unverifiable" ? inspection.code : "vanished"})`,
+          `child=${child} staging=${state.stagingHome}`,
+        ),
+      );
+    }
+    if (inspection.kind !== "file" && inspection.kind !== "directory") {
+      throw failWithRollback(
+        state,
+        reservationError(
+          `Staged child has an unsupported entry type (${inspection.kind}); only regular files and directories are published`,
+          `child=${child} staging=${state.stagingHome}`,
+        ),
+      );
+    }
+    stagedByName.set(child, {
+      kind: inspection.kind,
+      identity: inspection.identity,
+    });
+  }
   try {
     for (const child of children) {
       assertReservationIntact(state);
-      const target = join(state.destinationHome, child);
-      if (existsSync(target)) {
+      assertStagingIntact(state);
+      const staged = stagedByName.get(child)!;
+      const current = inspectEntry(join(state.stagingHome, child));
+      if (
+        current.status !== "present" ||
+        current.kind !== staged.kind ||
+        !identityMatches(current.identity, staged.identity)
+      ) {
         throw reservationError(
-          "Destination child already exists; refusing to overwrite",
+          "Staged child changed before its publication move; refusing to adopt it",
+          `child=${child} staging=${state.stagingHome}`,
+        );
+      }
+      const target = join(state.destinationHome, child);
+      const targetInspection = inspectEntry(target);
+      if (targetInspection.status === "present") {
+        throw reservationError(
+          `Destination child already exists (${targetInspection.kind}); refusing to overwrite`,
           `child=${child} destination=${state.destinationHome}`,
         );
       }
-      const stagedIdentity = directoryIdentity(join(state.stagingHome, child));
+      if (targetInspection.status === "unverifiable") {
+        throw reservationError(
+          `Destination child cannot be inspected (${targetInspection.code}); refusing to overwrite`,
+          `child=${child} destination=${state.destinationHome}`,
+        );
+      }
       renameSync(join(state.stagingHome, child), target);
-      state.published.push({ name: child, stagedIdentity, returned: false });
-      if (!identityMatches(directoryIdentity(target), stagedIdentity)) {
+      state.published.push({
+        name: child,
+        stagedIdentity: staged.identity,
+        returned: false,
+      });
+      const moved = inspectEntry(target);
+      if (
+        moved.status !== "present" ||
+        !identityMatches(moved.identity, staged.identity)
+      ) {
         throw reservationError(
           "Moved child lost its identity at the destination",
           `child=${child} destination=${state.destinationHome}`,
         );
       }
+      // Test-only seam: runs after the move is recorded and verified, inside
+      // ordinary rollback/failure handling.
+      state.testHooks?.afterChildMove?.(child);
     }
   } catch (error) {
     throw failWithRollback(state, error);
   }
   assertReservationIntact(state);
+  assertStagingIntact(state);
   // The marker transition is checked: absence, replacement or removal
   // failure can never be converted into successful publication.
   try {
@@ -302,7 +403,8 @@ function publishReservation(
 /**
  * Failure finalizer for publication: roll back provably owned children, then
  * preserve the remaining blockage and describe the state left behind. Never
- * performs a write after ownership loss.
+ * performs a write after ownership loss, and never releases the last
+ * effective block while recoverable state remains.
  */
 function failWithRollback(
   state: ReservationState,
@@ -316,21 +418,23 @@ function failWithRollback(
         ? cause.message
         : String(cause);
   const rollbackComplete = rollbackPublishedChildren(state);
+  const marker = ensureMarkerPreserved(state);
   if (rollbackComplete) {
-    const marker = ensureMarkerPreserved(state);
-    const blockage =
-      marker === "present"
-        ? "by the INCOMPLETE marker"
-        : marker === "foreign"
-          ? "by a foreign INCOMPLETE marker preserved for operator review"
-          : "only by operator review (no marker could be preserved)";
+    if (marker === "absent") {
+      // Complete rollback, but no enforceable blockage could be preserved
+      // while rolled-back payload remains in the home: retain the lock.
+      state.lockRetainedForBlockage = true;
+      return reservationError(
+        `${causeMessage}; publication was rolled back completely, but the INCOMPLETE marker could not be preserved or restored; rolled-back payload remains in staging; the write lock is retained as the last block and no further writes were made; recover by removing the lock directory and staged contents after all writers are quiescent`,
+        `destination=${state.destinationHome}`,
+      );
+    }
     const released = state.lock.release();
     return reservationError(
-      `${causeMessage}; publication was rolled back completely; the destination remains blocked ${blockage}${released ? "" : " and the lock release reported ownership loss"}; recover after all writers are quiescent`,
+      `${causeMessage}; publication was rolled back completely; the destination remains blocked ${marker === "present" ? "by the INCOMPLETE marker" : "by a foreign INCOMPLETE marker preserved for operator review"}${released ? "" : " and the lock release reported ownership loss"}; recover after all writers are quiescent`,
       `destination=${state.destinationHome}`,
     );
   }
-  const marker = ensureMarkerPreserved(state);
   if (marker !== "absent") {
     const released = state.lock.release();
     return reservationError(
@@ -349,12 +453,13 @@ function failWithRollback(
 
 /**
  * Move published children back into staging, one ownership check at a time.
- * Compares each destination child against the identity recorded in staging
- * before the move; stops at the first mismatch, refusal or I/O failure and
- * leaves everything else untouched. Never overwrites content found at a
- * staging target; a child already back at its staging target with the
- * recorded staged identity and absent from the destination counts as an
- * earlier verified return.
+ * Compares each destination child against the entry identity recorded in
+ * staging before the move; stops at the first mismatch, refusal or I/O
+ * failure and leaves everything else untouched. Never overwrites content
+ * found at a staging target — any entry there is occupied — and treats
+ * inspection failures as unverifiable, never as absence. A child already
+ * back at its staging target with the recorded identity and absent from the
+ * destination counts as an earlier verified return.
  */
 function rollbackPublishedChildren(state: ReservationState): boolean {
   for (const record of [...state.published].reverse()) {
@@ -374,18 +479,18 @@ function rollbackPublishedChildren(state: ReservationState): boolean {
     }
     const destinationChild = join(state.destinationHome, record.name);
     const stagingChild = join(state.stagingHome, record.name);
+    const destination = inspectEntry(destinationChild);
     if (
-      !identityMatches(
-        directoryIdentity(destinationChild),
-        record.stagedIdentity,
-      )
+      destination.status !== "present" ||
+      !identityMatches(destination.identity, record.stagedIdentity)
     ) {
-      // Replaced or removed at the destination: if the original already sits
-      // at its staging target with the recorded identity, an earlier verified
-      // return completed; otherwise the foreign state is preserved.
+      // Replaced, removed, or unverifiable at the destination: if the
+      // original already sits at its staging target with the recorded
+      // identity, an earlier verified return completed; otherwise the
+      // foreign or unknown state is preserved.
       if (
-        directoryIdentity(destinationChild) === undefined &&
-        identityMatches(directoryIdentity(stagingChild), record.stagedIdentity)
+        destination.status === "absent" &&
+        identityMatches(entryIdentity(stagingChild), record.stagedIdentity)
       ) {
         record.returned = true;
         continue;
@@ -393,8 +498,8 @@ function rollbackPublishedChildren(state: ReservationState): boolean {
       return false;
     }
     // The destination child is provably ours; its staging target must be
-    // empty. Any content there is unexpected and never overwritten.
-    if (directoryIdentity(stagingChild) !== undefined) {
+    // empty. Any entry there is occupied and never overwritten.
+    if (inspectEntry(stagingChild).status !== "absent") {
       return false;
     }
     try {
@@ -402,9 +507,7 @@ function rollbackPublishedChildren(state: ReservationState): boolean {
     } catch {
       return false;
     }
-    if (
-      !identityMatches(directoryIdentity(stagingChild), record.stagedIdentity)
-    ) {
+    if (!identityMatches(entryIdentity(stagingChild), record.stagedIdentity)) {
       return false;
     }
     record.returned = true;
@@ -414,27 +517,33 @@ function rollbackPublishedChildren(state: ReservationState): boolean {
 
 /**
  * Ensure the durable blockage survives a failed operation. Returns "present"
- * when a marker with this reservation's token (or an unreadable marker, which
- * is left as blockage) is in place, including after a successful restore;
- * "foreign" when a replaced marker with another token stands (preserved,
- * never touched); "absent" when no trustworthy blockage exists. Restore is
- * attempted only while reservation ownership is verifiable, and nothing is
- * written after ownership loss.
+ * when a marker with this reservation's token (or an entry that cannot be
+ * read, which is left as blockage) is in place, including after a successful
+ * restore; "foreign" when a replaced marker with another token stands
+ * (preserved, never touched); "absent" when no enforceable blockage exists.
+ * Restore is attempted only while reservation ownership is verifiable, and
+ * nothing is written after ownership loss.
  */
 function ensureMarkerPreserved(
   state: ReservationState,
 ): "present" | "foreign" | "absent" {
   const marker = join(state.destinationHome, INCOMPLETE_MARKER);
-  try {
-    const current = JSON.parse(readFileSync(marker, "utf8")) as {
-      token?: string;
-    };
-    return current?.token === state.token ? "present" : "foreign";
-  } catch (error) {
-    if (!isAbsence(error)) {
+  const status = incompleteMarkerEntry(state.destinationHome);
+  if (status === "present") {
+    try {
+      const current = JSON.parse(readFileSync(marker, "utf8")) as {
+        token?: string;
+      };
+      return current?.token === state.token ? "present" : "foreign";
+    } catch {
       // Unreadable but present: left as blockage, never overwritten.
       return "present";
     }
+  }
+  if (status === "unverifiable") {
+    // Fail closed: an uninspectable marker entry is treated as blockage and
+    // never touched.
+    return "present";
   }
   if (!reservationIntact(state)) {
     return "absent";
@@ -468,16 +577,23 @@ function ensureMarkerPreserved(
  */
 function removeIncompleteMarkerChecked(state: ReservationState): void {
   const marker = join(state.destinationHome, INCOMPLETE_MARKER);
+  const status = incompleteMarkerEntry(state.destinationHome);
+  if (status === "absent") {
+    throw reservationError(
+      "Incomplete marker is unexpectedly absent at publication; refusing to report success over external interference",
+      `destination=${state.destinationHome}`,
+    );
+  }
+  if (status === "unverifiable") {
+    throw reservationError(
+      "Incomplete marker cannot be inspected at publication; refusing to report success over uncertainty",
+      `destination=${state.destinationHome}`,
+    );
+  }
   let current: { token?: string };
   try {
     current = JSON.parse(readFileSync(marker, "utf8")) as { token?: string };
   } catch (error) {
-    if (isAbsence(error)) {
-      throw reservationError(
-        "Incomplete marker is unexpectedly absent at publication; refusing to report success over external interference",
-        `destination=${state.destinationHome}`,
-      );
-    }
     throw reservationError(
       `Incomplete marker is unreadable at publication (${errorCode(error)})`,
       `destination=${state.destinationHome}`,
@@ -567,13 +683,17 @@ function abortReservation(state: ReservationState): string | undefined {
  */
 function clearMarkerAfterCleanup(state: ReservationState): string {
   const marker = join(state.destinationHome, INCOMPLETE_MARKER);
+  const status = incompleteMarkerEntry(state.destinationHome);
+  if (status === "absent") {
+    return "the INCOMPLETE marker was already absent (external interference; operator review required)";
+  }
+  if (status === "unverifiable") {
+    return "the INCOMPLETE marker could not be inspected and was left in place as blockage";
+  }
   let current: { token?: string };
   try {
     current = JSON.parse(readFileSync(marker, "utf8")) as { token?: string };
   } catch (error) {
-    if (isAbsence(error)) {
-      return "the INCOMPLETE marker was already absent (external interference; operator review required)";
-    }
     return `the INCOMPLETE marker is unreadable (${errorCode(error)}) and was left in place as blockage`;
   }
   if (current?.token !== state.token) {
@@ -584,6 +704,20 @@ function clearMarkerAfterCleanup(state: ReservationState): string {
     return "";
   } catch (error) {
     return `the INCOMPLETE marker could not be removed (${errorCode(error)}); the destination remains blocked and requires operator recovery`;
+  }
+}
+
+function assertStagingIntact(state: ReservationState): void {
+  if (
+    !identityMatches(
+      directoryIdentity(state.stagingHome),
+      state.stagingIdentity,
+    )
+  ) {
+    throw reservationError(
+      "Staging directory ownership was lost or replaced; refusing to publish from it",
+      `staging=${state.stagingHome}`,
+    );
   }
 }
 
@@ -631,6 +765,39 @@ function directoryIdentity(path: string): DirectoryIdentity | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Non-following entry inspection: any existing directory entry — including
+ * a dangling symlink — is "present" with its own identity; only
+ * ENOENT/ENOTDIR is "absent"; anything else is "unverifiable", never proven
+ * absence.
+ */
+function inspectEntry(path: string): EntryInspection {
+  try {
+    const info = lstatSync(path);
+    return {
+      status: "present",
+      kind: info.isFile()
+        ? "file"
+        : info.isDirectory()
+          ? "directory"
+          : info.isSymbolicLink()
+            ? "symlink"
+            : "other",
+      identity: { device: info.dev, inode: info.ino },
+    };
+  } catch (error) {
+    if (isAbsence(error)) {
+      return { status: "absent" };
+    }
+    return { status: "unverifiable", code: errorCode(error) };
+  }
+}
+
+function entryIdentity(path: string): DirectoryIdentity | undefined {
+  const inspection = inspectEntry(path);
+  return inspection.status === "present" ? inspection.identity : undefined;
 }
 
 function readLockInfoSafe(lockDir: string): { token?: string } | null {
