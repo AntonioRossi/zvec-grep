@@ -1296,6 +1296,17 @@ export function parseRange(value: string): Range {
           context: `startLine=${startLine} endLine=${endLine}`,
         });
       }
+      // Same-line offset ordering is convention-independent; cross-line
+      // rules wait on the documented producer-convention reconciliation.
+      if (startLine === endLine && endOffset < startOffset) {
+        throw new EngineError(
+          "Stored fragment same-line text offsets are inverted",
+          {
+            code: "ZVEC_GREP.ENGINE.STORAGE.INVALID_RANGE",
+            context: `line=${startLine} startOffset=${startOffset} endOffset=${endOffset}`,
+          },
+        );
+      }
       return { kind: "text", startLine, endLine, startOffset, endOffset };
     }
     case "byte": {

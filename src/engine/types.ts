@@ -105,6 +105,13 @@ export type FileRange = {
   kind: "file";
 };
 
+/**
+ * Text range. The offset convention is currently producer-dependent:
+ * extraction producers write absolute document offsets, while lexical
+ * context expansion writes line-relative columns. Only same-line offset
+ * ordering is enforced on deserialize; cross-line offset rules wait on the
+ * recorded convention reconciliation.
+ */
 export type TextRange = {
   kind: "text";
   startLine: number;

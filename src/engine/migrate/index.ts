@@ -2,10 +2,14 @@ import { dirname, isAbsolute, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
 import {
+  appendReservationCleanup,
   reserveDestination,
   type DestinationReservation,
 } from "../reservation.js";
-import { writeWorkspaceManifest } from "../manifest.js";
+import {
+  assertHomeNotIncomplete,
+  writeWorkspaceManifest,
+} from "../manifest.js";
 import {
   createFilesSchema,
   createEntitiesSchema,
@@ -148,6 +152,10 @@ export async function migrateWorkspaceIndex(
 
   let reservation: DestinationReservation | undefined;
   try {
+    // The incomplete-home guard runs under the source lock before any
+    // metadata read: a crashed reservation blocks migration even after its
+    // owner is gone.
+    assertHomeNotIncomplete(sourceHome);
     const raw = readJsonFileSync<unknown>(manifestPath, null);
     if (raw === null) {
       throw migrationError("Legacy index manifest not found", manifestPath);
@@ -340,7 +348,10 @@ export async function migrateWorkspaceIndex(
   } catch (error) {
     // Native handles close before any filesystem cleanup.
     closeAll();
-    reservation?.abort();
+    const cleanup = reservation?.abort();
+    if (cleanup) {
+      throw appendReservationCleanup(error, cleanup);
+    }
     throw error;
   } finally {
     lock.release();

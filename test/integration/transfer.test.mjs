@@ -14,7 +14,10 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { ZVecInitialize, ZVecLogLevel } from "@zvec/zvec";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
-import { exportWorkspaceIndex } from "../../dist/engine/transfer/index.js";
+import {
+  exportWorkspaceIndex,
+  importWorkspaceIndex,
+} from "../../dist/engine/transfer/index.js";
 import { createZvecGrep } from "../../dist/index.js";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
@@ -412,4 +415,94 @@ test("CLI migrate requires an explicit destination and CLI export/import works",
 
   const manifest = readWorkspaceManifest(join(destinationRoot, ".zvec-grep"));
   assert.ok(manifest?.embedding);
+});
+
+test("import rejects an artifact marked INCOMPLETE with no writer lock held", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-transfer-marked-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(sourceRoot, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+
+  // A crashed operation left the durable marker; no writer lock is held, so
+  // only the marker stands between import and an uncommitted artifact.
+  await writeFile(
+    join(artifact, "INCOMPLETE"),
+    `${JSON.stringify({ token: "crashed", operation: "index.export" })}\n`,
+  );
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    importWorkspaceIndex({ artifactPath: artifact, destinationRoot }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+    "a marked artifact is rejected before any metadata read",
+  );
+
+  // The artifact is preserved and no destination was staged.
+  assert.ok((await readdir(artifact)).includes("format.json"));
+  assert.ok(!(await readdir(destinationRoot)).includes(".zvec-grep"));
+});
+
+test("export rejects a source marked INCOMPLETE before reading it", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-export-marked-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  await writeFile(
+    join(sourceRoot, ".zvec-grep", "INCOMPLETE"),
+    `${JSON.stringify({ token: "crashed", operation: "index.import" })}\n`,
+  );
+
+  await assert.rejects(
+    exportWorkspaceIndex({
+      sourceHome: join(sourceRoot, ".zvec-grep"),
+      artifactPath: join(parent, "artifact"),
+    }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+  );
+});
+
+test("import rejects entities with inverted same-line text offsets", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-transfer-invoff-");
+  const sourceRoot = await makeSourceWorkspace(parent);
+  const artifact = join(parent, "artifact");
+  await exportWorkspaceIndex({
+    sourceHome: join(sourceRoot, ".zvec-grep"),
+    artifactPath: artifact,
+  });
+
+  // A same-line range whose offsets run backwards passes JSON parsing but
+  // violates the Range ordering contract.
+  const entitiesPath = join(artifact, "entities.jsonl");
+  const entityDocs = (await readFile(entitiesPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  entityDocs[0].fields.range_json = JSON.stringify({
+    kind: "text",
+    startLine: 1,
+    endLine: 1,
+    startOffset: 20,
+    endOffset: 1,
+  });
+  await writeFile(
+    entitiesPath,
+    entityDocs.map((doc) => JSON.stringify(doc)).join("\n") + "\n",
+  );
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    importInSeparateProcess(artifact, destinationRoot, t),
+    undefined,
+    "inverted same-line offsets must fail verification",
+  );
+  const homeEntries = await readdir(join(destinationRoot, ".zvec-grep"));
+  assert.ok(!homeEntries.includes("manifest.json"));
 });

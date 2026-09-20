@@ -347,3 +347,27 @@ test("migration claims an empty unreserved destination but rejects an indexed on
     sourceManifestBefore,
   );
 });
+
+test("migration rejects a legacy home marked INCOMPLETE", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-migrate-marked-");
+  const { sourceRoot, manifest } = await makeSourceWorkspace(t, parent);
+  const legacyHome = join(sourceRoot, ".zvec-grep-legacy");
+  await buildLegacyHome(sourceRoot, legacyHome, manifest.id);
+
+  // A crashed operation's durable marker blocks migration even with no
+  // writer lock present; the guard runs before any manifest read.
+  await writeFile(
+    join(legacyHome, "INCOMPLETE"),
+    `${JSON.stringify({ token: "crashed", operation: "index.migrate" })}\n`,
+  );
+
+  const destinationRoot = join(parent, "destination");
+  await copySourceFiles(sourceRoot, destinationRoot);
+  await assert.rejects(
+    migrateWorkspaceIndex({ sourceHome: legacyHome, destinationRoot }),
+    (error) =>
+      error.code === "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
+  );
+  assert.ok(!(await readdir(destinationRoot)).includes(".zvec-grep"));
+});
