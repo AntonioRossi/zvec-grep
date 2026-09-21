@@ -351,8 +351,14 @@ function publishReservation(
   } catch (error) {
     throw failWithRollback(state, error);
   }
-  assertReservationIntact(state);
-  assertStagingIntact(state);
+  // Ownership and staging integrity are rechecked after the last move and
+  // before the marker transition; failures enter the same finalizer.
+  try {
+    assertReservationIntact(state);
+    assertStagingIntact(state);
+  } catch (error) {
+    throw failWithRollback(state, error);
+  }
   // The marker transition is checked: absence, replacement or removal
   // failure can never be converted into successful publication.
   try {
@@ -418,35 +424,12 @@ function failWithRollback(
         ? cause.message
         : String(cause);
   const rollbackComplete = rollbackPublishedChildren(state);
-  const marker = ensureMarkerPreserved(state);
-  if (rollbackComplete) {
-    if (marker === "absent") {
-      // Complete rollback, but no enforceable blockage could be preserved
-      // while rolled-back payload remains in the home: retain the lock.
-      state.lockRetainedForBlockage = true;
-      return reservationError(
-        `${causeMessage}; publication was rolled back completely, but the INCOMPLETE marker could not be preserved or restored; rolled-back payload remains in staging; the write lock is retained as the last block and no further writes were made; recover by removing the lock directory and staged contents after all writers are quiescent`,
-        `destination=${state.destinationHome}`,
-      );
-    }
-    const released = state.lock.release();
-    return reservationError(
-      `${causeMessage}; publication was rolled back completely; the destination remains blocked ${marker === "present" ? "by the INCOMPLETE marker" : "by a foreign INCOMPLETE marker preserved for operator review"}${released ? "" : " and the lock release reported ownership loss"}; recover after all writers are quiescent`,
-      `destination=${state.destinationHome}`,
-    );
-  }
-  if (marker !== "absent") {
-    const released = state.lock.release();
-    return reservationError(
-      `${causeMessage}; rollback is incomplete: published payload remains at the destination, which stays blocked by ${marker === "present" ? "the INCOMPLETE marker" : "a foreign INCOMPLETE marker preserved for operator review"}${released ? "" : " and an ownership-conflicted lock"}; recover by removing the marker and partial contents after all writers are quiescent`,
-      `destination=${state.destinationHome}`,
-    );
-  }
-  // Rollback incomplete and the marker is missing and unrestorable: retain
-  // the write lock as the last effective block and report the recovery.
-  state.lockRetainedForBlockage = true;
+  const { marker, released } = settleBlockage(state);
+  const rollbackDescription = rollbackComplete
+    ? "publication was rolled back completely, with its payload returned to staging"
+    : "rollback is incomplete: published payload remains at the destination";
   return reservationError(
-    `${causeMessage}; rollback is incomplete and the INCOMPLETE marker is missing: partial payload remains at the destination; the write lock is retained as the last block and no further writes were made; recover by removing the lock directory and the partial contents after all writers are quiescent`,
+    `${causeMessage}; ${rollbackDescription}; ${markerBlockageDescription(marker, released)}; recover after all writers are quiescent`,
     `destination=${state.destinationHome}`,
   );
 }
@@ -517,16 +500,19 @@ function rollbackPublishedChildren(state: ReservationState): boolean {
 
 /**
  * Ensure the durable blockage survives a failed operation. Returns "present"
- * when a marker with this reservation's token (or an entry that cannot be
- * read, which is left as blockage) is in place, including after a successful
+ * when a marker with this reservation's token (or an entry confirmed present
+ * by lstat but unreadable — such an entry really does supply the durable
+ * block and is never overwritten) is in place, including after a successful
  * restore; "foreign" when a replaced marker with another token stands
- * (preserved, never touched); "absent" when no enforceable blockage exists.
- * Restore is attempted only while reservation ownership is verifiable, and
- * nothing is written after ownership loss.
+ * (preserved, never touched); "unknown" when inspection fails — an
+ * inspection error does not establish that an entry exists, so uncertainty
+ * is never treated as confirmed blockage; "absent" when no enforceable
+ * blockage exists. Restore is attempted only while reservation ownership is
+ * verifiable, and nothing is written after ownership loss.
  */
 function ensureMarkerPreserved(
   state: ReservationState,
-): "present" | "foreign" | "absent" {
+): "present" | "foreign" | "absent" | "unknown" {
   const marker = join(state.destinationHome, INCOMPLETE_MARKER);
   const status = incompleteMarkerEntry(state.destinationHome);
   if (status === "present") {
@@ -536,14 +522,11 @@ function ensureMarkerPreserved(
       };
       return current?.token === state.token ? "present" : "foreign";
     } catch {
-      // Unreadable but present: left as blockage, never overwritten.
       return "present";
     }
   }
   if (status === "unverifiable") {
-    // Fail closed: an uninspectable marker entry is treated as blockage and
-    // never touched.
-    return "present";
+    return "unknown";
   }
   if (!reservationIntact(state)) {
     return "absent";
@@ -568,6 +551,37 @@ function ensureMarkerPreserved(
   } catch {
     return "absent";
   }
+}
+
+type MarkerOutcome = "present" | "foreign" | "absent" | "unknown";
+
+/**
+ * Settle the remaining blockage after a failure, shared by publication
+ * rollback and abort so the decision cannot diverge: release the lock only
+ * when a durable marker is confirmed present (ours, or a preserved foreign
+ * one); otherwise — marker absent and unrestorable, or its state
+ * unverifiable — retain the owned write lock as the last effective block.
+ */
+function settleBlockage(state: ReservationState): {
+  marker: MarkerOutcome;
+  released: boolean;
+} {
+  const marker = ensureMarkerPreserved(state);
+  if (marker === "present" || marker === "foreign") {
+    return { marker, released: state.lock.release() };
+  }
+  state.lockRetainedForBlockage = true;
+  return { marker, released: false };
+}
+
+function markerBlockageDescription(
+  marker: MarkerOutcome,
+  released: boolean,
+): string {
+  if (marker === "present" || marker === "foreign") {
+    return `the destination remains blocked by ${marker === "present" ? "the INCOMPLETE marker" : "a foreign INCOMPLETE marker preserved for operator review"}${released ? "" : "; the lock release reported ownership loss"}`;
+  }
+  return `${marker === "unknown" ? "the INCOMPLETE marker state could not be inspected" : "no INCOMPLETE marker could be preserved or restored"}; the write lock is retained as the last block`;
 }
 
 /**
@@ -635,22 +649,25 @@ function abortReservation(state: ReservationState): string | undefined {
       const rollbackComplete = rollbackPublishedChildren(state);
       if (!rollbackComplete) {
         state.finalized = true;
-        const marker = ensureMarkerPreserved(state);
-        if (marker === "present") {
-          state.lock.release();
-          return "abort left partial published payload in place; the destination remains blocked by the INCOMPLETE marker; recover by removing the marker and partial contents after all writers are quiescent";
-        }
-        if (marker === "foreign") {
-          state.lock.release();
-          return "abort left partial published payload in place; the destination remains blocked by a foreign INCOMPLETE marker preserved for operator review; recover after all writers are quiescent";
-        }
-        state.lockRetainedForBlockage = true;
-        return "abort left partial published payload in place and the INCOMPLETE marker is missing; the write lock is retained as the last block; recover by removing the lock directory and partial contents after all writers are quiescent";
+        const { marker, released } = settleBlockage(state);
+        return `abort left partial published payload in place; ${markerBlockageDescription(marker, released)}; recover after all writers are quiescent`;
       }
     }
-    // Nothing remains published: remove provably owned staging, then clear
-    // the marker through a checked transition, then release.
-    if (
+    // Nothing remains published: staging removal is a checked transition.
+    // The marker is cleared only after owned staging removal is confirmed;
+    // failed, skipped (foreign replacement, never deleted) or unverifiable
+    // cleanup preserves the marker, or retains the owned lock when no
+    // durable marker can be established.
+    let stagingNote = "";
+    let stagingCleared = false;
+    const stagingPresence = inspectEntry(state.stagingHome);
+    if (stagingPresence.status === "absent") {
+      stagingCleared = true;
+      stagingNote =
+        "the staging directory was already absent (external interference; operator review required)";
+    } else if (stagingPresence.status === "unverifiable") {
+      stagingNote = `the staging directory could not be inspected (${stagingPresence.code})`;
+    } else if (
       identityMatches(
         directoryIdentity(state.stagingHome),
         state.stagingIdentity,
@@ -658,13 +675,22 @@ function abortReservation(state: ReservationState): string | undefined {
     ) {
       try {
         rmSync(state.stagingHome, { recursive: true, force: true });
-      } catch {
-        // Reported through the returned description.
+        stagingCleared = true;
+      } catch (error) {
+        stagingNote = `owned staging could not be removed (${errorCode(error)}); its payload remains`;
       }
+    } else {
+      stagingNote =
+        "staging was replaced by foreign content, which was preserved in place";
+    }
+    if (!stagingCleared) {
+      state.finalized = true;
+      const { marker, released } = settleBlockage(state);
+      return `abort cleanup incomplete: ${stagingNote}; ${markerBlockageDescription(marker, released)}; recover after all writers are quiescent`;
     }
     const markerNote = clearMarkerAfterCleanup(state);
     const released = state.lock.release();
-    const notes = [markerNote];
+    const notes = [stagingNote, markerNote];
     if (!released) {
       notes.push("the lock release reported ownership loss");
     }
@@ -688,7 +714,7 @@ function clearMarkerAfterCleanup(state: ReservationState): string {
     return "the INCOMPLETE marker was already absent (external interference; operator review required)";
   }
   if (status === "unverifiable") {
-    return "the INCOMPLETE marker could not be inspected and was left in place as blockage";
+    return "the INCOMPLETE marker state could not be inspected; owned contents were removed, and any marker entry that does remain keeps blocking the destination";
   }
   let current: { token?: string };
   try {

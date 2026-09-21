@@ -353,12 +353,18 @@ test("an aborted staging replacement preserves the foreign file", async (t) => {
   mkdirSync(reservation.stagingHome, { recursive: true });
   writeFileSync(join(reservation.stagingHome, "foreign.txt"), "not ours");
 
-  reservation.abort();
+  const cleanup = reservation.abort();
   assert.equal(
     await readFile(join(reservation.stagingHome, "foreign.txt"), "utf8"),
     "not ours",
     "abort must not delete a staging replacement",
   );
+  // Skipped cleanup is unfinished cleanup: the foreign content is preserved,
+  // the marker is preserved as blockage, and the state is reported.
+  assert.match(cleanup, /replaced by foreign content/i);
+  assert.match(cleanup, /blocked by the INCOMPLETE marker/i);
+  assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
 });
 
 test("an abandoned reservation stays blocked until the documented operator recovery", async (t) => {
@@ -875,6 +881,20 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
     (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
   );
   await service.close();
+
+  // Documented operator recovery: quiesce writers, remove the lock directory
+  // and the partial contents; publication then succeeds.
+  await rm(join(destinationHome, "locks"), { recursive: true, force: true });
+  await rm(join(destinationHome, "payload.txt"));
+  await rm(reservation.stagingHome, { recursive: true, force: true });
+  const recovered = reserveDestination({
+    destinationHome,
+    operation: "test.recovery",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
+  recovered.publish(() => undefined);
+  assert.ok(existsSync(join(destinationHome, "manifest.json")));
 });
 
 test("publication rejects a dangling destination child without overwriting it", async (t) => {
@@ -1082,4 +1102,170 @@ test("a complete rollback with an unreadable marker stays blocked with a live an
     "an unreadable marker entry must keep blocking discovery",
   );
   await service.close();
+});
+
+test("abort with an unremovable staging payload preserves blockage and reports it", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-abortcleanup-");
+
+  // Live ancestor index.
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  const child = join(parent, "child");
+  const destinationHome = join(child, ".zvec-grep");
+  await mkdir(child, { recursive: true });
+  await writeFile(join(child, "docs.md"), "# Child\n\nChild content.\n");
+
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.abort-cleanup",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  // Real permission failure, no syscall mocking: a read-only staged
+  // subdirectory cannot be emptied, so recursive staging removal fails.
+  const protectedDir = join(reservation.stagingHome, "protected");
+  await mkdir(protectedDir, { recursive: true });
+  await writeFile(
+    join(protectedDir, "payload.txt"),
+    "owned recoverable payload",
+  );
+  chmodSync(protectedDir, 0o500);
+  const unlinkControl = await import("node:fs/promises").then((fs) =>
+    fs.unlink(join(protectedDir, "payload.txt")).catch((error) => error.code),
+  );
+  assert.equal(unlinkControl, "EACCES");
+
+  const cleanup = reservation.abort();
+  // Restore normal access before any discovery check: permission failure
+  // itself must not be mistaken for persistent protection.
+  chmodSync(protectedDir, 0o700);
+
+  // The cleanup failure is reported, the payload remains, the marker is
+  // preserved as blockage, and the lock is released against it.
+  assert.match(cleanup, /could not be removed \(EACCES\)/i);
+  assert.match(cleanup, /blocked by the INCOMPLETE marker/i);
+  assert.ok(existsSync(join(protectedDir, "payload.txt")));
+  assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+
+  // With access restored and a live ancestor, writers and discovery are
+  // denied; the ancestor is not served.
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "ancestor content", limit: 3 }),
+    /incomplete|INCOMPLETE/i,
+  );
+  await service.close();
+
+  // Documented operator recovery: remove the marker and partial contents,
+  // then the workspace publishes normally.
+  await rm(join(destinationHome, "INCOMPLETE"));
+  await rm(reservation.stagingHome, { recursive: true, force: true });
+  const recovered = reserveDestination({
+    destinationHome,
+    operation: "test.recovery",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
+  recovered.publish(() => undefined);
+  assert.ok(existsSync(join(destinationHome, "manifest.json")));
+});
+
+test("a permission failure retains the write lock and operator recovery restores the workspace", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-permrec-");
+
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  const child = join(parent, "child");
+  const destinationHome = join(child, ".zvec-grep");
+  await mkdir(child, { recursive: true });
+
+  // Permission-failure and recovery coverage: an unreadable home also hides
+  // the lock metadata, so even the release path refuses deletion. This
+  // fixture cannot distinguish the marker decision itself — that is the
+  // pinned marker-only inspection probe's role (validation evidence).
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.permission-recovery",
+    existingIndexMarkers: ["manifest.json"],
+    testHooks: {
+      afterChildMove() {
+        rmSync(join(destinationHome, "INCOMPLETE"));
+        chmodSync(destinationHome, 0o000);
+      },
+    },
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+
+  assert.throws(
+    () => reservation.publish(() => undefined),
+    /retained as the last block/i,
+  );
+  // Restore normal access before any discovery check.
+  chmodSync(destinationHome, 0o755);
+
+  // The lock is retained, the marker is absent, the payload remains at the
+  // destination, and writers and discovery stay denied with a live ancestor.
+  assert.ok(existsSync(join(destinationHome, "locks", "home.write")));
+  assert.ok(!existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.equal(
+    await readFile(join(destinationHome, "payload.txt"), "utf8"),
+    "ours",
+  );
+  assert.throws(
+    () =>
+      assertNoWriteLock(join(destinationHome, "locks", "home"), "competitor"),
+    (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+  );
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "ancestor content", limit: 3 }),
+    (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
+  );
+  await service.close();
+
+  // Documented operator recovery: quiesce writers, remove the lock directory
+  // and the partial contents; the workspace then serves the ancestor again.
+  await rm(join(destinationHome, "locks"), { recursive: true, force: true });
+  await rm(join(destinationHome, "payload.txt"));
+  const recovered = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  const result = await recovered.context({
+    query: "ancestor content",
+    limit: 3,
+  });
+  assert.ok(
+    result.items.length > 0,
+    "after recovery the ancestor serves again",
+  );
+  await recovered.close();
 });
