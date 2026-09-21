@@ -1269,3 +1269,200 @@ test("a permission failure retains the write lock and operator recovery restores
   );
   await recovered.close();
 });
+
+test("abort preserves a staging symlink alias and the moved-aside payload", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-alias-");
+
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  const child = join(parent, "child");
+  const destinationHome = join(child, ".zvec-grep");
+  await mkdir(child, { recursive: true });
+
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.staging-alias",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(
+    join(reservation.stagingHome, "payload.txt"),
+    "owned payload",
+  );
+  // Move the owned staging aside inside the destination, then alias the
+  // original path to it. The alias is a replacement entry: never deleted,
+  // never treated as the owned staging.
+  const asideHome = join(destinationHome, "staging-aside");
+  renameSync(reservation.stagingHome, asideHome);
+  symlinkSync(asideHome, reservation.stagingHome);
+
+  const cleanup = reservation.abort();
+
+  assert.match(cleanup, /symlink/i);
+  assert.match(cleanup, /blocked by the INCOMPLETE marker/i);
+  assert.equal(readlinkSync(reservation.stagingHome), asideHome);
+  assert.equal(
+    await readFile(join(asideHome, "payload.txt"), "utf8"),
+    "owned payload",
+  );
+  assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "ancestor content", limit: 3 }),
+    /incomplete|INCOMPLETE/i,
+    "an aliased staging replacement must keep the destination blocked",
+  );
+  await service.close();
+
+  // Documented operator recovery: remove the marker, the alias and the
+  // moved-aside payload; publication then succeeds.
+  await rm(join(destinationHome, "INCOMPLETE"));
+  rmSync(reservation.stagingHome);
+  await rm(asideHome, { recursive: true, force: true });
+  const recovered = reserveDestination({
+    destinationHome,
+    operation: "test.recovery",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
+  recovered.publish(() => undefined);
+  assert.ok(existsSync(join(destinationHome, "manifest.json")));
+});
+
+test("abort treats a vanished staging directory as unfinished cleanup", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-vanished-");
+
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  const child = join(parent, "child");
+  const destinationHome = join(child, ".zvec-grep");
+  await mkdir(child, { recursive: true });
+
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.staging-vanished",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(
+    join(reservation.stagingHome, "payload.txt"),
+    "owned payload",
+  );
+  // The staging pathname disappears without a replacement; its payload
+  // remains elsewhere in the destination.
+  const asideHome = join(destinationHome, "staging-aside");
+  renameSync(reservation.stagingHome, asideHome);
+
+  const cleanup = reservation.abort();
+
+  assert.match(cleanup, /unexpectedly absent/i);
+  assert.match(cleanup, /blocked by the INCOMPLETE marker/i);
+  assert.equal(
+    await readFile(join(asideHome, "payload.txt"), "utf8"),
+    "owned payload",
+  );
+  assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await assert.rejects(
+    service.context({ query: "ancestor content", limit: 3 }),
+    /incomplete|INCOMPLETE/i,
+    "unexplained staging disappearance must keep the destination blocked",
+  );
+  await service.close();
+
+  await rm(join(destinationHome, "INCOMPLETE"));
+  await rm(asideHome, { recursive: true, force: true });
+  const recovered = reserveDestination({
+    destinationHome,
+    operation: "test.recovery",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
+  recovered.publish(() => undefined);
+  assert.ok(existsSync(join(destinationHome, "manifest.json")));
+});
+
+test("a normal abort cleans up completely and releases the workspace", async (t) => {
+  ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
+  const parent = await createTemporaryDirectory(t, "zg-reserve-clean-abort-");
+
+  await mkdir(join(parent, "docs"), { recursive: true });
+  await writeFile(
+    join(parent, "docs", "ancestor.md"),
+    "# Ancestor\n\nAncestor content.\n",
+  );
+  const parentService = await createZvecGrep({
+    root: parent,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  await parentService.index();
+  await parentService.close();
+
+  const child = join(parent, "child");
+  const destinationHome = join(child, ".zvec-grep");
+  await mkdir(child, { recursive: true });
+
+  const reservation = reserveDestination({
+    destinationHome,
+    operation: "test.clean-abort",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+
+  const cleanup = reservation.abort();
+
+  // Verified complete cleanup: nothing blocks, nothing remains, no warning.
+  assert.equal(cleanup, undefined);
+  assert.ok(!existsSync(reservation.stagingHome));
+  assert.ok(!existsSync(join(destinationHome, "INCOMPLETE")));
+  assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+
+  // A clean workspace legitimately falls back to the ancestor index.
+  const service = await createZvecGrep({
+    root: child,
+    embeddingModel: new FakeEmbeddingModel(),
+  });
+  const result = await service.context({ query: "ancestor content", limit: 3 });
+  assert.ok(result.items.length > 0);
+  await service.close();
+
+  // And a fresh reservation publishes normally.
+  const recovered = reserveDestination({
+    destinationHome,
+    operation: "test.recovery",
+    existingIndexMarkers: ["manifest.json"],
+  });
+  writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
+  recovered.publish(() => undefined);
+  assert.ok(existsSync(join(destinationHome, "manifest.json")));
+});
