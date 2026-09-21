@@ -293,8 +293,14 @@ test("never removes an artifact destination changed by another writer", async (t
   }
 
   const concurrentBytes = Buffer.alloc(bytes.byteLength, 121);
-  await new Promise((resolve) => setTimeout(resolve, 2));
+  // The change must differ in the file identity the installer inspects; a
+  // sleep cannot guarantee an mtime/ctime change (timestamp granularity and
+  // ms truncation), so set the mutation's timestamps explicitly. This
+  // exercises the changed-stat detection path; equal-stat overwrite
+  // acceptance remains the documented VAL-001 baseline limitation.
   await writeFile(destination, concurrentBytes);
+  const distinct = new Date(Date.now() + 60_000);
+  await utimes(destination, distinct, distinct);
   releaseBody();
 
   await assert.rejects(resolution, (error) => {
