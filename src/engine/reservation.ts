@@ -193,7 +193,7 @@ export function reserveDestination(options: {
       testHooks: options.testHooks,
     };
     mkdirSync(state.stagingHome);
-    state.stagingIdentity = directoryIdentity(state.stagingHome);
+    state.stagingIdentity = entryIdentity(state.stagingHome);
     // The durable marker blocks readers, discovery and writers across
     // process death and lock cleanup until verified completion or the
     // documented operator recovery. "wx": the validated-empty destination
@@ -368,8 +368,7 @@ function publishReservation(
   }
   // Staging must be empty after the moves; a non-recursive rmdir fails
   // loudly on unexpected content instead of deleting it.
-  const stagingIdentity = directoryIdentity(state.stagingHome);
-  if (!identityMatches(stagingIdentity, state.stagingIdentity)) {
+  if (!stagingIntact(state)) {
     throw failWithRollback(
       state,
       reservationError(
@@ -452,12 +451,7 @@ function rollbackPublishedChildren(state: ReservationState): boolean {
     if (!reservationIntact(state)) {
       return false;
     }
-    if (
-      !identityMatches(
-        directoryIdentity(state.stagingHome),
-        state.stagingIdentity,
-      )
-    ) {
+    if (!stagingIntact(state)) {
       return false;
     }
     const destinationChild = join(state.destinationHome, record.name);
@@ -655,23 +649,22 @@ function abortReservation(state: ReservationState): string | undefined {
     }
     // Nothing remains published: staging removal is a checked transition.
     // The marker is cleared only after owned staging removal is confirmed;
-    // failed, skipped (foreign replacement, never deleted) or unverifiable
-    // cleanup preserves the marker, or retains the owned lock when no
-    // durable marker can be established.
+    // failed, skipped (foreign replacement, never deleted), unverifiable or
+    // unexplained-absent cleanup preserves the marker, or retains the owned
+    // lock when no durable marker can be established.
     let stagingNote = "";
     let stagingCleared = false;
     const stagingPresence = inspectEntry(state.stagingHome);
     if (stagingPresence.status === "absent") {
-      stagingCleared = true;
+      // Unexplained disappearance is not completed cleanup: recoverable
+      // payload may remain elsewhere in the destination.
       stagingNote =
-        "the staging directory was already absent (external interference; operator review required)";
+        "the staging directory is unexpectedly absent (its payload may remain elsewhere in the destination; operator review required)";
     } else if (stagingPresence.status === "unverifiable") {
       stagingNote = `the staging directory could not be inspected (${stagingPresence.code})`;
     } else if (
-      identityMatches(
-        directoryIdentity(state.stagingHome),
-        state.stagingIdentity,
-      )
+      stagingPresence.kind === "directory" &&
+      identityMatches(stagingPresence.identity, state.stagingIdentity)
     ) {
       try {
         rmSync(state.stagingHome, { recursive: true, force: true });
@@ -680,8 +673,12 @@ function abortReservation(state: ReservationState): string | undefined {
         stagingNote = `owned staging could not be removed (${errorCode(error)}); its payload remains`;
       }
     } else {
+      // A replacement — including a symlink alias to the original contents —
+      // is preserved, never deleted through.
       stagingNote =
-        "staging was replaced by foreign content, which was preserved in place";
+        stagingPresence.kind === "directory"
+          ? "staging was replaced by foreign content, which was preserved in place"
+          : `staging was replaced by a ${stagingPresence.kind} entry, which was preserved in place`;
     }
     if (!stagingCleared) {
       state.finalized = true;
@@ -734,17 +731,27 @@ function clearMarkerAfterCleanup(state: ReservationState): string {
 }
 
 function assertStagingIntact(state: ReservationState): void {
-  if (
-    !identityMatches(
-      directoryIdentity(state.stagingHome),
-      state.stagingIdentity,
-    )
-  ) {
+  if (!stagingIntact(state)) {
     throw reservationError(
       "Staging directory ownership was lost or replaced; refusing to publish from it",
       `staging=${state.stagingHome}`,
     );
   }
+}
+
+/**
+ * Non-following staging validation: the staging path must still be the
+ * recorded directory entry itself. A symlink alias to the original contents
+ * is a replacement entry, never the owned staging — and deletion through an
+ * alias would delete the link, not the payload.
+ */
+function stagingIntact(state: ReservationState): boolean {
+  const inspection = inspectEntry(state.stagingHome);
+  return (
+    inspection.status === "present" &&
+    inspection.kind === "directory" &&
+    identityMatches(inspection.identity, state.stagingIdentity)
+  );
 }
 
 function reservationIntact(state: ReservationState): boolean {
