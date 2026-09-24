@@ -1704,21 +1704,41 @@ async function removeJsoncMcpSettings(
   const container = isJsonObject(currentContainer) ? currentContainer : {};
 
   if (isManaged(container.zvec_grep)) {
-    source = hasJsoncComments(source)
-      ? removeJsoncPropertyPreservingComments(source, [
-          containerKey,
-          "zvec_grep",
-        ])
-      : editJsonWithComments(
-          source,
-          Object.keys(container).length === 1
-            ? [containerKey]
-            : [containerKey, "zvec_grep"],
-          undefined,
-        );
+    // Keep each branch's documented removal semantics — the comment-
+    // preserving path removes only the managed server; the comment-free path
+    // removes the whole container when the server is its only property — but
+    // perform both with token-aware separator handling so trailing commas
+    // cannot corrupt the output.
+    source = removeJsoncPropertyPreservingComments(
+      source,
+      hasJsoncComments(source)
+        ? [containerKey, "zvec_grep"]
+        : Object.keys(container).length === 1
+          ? [containerKey]
+          : [containerKey, "zvec_grep"],
+    );
   }
   if (source !== existing) {
+    assertJsoncRewriteValid(path, source, label, allowTrailingComma);
     await writeTextFileAtomic(path, ensureTrailingNewline(source));
+  }
+}
+
+function assertJsoncRewriteValid(
+  path: string,
+  source: string,
+  label: string,
+  allowTrailingComma: boolean,
+): void {
+  const errors: ParseError[] = [];
+  const parsed = parseJsonWithComments(source, errors, {
+    allowTrailingComma,
+    disallowComments: false,
+  });
+  if (errors.length > 0 || !isJsonObject(parsed)) {
+    throw new Error(
+      `Refusing to rewrite ${label} configuration with invalid JSONC in ${path}.`,
+    );
   }
 }
 
@@ -1806,22 +1826,23 @@ function removeJsoncPropertyPreservingComments(
   const propertyIndex = objectNode.children.indexOf(propertyNode);
   if (propertyIndex < 0) return source;
 
-  const ranges = [nodeRange(propertyNode)];
+  const propertyEnd = propertyNode.offset + propertyNode.length;
+  const objectEnd = objectNode.offset + objectNode.length;
   const previousProperty = objectNode.children[propertyIndex - 1];
   const nextProperty = objectNode.children[propertyIndex + 1];
+  // Remove the separator after the property (including a trailing comma
+  // before the container's closing brace) when one follows; otherwise the
+  // one before it. Token-aware scanning leaves commas inside comments alone.
   const separatorOffset = nextProperty
-    ? findComma(
-        source,
-        propertyNode.offset + propertyNode.length,
-        nextProperty.offset,
-      )
+    ? findComma(source, propertyEnd, nextProperty.offset)
     : previousProperty
       ? findComma(
           source,
           previousProperty.offset + previousProperty.length,
           propertyNode.offset,
         )
-      : undefined;
+      : findComma(source, propertyEnd, objectEnd);
+  const ranges = [nodeRange(propertyNode)];
   if (separatorOffset !== undefined) {
     ranges.push({ offset: separatorOffset, length: 1 });
   }
