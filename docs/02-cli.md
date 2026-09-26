@@ -211,7 +211,7 @@ the Copilot CLI. `zg --install` also accepts:
 | `--mcp-toolset <agent\|full>` | Daemon MCP surface; default `agent` |
 | `--mcp-tool-timeout <seconds>` | Codex, Qwen Code, both Qoder clients, OpenCode, and GitHub Copilot MCP timeout; default 600 seconds |
 | `--mcp-token-env <name>` | Environment variable containing the server token |
-| `--force` | Replace a conflicting unmanaged `zvec_grep` entry |
+| `--force` | Write the selected configuration despite a conflicting unmanaged `zvec_grep` entry; malformed inspected files still fail. For OpenCode this writes the selected file only — sibling definitions in other merged files can remain effective |
 
 See [Agent integrations](./01-agents.md) before using `--force`.
 
