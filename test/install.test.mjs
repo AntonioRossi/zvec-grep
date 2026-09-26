@@ -2111,6 +2111,196 @@ test("OpenCode install and uninstall accept JSONC comments and trailing commas",
   assert.equal(uninstalled.mcp.other.url, "https://example.com/mcp");
 });
 
+test("OpenCode uninstall keeps JSONC valid for every removal position with trailing commas", async (t) => {
+  const managedUrl = "http://127.0.0.1:7999/mcp";
+  const server = (url) => `{ "type": "remote", "url": "${url}" }`;
+  const fixtures = [
+    {
+      name: "comment-free sole top-level mcp property with trailing comma",
+      source: `{
+  "mcp": {
+    "zvec_grep": ${server(managedUrl)},
+  },
+}
+`,
+      model: undefined,
+      remainingServers: [],
+      expectMcpGone: true,
+    },
+    {
+      name: "sole mcp property, mcp sole top-level property",
+      source: `{
+  // Keep this header comment.
+  "mcp": {
+    "zvec_grep": ${server(managedUrl)},
+  },
+}
+`,
+      model: undefined,
+      remainingServers: [],
+    },
+    {
+      name: "sole mcp property beside unrelated settings",
+      source: `{
+  // Keep this header comment.
+  "model": "custom/model",
+  "mcp": {
+    "zvec_grep": ${server(managedUrl)},
+  },
+}
+`,
+      model: "custom/model",
+      remainingServers: [],
+    },
+    {
+      name: "first property with trailing commas",
+      source: `{
+  "model": "custom/model",
+  "mcp": {
+    "zvec_grep": ${server(managedUrl)},
+    "other": ${server("https://example.com/other")},
+    "third": ${server("https://example.com/third")},
+  },
+}
+`,
+      model: "custom/model",
+      remainingServers: ["other", "third"],
+    },
+    {
+      name: "middle property with trailing commas",
+      source: `{
+  "model": "custom/model",
+  "mcp": {
+    "other": ${server("https://example.com/other")},
+    "zvec_grep": ${server(managedUrl)},
+    "third": ${server("https://example.com/third")},
+  },
+}
+`,
+      model: "custom/model",
+      remainingServers: ["other", "third"],
+    },
+    {
+      name: "last property with trailing comma",
+      source: `{
+  "model": "custom/model",
+  "mcp": {
+    "other": ${server("https://example.com/other")},
+    "third": ${server("https://example.com/third")},
+    "zvec_grep": ${server(managedUrl)},
+  },
+}
+`,
+      model: "custom/model",
+      remainingServers: ["other", "third"],
+    },
+    {
+      name: "comments between properties survive removal",
+      source: `{
+  // Header comment.
+  "model": "custom/model",
+  "mcp": {
+    // Before the managed entry.
+    "zvec_grep": ${server(managedUrl)},
+    // After the managed entry.
+    "other": ${server("https://example.com/other")},
+  },
+}
+`,
+      model: "custom/model",
+      remainingServers: ["other"],
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "zvec-grep-install-opencode-uninstall-"),
+    );
+    const xdgConfigHome = join(temporaryDirectory, "config");
+    const configDirectory = join(xdgConfigHome, "opencode");
+    const jsoncPath = join(configDirectory, "opencode.jsonc");
+    t.after(async () => {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    });
+    await mkdir(configDirectory, { recursive: true });
+    await writeFile(jsoncPath, fixture.source);
+
+    await uninstallTarget("opencode", {
+      OPENCODE_CONFIG: undefined,
+      XDG_CONFIG_HOME: xdgConfigHome,
+    });
+
+    const uninstalledSource = await readFile(jsoncPath, "utf8");
+    const errors = [];
+    const uninstalled = parseJsonWithComments(uninstalledSource, errors, {
+      allowTrailingComma: true,
+    });
+    assert.equal(
+      errors.length,
+      0,
+      `${fixture.name}: uninstall must leave valid JSONC (got ${JSON.stringify(uninstalledSource)})`,
+    );
+    assert.equal(
+      uninstalled.mcp?.zvec_grep,
+      undefined,
+      `${fixture.name}: managed entry must be removed`,
+    );
+    if (fixture.expectMcpGone) {
+      assert.equal(
+        uninstalled.mcp,
+        undefined,
+        `${fixture.name}: sole comment-free container must be removed entirely`,
+      );
+    }
+    if (fixture.model !== undefined) {
+      assert.equal(
+        uninstalled.model,
+        fixture.model,
+        `${fixture.name}: unrelated settings must survive`,
+      );
+    }
+    for (const name of fixture.remainingServers) {
+      assert.equal(
+        uninstalled.mcp?.[name]?.url,
+        `https://example.com/${name}`,
+        `${fixture.name}: unrelated server ${name} must survive`,
+      );
+    }
+    if (fixture.source.includes("Header comment")) {
+      assert.match(
+        uninstalledSource,
+        /Header comment/,
+        `${fixture.name}: comments must survive`,
+      );
+    }
+
+    const { stdout } = await installTarget("opencode", {
+      OPENCODE_CONFIG: undefined,
+      XDG_CONFIG_HOME: xdgConfigHome,
+    });
+    assert.ok(
+      stdout.includes(`Config    ${jsoncPath}`),
+      `${fixture.name}: reinstall must succeed after uninstall`,
+    );
+    const reinstallErrors = [];
+    const reinstalled = parseJsonWithComments(
+      await readFile(jsoncPath, "utf8"),
+      reinstallErrors,
+      { allowTrailingComma: true },
+    );
+    assert.equal(
+      reinstallErrors.length,
+      0,
+      `${fixture.name}: reinstall must leave valid JSONC`,
+    );
+    assert.equal(
+      reinstalled.mcp.zvec_grep.enabled,
+      true,
+      `${fixture.name}: reinstall must restore the managed entry`,
+    );
+  }
+});
+
 test("OpenCode installer leaves an unmanaged JSONC entry byte-identical without force", async (t) => {
   const temporaryDirectory = await mkdtemp(
     join(tmpdir(), "zvec-grep-install-opencode-jsonc-conflict-"),
