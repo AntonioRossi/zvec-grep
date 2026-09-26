@@ -38,6 +38,34 @@ that override, the installer uses an existing global `opencode.jsonc` before
 XDG-based environments, `XDG_CONFIG_HOME` replaces the default `~/.config`
 root.
 
+OpenCode deep-merges its configuration layers — `config.json`, then
+`opencode.json`, then `opencode.jsonc`, then an explicit `OPENCODE_CONFIG` —
+with later files overriding conflicting keys and non-overlapping fields from
+every layer remaining effective. Before writing anything, the installer
+therefore inspects all three default global files plus the selected explicit
+file (when `OPENCODE_CONFIG` is set) for an existing `zvec_grep` entry:
+
+- An unmanaged entry in any inspected file fails the installation unless
+  `--force` is given; the error names the conflicting file and leaves every
+  configuration file and `AGENTS.md` byte-identical.
+- Every inspected file must be parseable with a valid `mcp` container.
+  Malformed files or invalid containers are rejected **regardless of
+  `--force`**; force only bypasses the unmanaged-entry restriction.
+- `--force` writes the selected configuration file alone (plus its adjacent
+  `AGENTS.md`). It does not remove or rewrite sibling definitions: fields
+  defined only in another merged file — for example an authorization header
+  on a sibling `zvec_grep` entry — can remain part of the effective merged
+  server. Non-selected files are preserved byte-identical under `--force`.
+- An entry is recognized as managed when it matches the currently configured
+  server URL or the documented `zg` command forms, so reinstallations and
+  uninstalls replace only entries this installer would have written.
+
+Inspection covers the global configuration files OpenCode merges by default.
+Other configuration layers — `~/.opencode` directories, `OPENCODE_CONFIG_DIR`,
+project-level configuration, managed preferences — can also affect the
+effective server definition and are **not** exhaustively inspected; conflict
+detection is limited to the inspected set above.
+
 The current Qoder CLI package exposes both `qoder` and `qodercli` commands, but
 the installer exposes only the canonical `qoder` target. One Qoder install
 configures both the CLI and IDE, and automatic detection recognizes either CLI
@@ -289,3 +317,11 @@ zg --uninstall --target all --yes
 
 Restart the agent or open a new session to apply the change. Uninstalling an
 agent integration does not delete repository indexes or the npm package.
+
+The Rust implementation of the CLI (`rust/crates/zg-cli`) carries its own
+installer. Code inspection of `install_opencode` there shows it selects the
+same configuration file but does **not** perform the merged-file conflict
+inspection described above (neither the legacy `config.json` nor cross-file
+unmanaged entries are checked). No Rust installer behavior was executed by
+these regressions; aligning and testing Rust-side parity is a separate
+follow-up, labelled code-inspected, not reproduced.
