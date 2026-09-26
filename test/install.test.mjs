@@ -2386,21 +2386,16 @@ test("OpenCode forced installation writes the selected file and preserves the ot
 }
 `,
   );
-  await writeFile(
-    jsonPath,
-    `${JSON.stringify(
-      {
-        mcp: {
-          zvec_grep: {
-            type: "remote",
-            url: "https://example.com/unmanaged",
-          },
-        },
+  const sibling = {
+    mcp: {
+      zvec_grep: {
+        type: "remote",
+        url: "https://example.com/unmanaged",
+        headers: { Authorization: "Bearer sibling-secret" },
       },
-      null,
-      2,
-    )}\n`,
-  );
+    },
+  };
+  await writeFile(jsonPath, `${JSON.stringify(sibling, null, 2)}\n`);
   const originalJson = await readFile(jsonPath);
 
   const { stdout } = await installTarget(
@@ -2424,12 +2419,67 @@ test("OpenCode forced installation writes the selected file and preserves the ot
   assert.equal(forcedErrors.length, 0);
   assert.equal(forced.model, "custom/model");
   assert.equal(forced.mcp.zvec_grep.enabled, true);
+  assert.equal(
+    forced.mcp.zvec_grep.headers,
+    undefined,
+    "the selected-file write carries no sibling-only fields",
+  );
   assert.match(await readFile(guidancePath, "utf8"), /zvec-grep/);
 });
 
-test("OpenCode explicit OPENCODE_CONFIG stays scoped and ignores global conflicts", async (t) => {
+test("OpenCode installer rejects malformed or invalid-container sibling files regardless of force", async (t) => {
+  for (const caseFixture of [
+    { name: "malformed JSONC", content: `{\n  "model": ,\n}\n` },
+    {
+      name: "invalid mcp container",
+      content: `${JSON.stringify({ mcp: "not-an-object" }, null, 2)}\n`,
+    },
+  ]) {
+    const temporaryDirectory = await mkdtemp(
+      join(tmpdir(), "zvec-grep-install-opencode-invalid-sibling-"),
+    );
+    const xdgConfigHome = join(temporaryDirectory, "config");
+    const configDirectory = join(xdgConfigHome, "opencode");
+    const jsoncPath = join(configDirectory, "opencode.jsonc");
+    const jsonPath = join(configDirectory, "opencode.json");
+    t.after(async () => {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    });
+
+    await mkdir(configDirectory, { recursive: true });
+    await writeFile(jsoncPath, `{\n  "model": "custom/model",\n}\n`);
+    await writeFile(jsonPath, caseFixture.content);
+    const originalJsonc = await readFile(jsoncPath);
+    const originalJson = await readFile(jsonPath);
+
+    for (const extraArgs of [[], ["--force"]]) {
+      await assert.rejects(
+        installTarget(
+          "opencode",
+          {
+            OPENCODE_CONFIG: undefined,
+            XDG_CONFIG_HOME: xdgConfigHome,
+          },
+          extraArgs,
+        ),
+        (error) => {
+          assert.ok(
+            error.stderr.includes(jsonPath),
+            `${caseFixture.name} (${extraArgs.length ? "forced" : "unforced"}) must name the invalid file`,
+          );
+          return true;
+        },
+      );
+    }
+
+    assert.deepEqual(await readFile(jsoncPath), originalJsonc);
+    assert.deepEqual(await readFile(jsonPath), originalJson);
+  }
+});
+
+test("OpenCode installer rejects a global conflict even when OPENCODE_CONFIG is set", async (t) => {
   const temporaryDirectory = await mkdtemp(
-    join(tmpdir(), "zvec-grep-install-opencode-explicit-"),
+    join(tmpdir(), "zvec-grep-install-opencode-explicit-conflict-"),
   );
   const xdgConfigHome = join(temporaryDirectory, "config");
   const configDirectory = join(xdgConfigHome, "opencode");
@@ -2457,23 +2507,21 @@ test("OpenCode explicit OPENCODE_CONFIG stays scoped and ignores global conflict
   );
   const originalJson = await readFile(jsonPath);
   await writeFile(explicitPath, "{}\n");
+  const originalExplicit = await readFile(explicitPath);
 
-  const { stdout } = await installTarget("opencode", {
-    OPENCODE_CONFIG: explicitPath,
-    XDG_CONFIG_HOME: xdgConfigHome,
-  });
-  assert.ok(stdout.includes(`Config    ${explicitPath}`));
-  assert.deepEqual(await readFile(jsonPath), originalJson);
-  const installedErrors = [];
-  const installed = parseJsonWithComments(
-    await readFile(explicitPath, "utf8"),
-    installedErrors,
-    {
-      allowTrailingComma: true,
+  await assert.rejects(
+    installTarget("opencode", {
+      OPENCODE_CONFIG: explicitPath,
+      XDG_CONFIG_HOME: xdgConfigHome,
+    }),
+    (error) => {
+      assert.ok(error.stderr.includes(jsonPath));
+      return true;
     },
   );
-  assert.equal(installedErrors.length, 0);
-  assert.equal(installed.mcp.zvec_grep.enabled, true);
+
+  assert.deepEqual(await readFile(jsonPath), originalJson);
+  assert.deepEqual(await readFile(explicitPath), originalExplicit);
 });
 
 test("OpenCode uninstaller removes legacy managed entries from both global configs", async (t) => {

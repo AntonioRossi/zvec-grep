@@ -391,7 +391,10 @@ async function assertNoUnmanagedOpenCodeServer(
   resolvedConfig: Awaited<ReturnType<typeof resolveOpenCodeConfigPath>>,
   force: boolean,
 ): Promise<void> {
-  if (force) return;
+  // Every inspected file is parsed and its container validated regardless of
+  // --force; force only bypasses the unmanaged-entry rejection, and it writes
+  // the selected file alone — sibling-only fields can remain effective in
+  // OpenCode's merged result.
   for (const path of resolvedConfig.conflictInspectionPaths ?? []) {
     const existing = await readTextFileIfExists(path);
     if (!existing.trim()) continue;
@@ -401,9 +404,9 @@ async function assertNoUnmanagedOpenCodeServer(
     validateJsoncMcpContainer(path, root, "mcp");
     const container = root.mcp;
     const current = isJsonObject(container) ? container.zvec_grep : undefined;
-    if (current !== undefined && !isManagedJsonMcpServer(current)) {
+    if (current !== undefined && !force && !isManagedJsonMcpServer(current)) {
       throw new Error(
-        `Existing unmanaged zvec_grep MCP server found in ${path}. Re-run with --force to replace it for OpenCode.`,
+        `Existing unmanaged zvec_grep MCP server found in ${path}. Re-run with --force to write the selected OpenCode configuration; sibling definitions in other merged files can remain effective.`,
       );
     }
   }
@@ -908,7 +911,23 @@ async function resolveOpenCodeConfigPath(): Promise<{
   conflictInspectionPaths?: readonly string[];
 }> {
   const configured = process.env.OPENCODE_CONFIG?.trim();
-  if (configured) return { path: resolve(configured) };
+  if (configured) {
+    const explicitDirectory = resolve(
+      process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
+      "opencode",
+    );
+    return {
+      path: resolve(configured),
+      // OpenCode deep-merges the default global files with an explicit
+      // configuration, so they participate in conflict inspection too.
+      conflictInspectionPaths: [
+        resolve(configured),
+        resolve(explicitDirectory, "opencode.jsonc"),
+        resolve(explicitDirectory, "opencode.json"),
+        resolve(explicitDirectory, "config.json"),
+      ],
+    };
+  }
 
   const configDirectory = resolve(
     process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
