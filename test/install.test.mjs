@@ -2352,13 +2352,15 @@ test("OpenCode installer proceeds when other global files hold only managed entr
   });
   assert.ok(stdout.includes(`Config    ${jsoncPath}`));
   assert.deepEqual(await readFile(jsonPath), originalJson);
+  const installedErrors = [];
   const installed = parseJsonWithComments(
     await readFile(jsoncPath, "utf8"),
-    [],
+    installedErrors,
     {
       allowTrailingComma: true,
     },
   );
+  assert.equal(installedErrors.length, 0);
   assert.equal(installed.mcp.zvec_grep.enabled, true);
 });
 
@@ -2462,13 +2464,15 @@ test("OpenCode explicit OPENCODE_CONFIG stays scoped and ignores global conflict
   });
   assert.ok(stdout.includes(`Config    ${explicitPath}`));
   assert.deepEqual(await readFile(jsonPath), originalJson);
+  const installedErrors = [];
   const installed = parseJsonWithComments(
     await readFile(explicitPath, "utf8"),
-    [],
+    installedErrors,
     {
       allowTrailingComma: true,
     },
   );
+  assert.equal(installedErrors.length, 0);
   assert.equal(installed.mcp.zvec_grep.enabled, true);
 });
 
