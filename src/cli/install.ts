@@ -351,6 +351,24 @@ async function installOpenCodeIntegration(
   const resolvedConfig = await resolveOpenCodeConfigPath();
   const configPath = resolvedConfig.path;
   const guidancePath = resolve(dirname(configPath), "AGENTS.md");
+  // OpenCode deep-merges every inspected configuration file, so an unmanaged
+  // entry in any of them is part of the effective server definition. Every
+  // inspected file is parsed and validated regardless of --force; force only
+  // bypasses the unmanaged-entry rejection, and it writes the selected file
+  // alone — sibling-only fields can remain effective in the merged result.
+  for (const inspectPath of resolvedConfig.conflictInspectionPaths ?? [
+    configPath,
+  ]) {
+    await assertJsoncMcpSettingsReplaceable(
+      inspectPath,
+      "OpenCode",
+      options.force,
+      isManagedJsonMcpServer,
+      "mcp",
+      true,
+      "Re-run with --force to write the selected OpenCode configuration; sibling definitions in other merged files can remain effective.",
+    );
+  }
   await updateJsoncMcpSettings({
     path: configPath,
     containerKey: "mcp",
@@ -1254,9 +1272,26 @@ async function resolveOpenCodeConfigPath(): Promise<{
   path: string;
   note?: string;
   managedCleanupPaths?: readonly string[];
+  conflictInspectionPaths?: readonly string[];
 }> {
   const configured = process.env.OPENCODE_CONFIG?.trim();
-  if (configured) return { path: resolve(configured) };
+  if (configured) {
+    const configDirectory = resolve(
+      process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
+      "opencode",
+    );
+    return {
+      path: resolve(configured),
+      // OpenCode deep-merges the default global files with an explicit
+      // configuration, so they participate in conflict inspection too.
+      conflictInspectionPaths: [
+        resolve(configured),
+        resolve(configDirectory, "opencode.jsonc"),
+        resolve(configDirectory, "opencode.json"),
+        resolve(configDirectory, "config.json"),
+      ],
+    };
+  }
 
   const configDirectory = resolve(
     process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
@@ -1264,6 +1299,14 @@ async function resolveOpenCodeConfigPath(): Promise<{
   );
   const jsoncPath = resolve(configDirectory, "opencode.jsonc");
   const jsonPath = resolve(configDirectory, "opencode.json");
+  // OpenCode deep-merges every default global configuration file (later
+  // files override conflicting keys), so all three participate in conflict
+  // inspection, including the legacy file.
+  const conflictInspectionPaths = [
+    jsoncPath,
+    jsonPath,
+    resolve(configDirectory, "config.json"),
+  ];
   const [jsoncExists, jsonExists] = await Promise.all([
     pathExists(jsoncPath),
     pathExists(jsonPath),
@@ -1273,6 +1316,7 @@ async function resolveOpenCodeConfigPath(): Promise<{
     return {
       path: jsoncPath,
       managedCleanupPaths: [jsoncPath, jsonPath],
+      conflictInspectionPaths,
       note: jsonExists
         ? "both opencode.jsonc and opencode.json exist; selected opencode.jsonc"
         : undefined,
@@ -1281,6 +1325,7 @@ async function resolveOpenCodeConfigPath(): Promise<{
   return {
     path: jsonPath,
     managedCleanupPaths: [jsoncPath, jsonPath],
+    conflictInspectionPaths,
   };
 }
 
@@ -2109,6 +2154,7 @@ async function assertJsoncMcpSettingsReplaceable(
   isManaged: (value: unknown) => boolean,
   containerKey: McpContainerKey = "mcpServers",
   allowTrailingComma = false,
+  forceGuidance?: string,
 ): Promise<void> {
   const existing = await readTextFileIfExists(path);
   const source = existing.trim() ? existing : "{}\n";
@@ -2121,7 +2167,7 @@ async function assertJsoncMcpSettingsReplaceable(
     !force
   ) {
     throw new Error(
-      `Existing unmanaged zvec_grep MCP server found in ${path}. Re-run with --force to replace it for ${label}.`,
+      `Existing unmanaged zvec_grep MCP server found in ${path}. ${forceGuidance ?? `Re-run with --force to replace it for ${label}.`}`,
     );
   }
 }
