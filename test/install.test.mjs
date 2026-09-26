@@ -2103,6 +2103,18 @@ test("OpenCode uninstall keeps JSONC valid for every removal position with trail
   const server = (url) => `{ "type": "remote", "url": "${url}" }`;
   const fixtures = [
     {
+      name: "comment-free sole top-level mcp property with trailing comma",
+      source: `{
+  "mcp": {
+    "zvec_grep": ${server(managedUrl)},
+  },
+}
+`,
+      model: undefined,
+      remainingServers: [],
+      expectMcpGone: true,
+    },
+    {
       name: "sole mcp property, mcp sole top-level property",
       source: `{
   // Keep this header comment.
@@ -2220,6 +2232,13 @@ test("OpenCode uninstall keeps JSONC valid for every removal position with trail
       undefined,
       `${fixture.name}: managed entry must be removed`,
     );
+    if (fixture.expectMcpGone) {
+      assert.equal(
+        uninstalled.mcp,
+        undefined,
+        `${fixture.name}: sole comment-free container must be removed entirely`,
+      );
+    }
     if (fixture.model !== undefined) {
       assert.equal(
         uninstalled.model,
