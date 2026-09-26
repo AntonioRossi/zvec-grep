@@ -311,6 +311,10 @@ async function installOpenCodeIntegration(
   const resolvedConfig = await resolveOpenCodeConfigPath();
   const configPath = resolvedConfig.path;
   const guidancePath = resolve(dirname(configPath), "AGENTS.md");
+  // OpenCode deep-merges the default global configuration files, so an
+  // unmanaged entry in any of them is part of the effective server
+  // definition; reject before any configuration or guidance write.
+  await assertNoUnmanagedOpenCodeServer(resolvedConfig, options.force);
   await updateJsoncMcpSettings({
     path: configPath,
     containerKey: "mcp",
@@ -381,6 +385,31 @@ async function uninstallOpenCodeIntegration(): Promise<InstallAgentResult> {
     endMarker: ZVEC_GREP_AGENTS_END,
   });
   return { files: [configPath, guidancePath] };
+}
+
+async function assertNoUnmanagedOpenCodeServer(
+  resolvedConfig: Awaited<ReturnType<typeof resolveOpenCodeConfigPath>>,
+  force: boolean,
+): Promise<void> {
+  // Every inspected file is parsed and its container validated regardless of
+  // --force; force only bypasses the unmanaged-entry rejection, and it writes
+  // the selected file alone — sibling-only fields can remain effective in
+  // OpenCode's merged result.
+  for (const path of resolvedConfig.conflictInspectionPaths ?? []) {
+    const existing = await readTextFileIfExists(path);
+    if (!existing.trim()) continue;
+    const root = parseJsoncSettings(path, existing, "OpenCode", {
+      allowTrailingComma: true,
+    });
+    validateJsoncMcpContainer(path, root, "mcp");
+    const container = root.mcp;
+    const current = isJsonObject(container) ? container.zvec_grep : undefined;
+    if (current !== undefined && !force && !isManagedJsonMcpServer(current)) {
+      throw new Error(
+        `Existing unmanaged zvec_grep MCP server found in ${path}. Re-run with --force to write the selected OpenCode configuration; sibling definitions in other merged files can remain effective.`,
+      );
+    }
+  }
 }
 
 async function installCursorIntegration(
@@ -879,9 +908,26 @@ async function resolveOpenCodeConfigPath(): Promise<{
   path: string;
   note?: string;
   managedCleanupPaths?: readonly string[];
+  conflictInspectionPaths?: readonly string[];
 }> {
   const configured = process.env.OPENCODE_CONFIG?.trim();
-  if (configured) return { path: resolve(configured) };
+  if (configured) {
+    const explicitDirectory = resolve(
+      process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
+      "opencode",
+    );
+    return {
+      path: resolve(configured),
+      // OpenCode deep-merges the default global files with an explicit
+      // configuration, so they participate in conflict inspection too.
+      conflictInspectionPaths: [
+        resolve(configured),
+        resolve(explicitDirectory, "opencode.jsonc"),
+        resolve(explicitDirectory, "opencode.json"),
+        resolve(explicitDirectory, "config.json"),
+      ],
+    };
+  }
 
   const configDirectory = resolve(
     process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
@@ -889,6 +935,14 @@ async function resolveOpenCodeConfigPath(): Promise<{
   );
   const jsoncPath = resolve(configDirectory, "opencode.jsonc");
   const jsonPath = resolve(configDirectory, "opencode.json");
+  // OpenCode deep-merges every default global configuration file (later
+  // files override conflicting keys), so all three participate in conflict
+  // inspection, including the legacy file.
+  const conflictInspectionPaths = [
+    jsoncPath,
+    jsonPath,
+    resolve(configDirectory, "config.json"),
+  ];
   const [jsoncExists, jsonExists] = await Promise.all([
     pathExists(jsoncPath),
     pathExists(jsonPath),
@@ -898,6 +952,7 @@ async function resolveOpenCodeConfigPath(): Promise<{
     return {
       path: jsoncPath,
       managedCleanupPaths: [jsoncPath, jsonPath],
+      conflictInspectionPaths,
       note: jsonExists
         ? "both opencode.jsonc and opencode.json exist; selected opencode.jsonc"
         : undefined,
@@ -906,6 +961,7 @@ async function resolveOpenCodeConfigPath(): Promise<{
   return {
     path: jsonPath,
     managedCleanupPaths: [jsoncPath, jsonPath],
+    conflictInspectionPaths,
   };
 }
 

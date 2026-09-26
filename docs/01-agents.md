@@ -34,6 +34,38 @@ that override, the installer uses an existing global `opencode.jsonc` before
 XDG-based environments, `XDG_CONFIG_HOME` replaces the default `~/.config`
 root.
 
+OpenCode deep-merges its configuration layers — `config.json`, then
+`opencode.json`, then `opencode.jsonc`, then an explicit `OPENCODE_CONFIG` —
+with later files overriding conflicting keys and non-overlapping fields from
+every layer remaining effective. Before writing anything, the installer
+therefore inspects all three default global files plus the selected explicit
+file (when `OPENCODE_CONFIG` is set) for an existing `zvec_grep` entry:
+
+- An unmanaged entry in any inspected file fails the installation unless
+  `--force` is given; the error names the conflicting file and leaves every
+  configuration file and `AGENTS.md` byte-identical.
+- Every inspected file must be parseable with a valid `mcp` container.
+  Malformed files or invalid containers are rejected **regardless of
+  `--force`**; force only bypasses the unmanaged-entry restriction.
+- `--force` writes the selected configuration file alone (plus its adjacent
+  `AGENTS.md`). It does not remove or rewrite sibling definitions: fields
+  defined only in another merged file — for example an authorization header
+  on a sibling `zvec_grep` entry — can remain part of the effective merged
+  server. Non-selected files are preserved byte-identical under `--force`.
+- Entry recognition is shape-based: an existing `zvec_grep` entry is treated
+  as managed when it matches the currently configured server URL or the
+  documented `zg` command forms. Unmanaged entries are never silently
+  replaced — unforced installation rejects them, and `--force` replaces an
+  unmanaged entry only in the selected file. Uninstallation removes
+  recognized entries wherever it finds them; a shape-matching entry written
+  by another configuration is treated as managed.
+
+Inspection covers the global configuration files OpenCode merges by default.
+Other configuration layers — `~/.opencode` directories, `OPENCODE_CONFIG_DIR`,
+project-level configuration, managed preferences — can also affect the
+effective server definition and are **not** exhaustively inspected; conflict
+detection is limited to the inspected set above.
+
 The current Qoder CLI package exposes both `qoder` and `qodercli` commands, but
 the installer exposes only the canonical `qoder` target. One Qoder install
 configures both the CLI and IDE, and automatic detection recognizes either CLI
@@ -74,7 +106,9 @@ lifecycle differs from Direct execution.
 Managed text blocks use `ZVEC_GREP_START` and `ZVEC_GREP_END` markers. Existing
 content outside those blocks is preserved, as are unrelated settings and other
 MCP servers. If an unmanaged `zvec_grep` entry already exists, inspect it before
-using `--force` to replace it.
+using `--force` — for OpenCode, force writes and replaces the entry in the
+selected configuration file only, and sibling definitions in other merged
+files can remain effective.
 
 For Qoder CLI, `--mcp-transport` selects either a stdio or HTTP entry under
 `mcpServers`; the installer also manages the timeout and trust fields. Search
