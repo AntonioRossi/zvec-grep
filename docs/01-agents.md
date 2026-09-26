@@ -56,9 +56,13 @@ file (when `OPENCODE_CONFIG` is set) for an existing `zvec_grep` entry:
   defined only in another merged file — for example an authorization header
   on a sibling `zvec_grep` entry — can remain part of the effective merged
   server. Non-selected files are preserved byte-identical under `--force`.
-- An entry is recognized as managed when it matches the currently configured
-  server URL or the documented `zg` command forms, so reinstallations and
-  uninstalls replace only entries this installer would have written.
+- Entry recognition is shape-based: an existing `zvec_grep` entry is treated
+  as managed when it matches the currently configured server URL or the
+  documented `zg` command forms. Unmanaged entries are never silently
+  replaced — unforced installation rejects them, and `--force` replaces an
+  unmanaged entry only in the selected file. Uninstallation removes
+  recognized entries wherever it finds them; a shape-matching entry written
+  by another configuration is treated as managed.
 
 Inspection covers the global configuration files OpenCode merges by default.
 Other configuration layers — `~/.opencode` directories, `OPENCODE_CONFIG_DIR`,
@@ -108,7 +112,9 @@ lifecycle differs from Direct execution.
 Managed text blocks use `ZVEC_GREP_START` and `ZVEC_GREP_END` markers. Existing
 content outside those blocks is preserved, as are unrelated settings and other
 MCP servers. If an unmanaged `zvec_grep` entry already exists, inspect it before
-using `--force` to replace it.
+using `--force` — for OpenCode, force writes and replaces the entry in the
+selected configuration file only, and sibling definitions in other merged
+files can remain effective.
 
 For Qoder CLI, `--mcp-transport` selects either a stdio or HTTP entry under
 `mcpServers`; the installer also manages the timeout and trust fields. Search
