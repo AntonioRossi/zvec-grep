@@ -2810,6 +2810,86 @@ test("VS Code installer manages the user profile mcp.json", async (t) => {
   assert.deepEqual(copilotConfig, {});
 });
 
+test("VS Code uninstall keeps trailing-comma mcp.json valid through the shared removal helper", async (t) => {
+  const managedServer =
+    '{ "type": "stdio", "command": "zg", "args": ["--server", "--stdio"] }';
+  const fixtures = [
+    {
+      name: "sole server with trailing comma",
+      source: `{
+  "servers": {
+    "zvec_grep": ${managedServer},
+  },
+}
+`,
+    },
+    {
+      name: "last of several servers with comments and trailing commas",
+      source: `{
+  // Keep this comment and my own server.
+  "inputs": [],
+  "servers": {
+    "memory": { "command": "npx", "args": ["-y", "@mcp/memory"] },
+    "zvec_grep": ${managedServer},
+  },
+}
+`,
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const directory = await createTemporaryDirectory(t, "install-vscode-jsonc");
+    const vscode = vsCodeFixture(directory);
+    const { configPath } = vscode;
+    await mkdir(vscode.userDirectory, { recursive: true });
+    await writeFile(configPath, fixture.source);
+
+    await vscode.uninstall();
+
+    const uninstalledSource = await readFile(configPath, "utf8");
+    const errors = [];
+    const uninstalled = parseJsonWithComments(uninstalledSource, errors, {
+      allowTrailingComma: true,
+    });
+    assert.equal(
+      errors.length,
+      0,
+      `${fixture.name}: uninstall must leave valid JSONC (got ${JSON.stringify(uninstalledSource)})`,
+    );
+    assert.equal(
+      uninstalled.servers?.zvec_grep,
+      undefined,
+      `${fixture.name}: managed entry must be removed`,
+    );
+    if (fixture.name.includes("several")) {
+      assert.deepEqual(uninstalled.servers.memory, {
+        command: "npx",
+        args: ["-y", "@mcp/memory"],
+      });
+      assert.deepEqual(uninstalled.inputs, []);
+      assert.match(uninstalledSource, /Keep this comment and my own server\./);
+    }
+
+    await vscode.install();
+    const reinstallErrors = [];
+    const reinstalled = parseJsonWithComments(
+      await readFile(configPath, "utf8"),
+      reinstallErrors,
+      { allowTrailingComma: true },
+    );
+    assert.equal(
+      reinstallErrors.length,
+      0,
+      `${fixture.name}: reinstall must leave valid JSONC`,
+    );
+    assert.equal(
+      reinstalled.servers.zvec_grep.type,
+      "stdio",
+      `${fixture.name}: reinstall must restore the managed entry`,
+    );
+  }
+});
+
 test("VS Code installer keeps only fields VS Code accepts", async (t) => {
   const directory = await createTemporaryDirectory(t, "install-vscode-schema");
   const vscode = vsCodeFixture(directory);
