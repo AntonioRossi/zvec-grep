@@ -60,9 +60,14 @@ file (when `OPENCODE_CONFIG` is set) for an existing `zvec_grep` entry:
   as managed when it matches the currently configured server URL or the
   documented `zg` command forms. Unmanaged entries are never silently
   replaced — unforced installation rejects them, and `--force` replaces an
-  unmanaged entry only in the selected file. Uninstallation removes
-  recognized entries wherever it finds them; a shape-matching entry written
-  by another configuration is treated as managed.
+  unmanaged entry only in the selected file; a shape-matching entry written
+  by another configuration is treated as managed. Without
+  `OPENCODE_CONFIG`, uninstall removes recognized entries from the default
+  `opencode.json` and `opencode.jsonc`. With `OPENCODE_CONFIG`, it checks
+  only that selected file. It does not clean legacy `config.json` or other
+  merged configuration locations. Guidance-file removal is separate:
+  uninstall also removes the managed `AGENTS.md` block adjacent to the
+  selected configuration.
 
 Inspection covers the global configuration files OpenCode merges by default.
 Other configuration layers — `~/.opencode` directories, `OPENCODE_CONFIG_DIR`,
