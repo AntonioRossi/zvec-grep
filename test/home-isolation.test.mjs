@@ -38,11 +38,16 @@ async function makeWorkspace(label) {
 
 // Invoke the child fixture that imports the application and indexes with
 // the deterministic test model; the child's exit status propagates and any
-// failure fails the test. Home selection comes from the child environment.
-async function runChild(env) {
-  const { stdout } = await execFileAsync(process.execPath, [childScript], {
-    env,
-  });
+// failure fails the test. The workspace is parent-owned (allocated and
+// torn down here); the child receives it as an argument.
+async function runChild(env, root) {
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [childScript, root],
+    {
+      env,
+    },
+  );
   return JSON.parse(stdout.trim().split("\n").pop());
 }
 
@@ -104,27 +109,34 @@ test("engine writes bindings only into an inherited isolated home", async (t) =>
 });
 
 test("child inherits the isolated home, executes, and records the exact workspace", async (t) => {
+  const root = await makeWorkspace("subprocess");
   const isolatedHome = await mkdtemp(join(tmpdir(), "zg-home-iso-sub-home-"));
   const shadowHome = await mkdtemp(join(tmpdir(), "zg-home-iso-sub-shadow-"));
   t.after(async () => {
+    await rm(root, { recursive: true, force: true });
     await rm(isolatedHome, { recursive: true, force: true });
     await rm(shadowHome, { recursive: true, force: true });
   });
 
-  // A missing child or any execution failure fails this test via
-  // execFileAsync rejection. The child exercises the real binding-store
-  // code path with the deterministic test model — no network.
-  const result = await runChild({
-    ...process.env,
-    ZVEC_GREP_HOME: isolatedHome,
-    HOME: shadowHome,
-  });
+  const result = await runChild(
+    {
+      ...process.env,
+      ZVEC_GREP_HOME: isolatedHome,
+      HOME: shadowHome,
+    },
+    root,
+  );
   assert.ok(result.ok, "the child fixture must succeed");
+  assert.equal(
+    result.root,
+    root,
+    "the child must report the parent-owned workspace",
+  );
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
   assert.ok(
-    roots.includes(result.root),
-    "the isolated home must carry a binding for the child's exact workspace",
+    roots.includes(root),
+    "the isolated home must carry a binding for the parent-owned workspace",
   );
   const shadowZvec = await readdir(join(shadowHome, ".zvec-grep")).catch(
     () => null,
@@ -137,26 +149,30 @@ test("child inherits the isolated home, executes, and records the exact workspac
 });
 
 test("unset override writes to a disposable shadow home, never production", async (t) => {
+  const root = await makeWorkspace("unset");
   const shadowHome = await mkdtemp(join(tmpdir(), "zg-home-iso-unset-shadow-"));
   t.after(async () => {
+    await rm(root, { recursive: true, force: true });
     await rm(shadowHome, { recursive: true, force: true });
   });
 
-  // Delete the override from the child environment only; the parent's
-  // environment is untouched. The child's binding-store resolution must
-  // fall back to HOME/.zvec-grep inside the disposable shadow.
   const childEnv = { ...process.env };
   delete childEnv.ZVEC_GREP_HOME;
   childEnv.HOME = shadowHome;
 
-  const result = await runChild(childEnv);
+  const result = await runChild(childEnv, root);
   assert.ok(result.ok, "the child fixture must succeed");
+  assert.equal(
+    result.root,
+    root,
+    "the child must report the parent-owned workspace",
+  );
 
   const roots = await bindingRootsFromStore(
     join(shadowHome, ".zvec-grep", "bindings"),
   );
   assert.ok(
-    roots.includes(result.root),
-    "the disposable shadow home must carry a binding for the child's exact workspace",
+    roots.includes(root),
+    "the disposable shadow home must carry a binding for the parent-owned workspace",
   );
 });
