@@ -38,6 +38,42 @@ that override, the installer uses an existing global `opencode.jsonc` before
 XDG-based environments, `XDG_CONFIG_HOME` replaces the default `~/.config`
 root.
 
+OpenCode deep-merges its configuration layers — `config.json`, then
+`opencode.json`, then `opencode.jsonc`, then an explicit `OPENCODE_CONFIG` —
+with later files overriding conflicting keys and non-overlapping fields from
+every layer remaining effective. Before writing anything, the installer
+therefore inspects all three default global files plus the selected explicit
+file (when `OPENCODE_CONFIG` is set) for an existing `zvec_grep` entry:
+
+- An unmanaged entry in any inspected file fails the installation unless
+  `--force` is given; the error names the conflicting file and leaves every
+  configuration file and `AGENTS.md` byte-identical.
+- Every inspected file must be parseable with a valid `mcp` container.
+  Malformed files or invalid containers are rejected **regardless of
+  `--force`**; force only bypasses the unmanaged-entry restriction.
+- `--force` writes the selected configuration file alone (plus its adjacent
+  `AGENTS.md`). It does not remove or rewrite sibling definitions: fields
+  defined only in another merged file — for example an authorization header
+  on a sibling `zvec_grep` entry — can remain part of the effective merged
+  server. Non-selected files are preserved byte-identical under `--force`.
+- Entry recognition is shape-based: an existing `zvec_grep` entry is treated
+  as managed when it matches the currently configured server URL or the
+  documented `zg` command forms. Unmanaged entries are never silently
+  replaced — unforced installation rejects them, and `--force` replaces an
+  unmanaged entry only in the selected file; a shape-matching entry written
+  by another configuration is treated as managed. Without
+  `OPENCODE_CONFIG`, uninstall removes recognized entries from the default
+  `opencode.json` and `opencode.jsonc`. With `OPENCODE_CONFIG`, it checks
+  only that selected file. It does not clean legacy `config.json` or other
+  merged configuration locations. Guidance-file removal is separate:
+  uninstall also removes the managed `AGENTS.md` block adjacent to the
+  selected configuration.
+
+Inspection covers the global configuration files OpenCode merges by default.
+Other configuration layers — `~/.opencode` directories, `OPENCODE_CONFIG_DIR`,
+project-level configuration, managed preferences — can also affect the
+effective server definition and are **not** exhaustively inspected; conflict
+detection is limited to the inspected set above.
 The current Qoder CLI package exposes both `qoder` and `qodercli` commands, but
 the installer exposes only the canonical `qoder` target. One Qoder install
 configures both the CLI and IDE, and automatic detection recognizes either CLI
