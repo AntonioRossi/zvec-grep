@@ -21,6 +21,7 @@ import {
 import { indexProgressFromMessage } from "../dist/index-progress.js";
 import { formatAgentContextResult } from "../dist/cli/format/context.js";
 import { ZVEC_GREP_WORKSPACE_EVIDENCE_RULES } from "../dist/prompts/zvec-grep-guidance.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const root = resolve("test/fixtures/repository");
 const longIndexedContent = "x".repeat(8_000);
@@ -171,6 +172,8 @@ async function connectCliAdmin(backend = createBackend()) {
     includeSearchStructuredContent: true,
   });
 }
+
+useIsolatedZvecGrepHome();
 
 test("MCP toolset resolution prefers explicit configuration and defaults to agent", () => {
   assert.equal(DEFAULT_MCP_TOOLSET, "agent");

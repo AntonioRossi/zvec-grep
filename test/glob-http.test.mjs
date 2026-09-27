@@ -3,6 +3,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { createTemporaryDirectory } from "./helpers/fixtures.mjs";
 import { inWorker } from "./helpers/glob-worker.mjs";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
+
+useIsolatedZvecGrepHome();
 
 test("MCP searches with adversarial globs complete and leave the daemon responsive", async (t) => {
   const root = await createTemporaryDirectory(t, "zvec-glob-http-");

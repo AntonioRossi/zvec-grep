@@ -6,9 +6,12 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { parseArgs } from "../dist/cli/args.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve("dist/cli/index.js");
+
+useIsolatedZvecGrepHome();
 
 test("config model set parses local runtime settings", () => {
   const parsed = parseArgs([

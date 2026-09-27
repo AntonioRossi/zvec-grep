@@ -10,12 +10,15 @@ import { inspectRoot } from "../dist/daemon/runtime-manager.js";
 import { WatchManager } from "../dist/daemon/watch-manager.js";
 import { BaseEmbeddingModel } from "../dist/engine/models/embeddings.js";
 import { createZvecGrep } from "../dist/index.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const noopWatchManagerFactory = () => ({
   start() {},
   flushPending: async () => {},
   close: async () => {},
 });
+
+useIsolatedZvecGrepHome();
 
 test("index releases its model lease when service creation fails", async () => {
   const temporaryDirectory = await mkdtemp(

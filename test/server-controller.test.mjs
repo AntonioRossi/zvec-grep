@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import test from "node:test";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 import {
   DaemonInstanceLock,
   readInstanceRecord,
@@ -14,6 +15,8 @@ import {
   startServer,
   stopServer,
 } from "../dist/daemon/server-controller.js";
+
+useIsolatedZvecGrepHome();
 
 test("daemon instance lock is exclusive and owner-released", async (t) => {
   const home = await mkdtemp(join(tmpdir(), "zvec-grep-controller-"));

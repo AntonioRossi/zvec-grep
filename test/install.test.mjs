@@ -20,9 +20,12 @@ import test from "node:test";
 import { parse as parseJsonWithComments } from "jsonc-parser";
 import { installerSelectionLines } from "../dist/cli/install.js";
 import { ZVEC_GREP_WORKSPACE_EVIDENCE_RULES } from "../dist/prompts/zvec-grep-guidance.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve("dist/cli/index.js");
+
+useIsolatedZvecGrepHome();
 
 test("interactive installer marker follows the active agent", () => {
   const detected = new Set(["claude", "codex"]);
