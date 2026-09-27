@@ -17,6 +17,9 @@ import {
   scanFilePath,
 } from "../dist/engine/pipeline/indexing/scanner/index.js";
 import { createZvecGrep } from "../dist/index.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
+
+useIsolatedZvecGrepHome();
 
 test("path scanners rebuild gitignore rules and stay inside the requested subtree", async () => {
   const temporaryDirectory = await mkdtemp(

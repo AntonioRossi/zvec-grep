@@ -22,6 +22,9 @@ import {
 } from "../dist/engine/utils/daemon-lease.js";
 import { createZvecGrep } from "../dist/index.js";
 import { printError } from "../dist/cli/errors.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
+
+useIsolatedZvecGrepHome();
 
 test("daemon root lease blocks Direct index writes and is removed on release", async () => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "zvec-grep-lease-"));

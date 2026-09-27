@@ -4,6 +4,9 @@ import { EmbeddingModelPool } from "../dist/daemon/model-pool.js";
 import { WorkspaceReadSessionCache } from "../dist/daemon/workspace-read-session-cache.js";
 import { RootRuntime } from "../dist/daemon/root-runtime.js";
 import { createZvecGrep } from "../dist/index.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
+
+useIsolatedZvecGrepHome();
 
 test("workspace read session cache opens once, serializes operations and waits for readers before close", async () => {
   let opens = 0;

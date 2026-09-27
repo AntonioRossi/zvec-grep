@@ -6,8 +6,11 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { routeByMode } from "../dist/client/mode-router.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const execFileAsync = promisify(execFile);
+
+useIsolatedZvecGrepHome();
 
 test("client mode defaults to auto without explicit, environment, or global config", async (t) => {
   const home = await mkdtemp(join(tmpdir(), "zvec-grep-mode-default-"));

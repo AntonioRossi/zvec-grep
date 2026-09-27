@@ -7,9 +7,12 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { BaseEmbeddingModel } from "../dist/engine/models/embeddings.js";
 import { createZvecGrep } from "../dist/index.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve("dist/cli/index.js");
+
+useIsolatedZvecGrepHome();
 
 test("managed rg runs locally when indexed operations use server mode", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "zvec-grep-rg-server-mode-"));
