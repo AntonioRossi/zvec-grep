@@ -3,6 +3,7 @@ import { dirname, relative } from "node:path";
 import { EngineError } from "../../errors.js";
 import type { RootPath } from "../../types.js";
 import { pathPatternMatches } from "../../utils/glob.js";
+import { labeledGlobWorkError } from "../../utils/glob-budget.js";
 import {
   isPathInside,
   normalizePath,
@@ -72,7 +73,7 @@ export function matchesRootPatterns(
   relativePath: string,
   rootPath: RootPath,
 ): boolean {
-  if (matchesAny(relativePath, rootPath.exclude)) {
+  if (matchesRootExcludePatterns(relativePath, rootPath)) {
     return false;
   }
 
@@ -80,21 +81,21 @@ export function matchesRootPatterns(
     return true;
   }
 
-  return matchesAny(relativePath, rootPath.include);
+  return matchesRootIncludePatterns(relativePath, rootPath);
 }
 
 export function matchesRootIncludePatterns(
   relativePath: string,
   rootPath: RootPath,
 ): boolean {
-  return matchesAny(relativePath, rootPath.include);
+  return matchesAny(relativePath, rootPath.include, "root include");
 }
 
 export function matchesRootExcludePatterns(
   relativePath: string,
   rootPath: RootPath,
 ): boolean {
-  return matchesAny(relativePath, rootPath.exclude);
+  return matchesAny(relativePath, rootPath.exclude, "root exclude");
 }
 
 type RootScanDomain = {
@@ -228,12 +229,19 @@ function directoryCoversFile(
 function matchesAny(
   relativePath: string,
   patterns: readonly string[] | undefined,
+  label: string,
 ): boolean {
   if (!patterns || patterns.length === 0) {
     return false;
   }
 
-  return patterns.some((pattern) => patternMatches(pattern, relativePath));
+  return patterns.some((pattern, index) => {
+    try {
+      return patternMatches(pattern, relativePath);
+    } catch (error) {
+      throw labeledGlobWorkError(`${label}[${index}]`, pattern, error);
+    }
+  });
 }
 
 function patternMatches(pattern: string, relativePath: string): boolean {

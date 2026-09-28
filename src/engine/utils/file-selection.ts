@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import {
   checkGlobLength,
   checkGlobRuleCount,
-  GlobWorkLimitError,
+  labeledGlobWorkError,
 } from "./glob-budget.js";
 import {
   ripgrepGlobMatches,
@@ -101,26 +101,8 @@ function applyLabeledPattern(
       ? ripgrepGlobMatchesCaseInsensitive(pattern, path)
       : ripgrepGlobMatches(pattern, path);
   } catch (error) {
-    throw labeledWorkLimitError(label, pattern, error);
+    throw labeledGlobWorkError(label, pattern, error);
   }
-}
-
-function labeledWorkLimitError(
-  label: string,
-  pattern: string,
-  cause: unknown,
-): Error {
-  if (!(
-    cause instanceof GlobWorkLimitError ||
-    (cause instanceof Error && cause.message.includes("matching work limit"))
-  )) {
-    return cause as Error;
-  }
-  const preview = pattern.length > 48 ? `${pattern.slice(0, 45)}…` : pattern;
-  return new Error(
-    `Glob matching exceeded its work limit at ${label} (pattern '${preview}').`,
-    { cause },
-  );
 }
 
 function matchesOrderedGlobs(path: string, selection: FileSelection): boolean {
