@@ -50,6 +50,7 @@ export type CliOptions = {
   routes?: ZvecGrepContextRoute[];
   fuse?: boolean;
   rebuild?: boolean;
+  reconcile?: boolean;
   drop?: boolean;
   force?: boolean;
   resetPaths?: boolean;
@@ -75,6 +76,9 @@ export type CliCommand =
   | "query"
   | "index"
   | "status"
+  | "migrate"
+  | "export"
+  | "import"
   | "install"
   | "uninstall"
   | "config"

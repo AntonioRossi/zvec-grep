@@ -1,13 +1,92 @@
 import { realpathSync, statSync, type BigIntStats } from "node:fs";
-import { dirname, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { EngineError } from "../../errors.js";
+import type { WorkspaceManifestRootPath } from "../../manifest.js";
 import type { RootPath } from "../../types.js";
+import {
+  tryRealpathSync,
+  workspaceRootCrp,
+  type CanonicalPathResolver,
+} from "../../utils/canonical-path.js";
 import { pathPatternMatches } from "../../utils/glob.js";
 import {
   isPathInside,
   normalizePath,
   toDisplayPath,
 } from "../../utils/path.js";
+
+/**
+ * Convert runtime roots to their persisted manifest form: canonical
+ * workspace-relative paths with selection options, no absolute locations.
+ * Ignore-file references are canonicalized too and must stay inside the
+ * workspace; anything else is an explicit error.
+ */
+export function manifestRootPathsFromRuntime(
+  paths: readonly RootPath[],
+  resolver: CanonicalPathResolver,
+): WorkspaceManifestRootPath[] {
+  return canonicalizeRootPaths(paths, resolver).map((root) => {
+    const { absolutePath: _absolutePath, canonicalPath, ...options } = root;
+    return {
+      ...options,
+      path: canonicalPath as string,
+      ...(root.ignoreFiles !== undefined
+        ? { ignoreFiles: portableIgnoreFiles(root, resolver) }
+        : {}),
+    };
+  });
+}
+
+function portableIgnoreFiles(
+  root: RootPath,
+  resolver: CanonicalPathResolver,
+): string[] {
+  return (root.ignoreFiles ?? []).map((entry) => {
+    const absolutePath = normalizePath(
+      isAbsolute(entry) ? entry : join(root.absolutePath, entry),
+    );
+    const canonicalPath = resolver.toCanonical(absolutePath);
+    if (canonicalPath === null) {
+      throw new EngineError("Configured ignore file is outside the workspace", {
+        code: "ZVEC_GREP.ENGINE.SCANNER.IGNORE_FILE_OUTSIDE_WORKSPACE",
+        context: `ignoreFile=${entry} root=${root.absolutePath} workspaceRoot=${resolver.workspaceRoot}`,
+      });
+    }
+    return canonicalPath;
+  });
+}
+/**
+ * Assign each root its canonical workspace-relative path, the identity
+ * reference point for scanned files. Roots must stay inside the workspace,
+ * including through symlinks; anything else is an explicit error in portable
+ * mode.
+ */
+export function canonicalizeRootPaths(
+  paths: readonly RootPath[],
+  resolver: CanonicalPathResolver,
+): RootPath[] {
+  return paths.map((root) => {
+    const canonicalPath =
+      root.canonicalPath ??
+      (normalizePath(root.absolutePath) === resolver.workspaceRoot
+        ? workspaceRootCrp()
+        : resolver.toCanonical(root.absolutePath));
+    const realRoot = tryRealpathSync(root.absolutePath);
+    const escapes =
+      realRoot !== undefined &&
+      !isPathInside(resolver.workspaceRealRoot, realRoot);
+    if (canonicalPath === null || escapes) {
+      throw new EngineError(
+        "Workspace index root path is outside the workspace",
+        {
+          code: "ZVEC_GREP.ENGINE.SCANNER.ROOT_PATH_OUTSIDE_WORKSPACE",
+          context: `rootPath=${root.absolutePath} workspaceRoot=${resolver.workspaceRoot}`,
+        },
+      );
+    }
+    return { ...root, canonicalPath };
+  });
+}
 
 export function validateRootPaths(
   paths: readonly (string | RootPath)[],
