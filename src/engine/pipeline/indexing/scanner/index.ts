@@ -1216,6 +1216,22 @@ function pathContainsMatchingSegment(path: string, pattern: string): boolean {
 }
 
 function segmentMatches(pattern: string, segment: string): boolean {
+  // Equivalent fast paths, proven against the compiled matcher's semantics:
+  // - a pattern without glob metacharacters matches a path segment (which
+  //   never contains "/") only by exact equality;
+  // - "*<literal>" matches a segment iff it ends with the literal suffix,
+  //   because a single "*" spans only non-separator characters.
+  // Patterns containing any other metacharacter keep the compiled matcher.
+  if (!hasPathGlob(pattern)) {
+    return pattern === segment;
+  }
+  if (
+    pattern.startsWith("*") &&
+    pattern.length > 1 &&
+    !hasPathGlob(pattern.slice(1))
+  ) {
+    return segment.endsWith(pattern.slice(1));
+  }
   return pathPatternMatchesPrepared(pattern, segment);
 }
 

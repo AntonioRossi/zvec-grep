@@ -113,9 +113,12 @@ test("glob complexity limits reject expensive inputs without hanging", async () 
     assert.throws(() => glob.ripgrepGlobMatches('*', 'a'.repeat(32769)), /32768-character/);
     assert.throws(() => glob.ripgrepGlobMatches('{a,'.repeat(33) + 'b' + '}'.repeat(33), 'a'), /nesting limit/);
     assert.throws(() => glob.ripgrepGlobMatches('*a'.repeat(1000) + 'Z', 'a'.repeat(4096)), /matching work limit/);
-    assert.throws(() => withGlobBudget(() => {
+    // The operation-wide pool is gone: cumulative legitimate matching no longer
+    // rejects an operation; a single expensive match still hits its per-match
+    // cap, and per-path accounting bounds rule sets per candidate.
+    withGlobBudget(() => {
       for (let i = 0; i < 3000; i++) glob.ripgrepGlobMatches('**', 'a'.repeat(8192));
-    }), /work limit/);
+    });
     // A failed operation must not poison the next one, including cached matchers.
     assert.equal(withGlobBudget(() => glob.ripgrepGlobMatches('**', 'a')), true);
   `,
@@ -256,5 +259,120 @@ test("scanner loading does not debit the matching pool", async (t) => {
   `,
     root,
     240_000,
+  );
+});
+
+test("built-in fast paths keep exact ignore semantics for literal and suffix rules", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-fastpath-");
+  const dirs = ["node_modules", "build", "not-node_modules", "distx"];
+  const files = [
+    "a.lock",
+    "b.lockb",
+    "c-lock.json",
+    "d.map",
+    "e.min.js",
+    "f.mjs",
+    "g.generated.ts",
+    "h.po",
+    "keep.ts",
+    "node_modules.txt",
+  ];
+  for (const dir of dirs) await mkdir(join(root, dir), { recursive: true });
+  for (const name of files) await writeFile(join(root, name), "x");
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, "src", "main.ts"), "x");
+  await inWorker(
+    `
+    const result = await scanRootPaths('glob-fastpath', [{ absolutePath: workerData, recursive: true }]);
+    const kept = result.files.map((f) => f.relativePath).sort();
+    assert.deepEqual(kept, ['f.mjs', 'keep.ts', 'node_modules.txt', 'src/main.ts']);
+  `,
+    root,
+    30_000,
+  );
+});
+
+test("100000 realistic-depth candidates pass through the per-path accounting", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-scale-");
+  await inWorker(
+    `
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    let dir = workerData;
+    for (let depth = 0; depth < 6; depth++) {
+      dir = join(dir, 'svc' + depth);
+      await mkdir(dir);
+      await writeFile(join(dir, '.gitignore'), 'debug/\\n*.tmp\\n');
+      await mkdir(join(dir, 'debug'));
+      await writeFile(join(dir, 'debug', 'skip.ts'), 'x');
+    }
+    const batch = [];
+    let created = 0;
+    for (let i = 0; i < 100000; i++) {
+      const file = join(dir, 'f' + String(i).padStart(6, '0') + '.ts');
+      batch.push(writeFile(file, 'export const a = 1;\\n'));
+      created++;
+      if (batch.length === 512) {
+        await Promise.all(batch);
+        batch.length = 0;
+      }
+    }
+    await Promise.all(batch);
+    const result = await scanRootPaths('glob-scale', [{ absolutePath: workerData, recursive: true }]);
+    assert.equal(result.files.length, created);
+  `,
+    root,
+    600_000,
+  );
+});
+
+test("concurrent scans keep independent budgets and recover after a failure", async (t) => {
+  const left = await createTemporaryDirectory(t, "zvec-glob-conc-a-");
+  const right = await createTemporaryDirectory(t, "zvec-glob-conc-b-");
+  await writeFile(join(left, "a.ts"), "x");
+  await writeFile(join(right, "b.ts"), "x");
+  await inWorker(
+    `
+    const { writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const [leftResult, rightResult] = await Promise.all([
+      scanRootPaths('conc', [{ absolutePath: ${JSON.stringify(left)}, recursive: true }]),
+      scanRootPaths('conc', [{ absolutePath: ${JSON.stringify(right)}, recursive: true }]),
+    ]);
+    assert.equal(leftResult.files.length, 1);
+    assert.equal(rightResult.files.length, 1);
+    const heavy = '*'.repeat(4094) + 'Z';
+    await writeFile(join(${JSON.stringify(left)}, 'f' + 'x'.repeat(250) + '.ts'), 'x');
+    await writeFile(join(${JSON.stringify(left)}, '.gitignore'), heavy + '\\n');
+    await assert.rejects(
+      () => scanRootPaths('conc', [{ absolutePath: ${JSON.stringify(left)}, recursive: true }]),
+      /\\.gitignore:1/,
+    );
+    const recovered = await scanRootPaths('conc', [{ absolutePath: ${JSON.stringify(right)}, recursive: true }]);
+    assert.equal(recovered.files.length, 1);
+  `,
+    undefined,
+    60_000,
+  );
+});
+
+test("root include pattern work-limit failures carry their index", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-rootinc-");
+  const longName = `f${"x".repeat(250)}.ts`;
+  await writeFile(join(root, longName), "x");
+  await inWorker(
+    `
+    const heavy = '*'.repeat(4094) + 'Z';
+    await assert.rejects(
+      () => scanRootPaths('rootinc', [{ absolutePath: workerData, recursive: true, include: [heavy] }]),
+      (error) => /work limit/.test(error.message) && /root include\\[0\\]/.test(error.message),
+    );
+    await assert.rejects(
+      () => scanRootPaths('rootinc', [{ absolutePath: workerData, recursive: true, exclude: ['keep.ts', heavy] }]),
+      (error) => /work limit/.test(error.message) && /root exclude\\[1\\]/.test(error.message),
+    );
+  `,
+    root,
+    30_000,
   );
 });
