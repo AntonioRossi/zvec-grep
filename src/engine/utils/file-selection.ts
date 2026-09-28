@@ -1,6 +1,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { checkGlobLength, checkGlobRuleCount } from "./glob-budget.js";
+import {
+  checkGlobLength,
+  checkGlobRuleCount,
+  GlobWorkLimitError,
+} from "./glob-budget.js";
 import {
   ripgrepGlobMatches,
   ripgrepGlobMatchesCaseInsensitive,
@@ -76,21 +80,58 @@ export function matchesFileSelection(
   const includedByGlob = matchesOrderedGlobs(path, selection);
   const includedByType =
     types.include.length === 0 ||
-    types.include.some((glob) => ripgrepGlobMatches(glob, path));
-  const excludedByType = types.exclude.some((glob) =>
-    ripgrepGlobMatches(glob, path),
+    types.include.some((glob, index) =>
+      applyLabeledPattern(`types.include[${index}]`, glob, path, false),
+    );
+  const excludedByType = types.exclude.some((glob, index) =>
+    applyLabeledPattern(`types.exclude[${index}]`, glob, path, false),
   );
 
   return includedByGlob && includedByType && !excludedByType;
 }
 
+function applyLabeledPattern(
+  label: string,
+  pattern: string,
+  path: string,
+  caseInsensitive: boolean,
+): boolean {
+  try {
+    return caseInsensitive
+      ? ripgrepGlobMatchesCaseInsensitive(pattern, path)
+      : ripgrepGlobMatches(pattern, path);
+  } catch (error) {
+    throw labeledWorkLimitError(label, pattern, error);
+  }
+}
+
+function labeledWorkLimitError(
+  label: string,
+  pattern: string,
+  cause: unknown,
+): Error {
+  if (!(
+    cause instanceof GlobWorkLimitError ||
+    (cause instanceof Error && cause.message.includes("matching work limit"))
+  )) {
+    return cause as Error;
+  }
+  const preview = pattern.length > 48 ? `${pattern.slice(0, 45)}…` : pattern;
+  return new Error(
+    `Glob matching exceeded its work limit at ${label} (pattern '${preview}').`,
+    { cause },
+  );
+}
+
 function matchesOrderedGlobs(path: string, selection: FileSelection): boolean {
   const rules = [
-    ...(selection.globs ?? []).map((pattern) => ({
+    ...(selection.globs ?? []).map((pattern, index) => ({
+      label: `globs[${index}]`,
       pattern,
       caseInsensitive: false,
     })),
-    ...(selection.insensitiveGlobs ?? []).map((pattern) => ({
+    ...(selection.insensitiveGlobs ?? []).map((pattern, index) => ({
+      label: `insensitiveGlobs[${index}]`,
       pattern,
       caseInsensitive: true,
     })),
@@ -109,9 +150,12 @@ function matchesOrderedGlobs(path: string, selection: FileSelection): boolean {
     if (!pattern) {
       continue;
     }
-    const matches = rule.caseInsensitive
-      ? ripgrepGlobMatchesCaseInsensitive(pattern, path)
-      : ripgrepGlobMatches(pattern, path);
+    const matches = applyLabeledPattern(
+      rule.label,
+      pattern,
+      path,
+      rule.caseInsensitive,
+    );
     if (matches) {
       included = !negated;
     }

@@ -149,3 +149,59 @@ test("invalid and oversized ignore files fail with source context rather than by
     root,
   );
 });
+
+test("per-path accounting admits ordinary large repositories without custom filters", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-large-");
+  await inWorker(
+    `
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const dir = join(workerData, 'packages/service/src/modules/authentication/handlers');
+    await mkdir(dir, { recursive: true });
+    const batch = [];
+    for (let i = 0; i < 15000; i++) {
+      batch.push(writeFile(join(dir, 'file-' + String(i).padStart(8, '0') + '.ts'), 'export const a = 1;\\n'));
+      if (batch.length === 256) {
+        await Promise.all(batch);
+        batch.length = 0;
+      }
+    }
+    await Promise.all(batch);
+    const result = await scanRootPaths('glob-large', [{ absolutePath: workerData, recursive: true }]);
+    assert.equal(result.files.length, 15000);
+  `,
+    root,
+    180_000,
+  );
+});
+
+test("match-time work-limit failures identify the offending ignore rule and request glob", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-attrib-");
+  const longName = `f${"x".repeat(250)}.ts`;
+  await writeFile(join(root, longName), "export const a = 1;\n");
+  await inWorker(
+    `
+    const { writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const heavy = '*'.repeat(4094) + 'Z';
+    const longName = ${JSON.stringify(longName)};
+    const scan = (extra) => scanRootPaths('glob-attrib', [{ absolutePath: workerData, recursive: true, ...extra }]);
+    await writeFile(join(workerData, '.gitignore'), heavy + '\\n');
+    await assert.rejects(
+      scan(),
+      (error) => /work limit/.test(error.message) && /\\.gitignore:1/.test(error.message),
+    );
+    await writeFile(join(workerData, '.gitignore'), '');
+    await assert.rejects(
+      scan({ globs: [heavy] }),
+      (error) => /work limit/.test(error.message) && /globs\\[0\\]/.test(error.message),
+    );
+    await assert.rejects(
+      scan({ insensitiveGlobs: [heavy] }),
+      (error) => /work limit/.test(error.message) && /insensitiveGlobs\\[0\\]/.test(error.message),
+    );
+  `,
+    root,
+    30_000,
+  );
+});

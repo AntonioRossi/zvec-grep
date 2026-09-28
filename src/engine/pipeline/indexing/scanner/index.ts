@@ -2,9 +2,12 @@ import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
   chargeGlobWork,
+  checkActiveRuleWeight,
   checkGlobRuleCount,
+  GlobWorkLimitError,
   globWorkNeedsYield,
   withGlobBudget,
+  withGlobPathBudget,
 } from "../../../utils/glob-budget.js";
 import { compileGlob } from "../../../utils/glob-matcher.js";
 import {
@@ -28,12 +31,16 @@ import { sha256Text } from "../../../utils/hash.js";
 import {
   matchesFileSelection,
   resolveFileTypePatterns,
+  type FileSelection,
   type FileTypePatterns,
 } from "../../../utils/file-selection.js";
 import {
+  globPatternWeight,
   hasPathGlob,
+  normalizePathForMatch,
   normalizePathPattern,
   pathPatternMatches,
+  pathPatternMatchesPrepared,
   pathPatternMightMatchDescendant,
 } from "../../../utils/glob.js";
 import { normalizePath, toDisplayPath } from "../../../utils/path.js";
@@ -131,6 +138,8 @@ type IgnoreRule = {
   directoryOnly: boolean;
   anchored: boolean;
   hasSlash: boolean;
+  source: string;
+  line: number;
 };
 
 type IgnoreMatch = {
@@ -138,6 +147,8 @@ type IgnoreMatch = {
   matchedNegation: boolean;
   matchedRule?: IgnoreRule;
 };
+
+const BUILT_IN_IGNORE_RULE_SOURCE = "built-in ignore rules";
 
 const DEFAULT_IGNORE_RULES: readonly IgnoreRule[] = [
   ...DEFAULT_IGNORED_DIRECTORY_NAMES.map((pattern) => ({
@@ -147,6 +158,8 @@ const DEFAULT_IGNORE_RULES: readonly IgnoreRule[] = [
     directoryOnly: true,
     anchored: false,
     hasSlash: false,
+    source: BUILT_IN_IGNORE_RULE_SOURCE,
+    line: 0,
   })),
   ...DEFAULT_IGNORED_FILE_PATTERNS.map((pattern) => ({
     basePath: "",
@@ -155,6 +168,8 @@ const DEFAULT_IGNORE_RULES: readonly IgnoreRule[] = [
     directoryOnly: false,
     anchored: false,
     hasSlash: false,
+    source: BUILT_IN_IGNORE_RULE_SOURCE,
+    line: 0,
   })),
 ];
 
@@ -256,15 +271,20 @@ async function scanFilePathImpl(
       root.fileTypes,
       root.excludedFileTypes,
     );
+    const acceptable = withGlobPathBudget(
+      relativePath.length,
+      rootFilterWeight(root, fileTypes) + ignoreRulesWeight(rules),
+      () =>
+        pathCanBeScanned(
+          root,
+          relativePath,
+          basename(absolutePath),
+          false,
+          rules,
+        ) && matchesFileSelection(relativePath, root, fileTypes),
+    );
     if (
-      !pathCanBeScanned(
-        root,
-        relativePath,
-        basename(absolutePath),
-        false,
-        rules,
-      ) ||
-      !matchesFileSelection(relativePath, root, fileTypes) ||
+      !acceptable ||
       (await hasExcludedNestedGitAncestor(root, absolutePath, false))
     ) {
       continue;
@@ -324,14 +344,24 @@ async function pathCanAffectIndexImpl(
 
     const relativePath = toDisplayPath(pathFromRoot);
     const rules = await ignoreRulesForDirectory(root, dirname(absolutePath));
+    const pathFileTypes = await resolveFileTypePatterns(
+      root.fileTypes,
+      root.excludedFileTypes,
+    );
+    const acceptable = withGlobPathBudget(
+      relativePath.length,
+      rootFilterWeight(root, pathFileTypes) + ignoreRulesWeight(rules),
+      () =>
+        pathCanBeScanned(
+          root,
+          relativePath,
+          basename(absolutePath),
+          isDirectory,
+          rules,
+        ),
+    );
     if (
-      !pathCanBeScanned(
-        root,
-        relativePath,
-        basename(absolutePath),
-        isDirectory,
-        rules,
-      ) ||
+      !acceptable ||
       (await hasExcludedNestedGitAncestor(root, absolutePath, isDirectory))
     ) {
       continue;
@@ -340,11 +370,7 @@ async function pathCanAffectIndexImpl(
       return true;
     }
 
-    const fileTypes = await resolveFileTypePatterns(
-      root.fileTypes,
-      root.excludedFileTypes,
-    );
-    if (matchesFileSelection(relativePath, root, fileTypes)) {
+    if (matchesFileSelection(relativePath, root, pathFileTypes)) {
       return true;
     }
   }
@@ -396,16 +422,24 @@ async function scanDirectoryPathImpl(
       root.fileTypes,
       root.excludedFileTypes,
     );
+    const staticRuleWeight = rootFilterWeight(root, fileTypes);
+    const directoryAcceptable =
+      !relativePath ||
+      withGlobPathBudget(
+        relativePath.length,
+        staticRuleWeight + ignoreRulesWeight(parentRules),
+        () =>
+          pathCanBeScanned(
+            root,
+            relativePath,
+            basename(absolutePath),
+            true,
+            parentRules,
+          ),
+      );
     if (
-      relativePath &&
-      (!pathCanBeScanned(
-        root,
-        relativePath,
-        basename(absolutePath),
-        true,
-        parentRules,
-      ) ||
-        (await hasExcludedNestedGitAncestor(root, absolutePath, true)))
+      !directoryAcceptable ||
+      (await hasExcludedNestedGitAncestor(root, absolutePath, true))
     ) {
       continue;
     }
@@ -424,6 +458,7 @@ async function scanDirectoryPathImpl(
       diagnostics,
       parentRules,
       fileTypes,
+      staticRuleWeight,
       new Set([rootRealPath, directoryRealPath]),
       depth,
       options.signal,
@@ -555,6 +590,7 @@ async function scanRootPath(
     root.fileTypes,
     root.excludedFileTypes,
   );
+  const staticRuleWeight = rootFilterWeight(root, fileTypes);
   const info = await stat(root.absolutePath).catch(() => null);
 
   if (!info) {
@@ -563,7 +599,12 @@ async function scanRootPath(
 
   if (info.isFile()) {
     const relativePath = basename(root.absolutePath);
-    const file = matchesFileSelection(relativePath, root, fileTypes)
+    const keepRootFile = withGlobPathBudget(
+      relativePath.length,
+      staticRuleWeight,
+      () => matchesFileSelection(relativePath, root, fileTypes),
+    );
+    const file = keepRootFile
       ? await readFileInfo(
           workspaceIndexId,
           root,
@@ -600,11 +641,56 @@ async function scanRootPath(
       ...(await readConfiguredIgnoreRules(root)),
     ],
     fileTypes,
+    staticRuleWeight,
     new Set([rootRealPath]),
     0,
     signal,
     knownFiles,
   );
+}
+
+function ignoreRulesWeight(rules: readonly IgnoreRule[]): number {
+  let weight = 0;
+  for (const rule of rules) {
+    weight += globPatternWeight(rule.pattern);
+  }
+  return weight;
+}
+
+function fileTypesWeight(fileTypes: FileTypePatterns): number {
+  let weight = 0;
+  for (const pattern of fileTypes.include) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of fileTypes.exclude) {
+    weight += globPatternWeight(pattern);
+  }
+  return weight;
+}
+
+function selectionWeight(selection: FileSelection): number {
+  let weight = 0;
+  for (const pattern of selection.globs ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of selection.insensitiveGlobs ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  return weight;
+}
+
+function rootFilterWeight(
+  rootPath: RootPath,
+  fileTypes: FileTypePatterns,
+): number {
+  let weight = selectionWeight(rootPath);
+  for (const pattern of rootPath.include ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of rootPath.exclude ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  return weight + fileTypesWeight(fileTypes);
 }
 
 async function walk(
@@ -615,6 +701,7 @@ async function walk(
   diagnostics: FileScanDiagnostics,
   parentIgnoreRules: readonly IgnoreRule[],
   fileTypes: FileTypePatterns,
+  staticRuleWeight: number,
   visitedDirectories: Set<string>,
   depth: number,
   signal?: AbortSignal,
@@ -629,6 +716,11 @@ async function walk(
       : await readGitIgnoreRules(rootPath, currentPath)),
   ];
   checkGlobRuleCount(ignoreRules.length);
+  const activeWeight = staticRuleWeight + ignoreRulesWeight(ignoreRules);
+  checkActiveRuleWeight(
+    activeWeight,
+    `ignore and filter rules active under ${currentPath}`,
+  );
 
   try {
     entries = await readdir(currentPath, { withFileTypes: true });
@@ -662,18 +754,31 @@ async function walk(
         continue;
       }
 
-      const ignoreMatch = matchIgnoreRules(relativePath, true, ignoreRules);
-      if (
-        HARD_SKIP_HIDDEN_NAMES.has(entry.name) ||
-        matchesRootExcludePatterns(relativePath, rootPath) ||
-        (ignoreMatch.ignored &&
-          !ignoredPathExplicitlyIncluded(
-            relativePath,
-            rootPath,
-            ignoreMatch,
-          )) ||
-        shouldSkipHiddenDirectory(entry.name, relativePath, rootPath)
-      ) {
+      const { skipDirectory } = withGlobPathBudget(
+        relativePath.length,
+        activeWeight,
+        () => {
+          const normalizedPath = normalizePathForMatch(relativePath);
+          const ignoreMatch = matchIgnoreRules(
+            normalizedPath,
+            true,
+            ignoreRules,
+          );
+          return {
+            skipDirectory:
+              HARD_SKIP_HIDDEN_NAMES.has(entry.name) ||
+              matchesRootExcludePatterns(relativePath, rootPath) ||
+              (ignoreMatch.ignored &&
+                !ignoredPathExplicitlyIncluded(
+                  normalizedPath,
+                  rootPath,
+                  ignoreMatch,
+                )) ||
+              shouldSkipHiddenDirectory(entry.name, normalizedPath, rootPath),
+          };
+        },
+      );
+      if (skipDirectory) {
         continue;
       }
 
@@ -697,6 +802,7 @@ async function walk(
         diagnostics,
         ignoreRules,
         fileTypes,
+        staticRuleWeight,
         visitedDirectories,
         depth + 1,
         signal,
@@ -717,23 +823,35 @@ async function walk(
       continue;
     }
 
-    const ignoreMatch = matchIgnoreRules(relativePath, false, ignoreRules);
-    if (
-      ignoreMatch.ignored &&
-      !ignoredPathExplicitlyIncluded(relativePath, rootPath, ignoreMatch)
-    ) {
-      continue;
-    }
+    const keepFile = withGlobPathBudget(
+      relativePath.length,
+      activeWeight,
+      () => {
+        const normalizedPath = normalizePathForMatch(relativePath);
+        const ignoreMatch = matchIgnoreRules(
+          normalizedPath,
+          false,
+          ignoreRules,
+        );
+        if (
+          ignoreMatch.ignored &&
+          !ignoredPathExplicitlyIncluded(normalizedPath, rootPath, ignoreMatch)
+        ) {
+          return false;
+        }
 
-    if (shouldSkipHiddenFile(entry.name, relativePath, rootPath)) {
-      continue;
-    }
+        if (shouldSkipHiddenFile(entry.name, normalizedPath, rootPath)) {
+          return false;
+        }
 
-    if (!matchesRootPatterns(relativePath, rootPath)) {
-      continue;
-    }
+        if (!matchesRootPatterns(normalizedPath, rootPath)) {
+          return false;
+        }
 
-    if (!matchesFileSelection(relativePath, rootPath, fileTypes)) {
+        return matchesFileSelection(normalizedPath, rootPath, fileTypes);
+      },
+    );
+    if (!keepFile) {
       continue;
     }
 
@@ -855,7 +973,7 @@ function parseGitIgnoreRules(
 
   for (const [line, rawLine] of content.split(/\r?\n/).entries()) {
     try {
-      const rule = parseGitIgnoreRule(rawLine, basePath);
+      const rule = parseGitIgnoreRule(rawLine, basePath, source, line + 1);
       if (rule) rules.push(rule);
       checkGlobRuleCount(rules.length);
     } catch (error) {
@@ -869,7 +987,12 @@ function parseGitIgnoreRules(
   return rules;
 }
 
-function parseGitIgnoreRule(line: string, basePath: string): IgnoreRule | null {
+function parseGitIgnoreRule(
+  line: string,
+  basePath: string,
+  source: string,
+  lineNumber: number,
+): IgnoreRule | null {
   let pattern = line.trim();
   if (pattern.length === 0 || pattern.startsWith("#")) {
     return null;
@@ -907,6 +1030,8 @@ function parseGitIgnoreRule(line: string, basePath: string): IgnoreRule | null {
     directoryOnly,
     anchored,
     hasSlash: pattern.includes("/"),
+    source,
+    line: lineNumber,
   };
 }
 
@@ -921,7 +1046,13 @@ function matchIgnoreRules(
   let matchedRule: IgnoreRule | undefined;
 
   for (const rule of rules) {
-    if (!ignoreRuleMatches(rule, relativePath, isDirectory)) {
+    let matches: boolean;
+    try {
+      matches = ignoreRuleMatches(rule, relativePath, isDirectory);
+    } catch (error) {
+      throw ignoreRuleWorkLimitError(rule, error);
+    }
+    if (!matches) {
       continue;
     }
 
@@ -935,6 +1066,26 @@ function matchIgnoreRules(
     matchedNegation,
     matchedRule,
   };
+}
+
+function ignoreRuleWorkLimitError(rule: IgnoreRule, cause: unknown): Error {
+  if (!isGlobWorkLimitFailure(cause)) {
+    return cause as Error;
+  }
+  const preview =
+    rule.pattern.length > 48 ? `${rule.pattern.slice(0, 45)}…` : rule.pattern;
+  const origin = rule.line > 0 ? `${rule.source}:${rule.line}` : rule.source;
+  return new Error(
+    `Glob matching exceeded its work limit at ignore rule ${origin} (pattern '${preview}').`,
+    { cause },
+  );
+}
+
+function isGlobWorkLimitFailure(error: unknown): boolean {
+  return (
+    error instanceof GlobWorkLimitError ||
+    (error instanceof Error && error.message.includes("matching work limit"))
+  );
 }
 
 function ignoredPathExplicitlyIncluded(
@@ -1009,14 +1160,14 @@ function ignoreRuleMatches(
 
   if (rule.directoryOnly) {
     if (rule.anchored || rule.hasSlash) {
-      return pathPatternMatches(rule.pattern, path);
+      return pathPatternMatchesPrepared(rule.pattern, path);
     }
 
     return pathContainsMatchingSegment(path, rule.pattern);
   }
 
   if (rule.anchored || rule.hasSlash) {
-    return pathPatternMatches(rule.pattern, path);
+    return pathPatternMatchesPrepared(rule.pattern, path);
   }
 
   if (isDirectory && pathContainsMatchingSegment(path, rule.pattern)) {
@@ -1049,7 +1200,7 @@ function pathContainsMatchingSegment(path: string, pattern: string): boolean {
 }
 
 function segmentMatches(pattern: string, segment: string): boolean {
-  return pathPatternMatches(pattern, segment);
+  return pathPatternMatchesPrepared(pattern, segment);
 }
 
 function shouldSkipHiddenDirectory(

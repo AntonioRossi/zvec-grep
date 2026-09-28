@@ -3,26 +3,112 @@ import { AsyncLocalStorage } from "node:async_hooks";
 export const MAX_GLOB_PATTERN_CHARS = 4_096;
 export const MAX_GLOB_PATH_CHARS = 32_768;
 export const MAX_GLOB_RULES = 10_000;
+/**
+ * Upper bound on the combined compiled weight of every rule that may be
+ * applied to one candidate path: built-in ignores, ignore-file rules, root
+ * include/exclude patterns, request globs and expanded file types. Unlike the
+ * matcher cache bound, exceeding this rejects the rule set itself.
+ */
+export const MAX_ACTIVE_RULE_WEIGHT = 250_000;
+
+/**
+ * Fixed per-path headroom. Must stay above the matcher's one-million-work
+ * per-match cap so a single admitted pattern can complete (or reject through
+ * its own cap) without tripping the path budget first.
+ */
+const PATH_WORK_BASE = 1_500_000;
+/**
+ * Legitimate matching work for one path grows with the path length times the
+ * compiled weight of the active rules; this multiplier keeps that headroom
+ * while admitted-but-adversarial rule sets remain bounded by the path budget.
+ */
+const PATH_WORK_MULTIPLIER = 4;
+/**
+ * Operation-wide pool for matching work that is not yet covered by per-path
+ * accounting. Per-path budgets take precedence wherever they are established.
+ */
 const MAX_OPERATION_WORK = 100_000_000;
-const operationBudget = new AsyncLocalStorage<{
-  remaining: number;
+
+export class GlobWorkLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GlobWorkLimitError";
+  }
+}
+
+type GlobBudgetStore = {
   sinceYield: number;
-}>();
+  operationRemaining: number;
+  pathRemaining?: number;
+};
+
+const operationBudget = new AsyncLocalStorage<GlobBudgetStore>();
 
 /** Keep concurrent searches/scans independent, and share a budget with nested work. */
 export function withGlobBudget<T>(operation: () => T): T {
   if (operationBudget.getStore()) return operation();
   return operationBudget.run(
-    { remaining: MAX_OPERATION_WORK, sinceYield: 0 },
+    { sinceYield: 0, operationRemaining: MAX_OPERATION_WORK },
     operation,
   );
 }
 
+export function globPathAllowance(
+  pathLength: number,
+  activeRuleWeight: number,
+): number {
+  return (
+    PATH_WORK_BASE + (pathLength + 16) * activeRuleWeight * PATH_WORK_MULTIPLIER
+  );
+}
+
+/**
+ * Charge all rule checks for one candidate path against a shared allowance
+ * sized by that path and the active rule weight. Nested calls restore the
+ * enclosing path budget. Yield and cancellation accounting is unaffected.
+ */
+export function withGlobPathBudget<T>(
+  pathLength: number,
+  activeRuleWeight: number,
+  body: () => T,
+): T {
+  const allowance = globPathAllowance(pathLength, activeRuleWeight);
+  const store = operationBudget.getStore();
+  if (!store) {
+    return operationBudget.run(
+      {
+        sinceYield: 0,
+        operationRemaining: MAX_OPERATION_WORK,
+        pathRemaining: allowance,
+      },
+      body,
+    );
+  }
+  const previous = store.pathRemaining;
+  store.pathRemaining = allowance;
+  try {
+    return body();
+  } finally {
+    store.pathRemaining = previous;
+  }
+}
+
 export function chargeGlobWork(work: number): void {
   const budget = operationBudget.getStore();
-  if (budget) budget.sinceYield += work;
-  if (budget && (budget.remaining -= work) < 0) {
-    throw new Error("Path filtering exceeded its matching work limit.");
+  if (!budget) return;
+  budget.sinceYield += work;
+  if (budget.pathRemaining !== undefined) {
+    if ((budget.pathRemaining -= work) < 0) {
+      throw new GlobWorkLimitError(
+        "Path filtering exceeded its matching work limit.",
+      );
+    }
+    return;
+  }
+  if ((budget.operationRemaining -= work) < 0) {
+    throw new GlobWorkLimitError(
+      "Path filtering exceeded its matching work limit.",
+    );
   }
 }
 
@@ -45,5 +131,13 @@ export function checkGlobLength(value: string, kind: "pattern" | "path"): void {
 export function checkGlobRuleCount(count: number): void {
   if (count > MAX_GLOB_RULES) {
     throw new Error(`Path filtering exceeds the ${MAX_GLOB_RULES}-rule limit.`);
+  }
+}
+
+export function checkActiveRuleWeight(weight: number, context: string): void {
+  if (weight > MAX_ACTIVE_RULE_WEIGHT) {
+    throw new Error(
+      `Path filtering exceeds the ${MAX_ACTIVE_RULE_WEIGHT.toLocaleString("en-US")}-unit active-rule limit for ${context}.`,
+    );
   }
 }

@@ -37,6 +37,52 @@ export function pathPatternMatches(pattern: string, path: string): boolean {
   return pathPatternMatchesWithCase(pattern, path, false);
 }
 
+/**
+ * Match a pre-normalized pattern against a pre-normalized path. Callers that
+ * normalize once per operation (for example parsed ignore rules and one
+ * normalization per candidate path) use this to avoid repeated normalization
+ * charges and work.
+ */
+export function pathPatternMatchesPrepared(
+  normalizedPattern: string,
+  normalizedPath: string,
+  caseInsensitive = false,
+): boolean {
+  if (normalizedPattern.length === 0) {
+    return false;
+  }
+
+  if (hasPathGlob(normalizedPattern)) {
+    return globPatternMatches(
+      normalizedPattern,
+      normalizedPath,
+      caseInsensitive,
+    );
+  }
+
+  const candidate = caseInsensitive
+    ? normalizedPath.toLowerCase()
+    : normalizedPath;
+  const expected = caseInsensitive
+    ? normalizedPattern.toLowerCase()
+    : normalizedPattern;
+  const expectedPrefix = expected.endsWith("/") ? expected : `${expected}/`;
+
+  return candidate === expected || candidate.startsWith(expectedPrefix);
+}
+
+/**
+ * Compiled-weight estimate for one active rule, used for the aggregate
+ * active-rule bound and per-path allowances. Literal patterns never reach the
+ * compiled matcher; charge their raw length instead.
+ */
+export function globPatternWeight(pattern: string): number {
+  if (!hasPathGlob(pattern)) {
+    return pattern.length;
+  }
+  return compileGlob(pattern, false).weight;
+}
+
 export function pathPatternMatchesCaseInsensitive(
   pattern: string,
   path: string,
