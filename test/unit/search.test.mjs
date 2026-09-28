@@ -518,3 +518,28 @@ test("many absolute filters against a long path stay within the budget", async (
   assert.ok(result.hits.length >= 1);
   assert.ok(result.hits.every((hit) => hit.file.id === "file-abs"));
 });
+
+test("oversized glob filters report their field and original index", async () => {
+  const { context } = createFixture();
+  const oversized = "x".repeat(4097);
+  await assert.rejects(
+    searchWorkspaceIndex(
+      { routes: [{ mode: "fts", query: "value" }], globs: [oversized] },
+      context,
+    ),
+    (error) =>
+      /globs\[0\]/.test(error.message) && /4096-character/.test(error.message),
+  );
+  await assert.rejects(
+    searchWorkspaceIndex(
+      {
+        routes: [{ mode: "fts", query: "value" }],
+        insensitiveGlobs: ["ok.ts", oversized],
+      },
+      context,
+    ),
+    (error) =>
+      /insensitiveGlobs\[1\]/.test(error.message) &&
+      /4096-character/.test(error.message),
+  );
+});
