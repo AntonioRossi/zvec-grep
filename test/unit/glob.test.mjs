@@ -376,3 +376,75 @@ test("root include pattern work-limit failures carry their index", async (t) => 
     30_000,
   );
 });
+
+test("brace alternation ignore rules and ordered negation survive the fast paths", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-brace-");
+  await mkdir(join(root, "pkg"), { recursive: true });
+  for (const name of ["a.ts", "b.js", "keep.ts", "c.mjs", "pkg/inner.ts"]) {
+    await writeFile(join(root, name), "x");
+  }
+  await writeFile(join(root, ".gitignore"), "*.{ts,js}\n!keep.ts\n");
+  await inWorker(
+    `
+    const result = await scanRootPaths('glob-brace', [{ absolutePath: workerData, recursive: true }]);
+    assert.deepEqual(result.files.map((f) => f.relativePath).sort(), ['c.mjs', 'keep.ts']);
+  `,
+    root,
+    30_000,
+  );
+});
+
+test("ripgrep-semantics literal globs are charged their compiled weight", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-weight-");
+  await writeFile(join(root, "f.ts"), "x");
+  await inWorker(
+    `
+    const heavy = Array.from({ length: 128 }, () => 'a'.repeat(1002));
+    await assert.rejects(
+      () => scanRootPaths('glob-weight', [{ absolutePath: workerData, recursive: true, globs: heavy }]),
+      /active-rule limit/,
+    );
+    const moderate = heavy.slice(0, 100);
+    const result = await scanRootPaths('glob-weight', [{ absolutePath: workerData, recursive: true, globs: moderate }]);
+    assert.equal(result.files.length, 0);
+    const kept = await scanRootPaths('glob-weight', [{ absolutePath: workerData, recursive: true, fileTypes: ['ts'] }]);
+    assert.deepEqual(kept.files.map((f) => f.relativePath), ['f.ts']);
+  `,
+    root,
+    60_000,
+  );
+});
+
+test("cancellation aborts a scan under load and overlapping failures spare healthy scans", async (t) => {
+  const load = await createTemporaryDirectory(t, "zvec-glob-cancel-load-");
+  const healthy = await createTemporaryDirectory(t, "zvec-glob-cancel-ok-");
+  await writeFile(join(healthy, "ok.ts"), "x");
+  await inWorker(
+    `
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const dir = join(workerData, 'bulk');
+    await mkdir(dir);
+    for (let i = 0; i < 4000; i++) {
+      await writeFile(join(dir, 'f' + i + '.ts'), 'x');
+    }
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 30);
+    await assert.rejects(
+      () => scanRootPaths('cancel', [{ absolutePath: workerData, recursive: true }], { signal: controller.signal }),
+      /cancel|abort/i,
+    );
+    const heavy = Array.from({ length: 128 }, () => 'a'.repeat(1002));
+    const healthyRoot = ${JSON.stringify(healthy)};
+    const [failed, ok] = await Promise.allSettled([
+      scanRootPaths('cancel', [{ absolutePath: workerData, recursive: true, globs: heavy }]),
+      scanRootPaths('cancel', [{ absolutePath: healthyRoot, recursive: true }]),
+    ]);
+    assert.equal(failed.status, 'rejected');
+    assert.equal(ok.status, 'fulfilled');
+    assert.equal(ok.value.files.length, 1);
+  `,
+    load,
+    120_000,
+  );
+});

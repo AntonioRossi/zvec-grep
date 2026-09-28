@@ -43,6 +43,7 @@ import {
   pathPatternMatches,
   pathPatternMatchesPrepared,
   pathPatternMightMatchDescendant,
+  ripgrepPatternWeight,
 } from "../../../utils/glob.js";
 import { normalizePath, toDisplayPath } from "../../../utils/path.js";
 import {
@@ -676,11 +677,11 @@ function ignoreRulesWeight(rules: readonly IgnoreRule[]): number {
 
 function fileTypesWeight(fileTypes: FileTypePatterns): number {
   let weight = 0;
-  for (const pattern of fileTypes.include) {
-    weight += globPatternWeight(pattern);
+  for (const entry of fileTypes.include) {
+    weight += ripgrepPatternWeight(entry.pattern);
   }
-  for (const pattern of fileTypes.exclude) {
-    weight += globPatternWeight(pattern);
+  for (const entry of fileTypes.exclude) {
+    weight += ripgrepPatternWeight(entry.pattern);
   }
   return weight;
 }
@@ -688,10 +689,10 @@ function fileTypesWeight(fileTypes: FileTypePatterns): number {
 function selectionWeight(selection: FileSelection): number {
   let weight = 0;
   for (const pattern of selection.globs ?? []) {
-    weight += globPatternWeight(pattern);
+    weight += ripgrepPatternWeight(pattern);
   }
   for (const pattern of selection.insensitiveGlobs ?? []) {
-    weight += globPatternWeight(pattern);
+    weight += ripgrepPatternWeight(pattern, true);
   }
   return weight;
 }
@@ -1217,22 +1218,29 @@ function pathContainsMatchingSegment(path: string, pattern: string): boolean {
 
 function segmentMatches(pattern: string, segment: string): boolean {
   // Equivalent fast paths, proven against the compiled matcher's semantics:
-  // - a pattern without glob metacharacters matches a path segment (which
-  //   never contains "/") only by exact equality;
-  // - "*<literal>" matches a segment iff it ends with the literal suffix,
-  //   because a single "*" spans only non-separator characters.
-  // Patterns containing any other metacharacter keep the compiled matcher.
-  if (!hasPathGlob(pattern)) {
+  // - a pattern without glob syntax (including braces, which the matcher
+  //   treats as alternation) matches a path segment — which never contains
+  //   "/" — only by exact equality;
+  // - "*<literal>" with a brace-free, metacharacter-free suffix matches a
+  //   segment iff it ends with that literal suffix, because a single "*"
+  //   spans only non-separator characters.
+  // Every other pattern keeps the compiled matcher.
+  if (isLiteralGlobText(pattern)) {
     return pattern === segment;
   }
-  if (
-    pattern.startsWith("*") &&
-    pattern.length > 1 &&
-    !hasPathGlob(pattern.slice(1))
-  ) {
+  if (pattern.startsWith("*") && isLiteralGlobText(pattern.slice(1))) {
     return segment.endsWith(pattern.slice(1));
   }
   return pathPatternMatchesPrepared(pattern, segment);
+}
+
+function isLiteralGlobText(value: string): boolean {
+  return (
+    !value.includes("*") &&
+    !value.includes("?") &&
+    !value.includes("[") &&
+    !value.includes("{")
+  );
 }
 
 function shouldSkipHiddenDirectory(
