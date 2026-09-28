@@ -3,7 +3,7 @@ import { dirname, relative } from "node:path";
 import { EngineError } from "../../errors.js";
 import type { RootPath } from "../../types.js";
 import { pathPatternMatches } from "../../utils/glob.js";
-import { labeledGlobWorkError } from "../../utils/glob-budget.js";
+import { labeledGlobError } from "../../utils/glob-budget.js";
 import {
   isPathInside,
   normalizePath,
@@ -239,7 +239,7 @@ function matchesAny(
     try {
       return patternMatches(pattern, relativePath);
     } catch (error) {
-      throw labeledGlobWorkError(`${label}[${index}]`, pattern, error);
+      throw labeledGlobError(`${label}[${index}]`, pattern, error);
     }
   });
 }

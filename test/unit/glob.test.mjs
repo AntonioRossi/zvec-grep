@@ -448,3 +448,26 @@ test("cancellation aborts a scan under load and overlapping failures spare healt
     120_000,
   );
 });
+
+test("scanner filter families label compilation failures with their origin", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-origin-");
+  await writeFile(join(root, "f.ts"), "x");
+  await inWorker(
+    `
+    await assert.rejects(
+      () => scanRootPaths('origin', [{ absolutePath: workerData, recursive: true, include: ['[z-a]'] }]),
+      (error) => /root include\\[0\\]/.test(error.message) && /z-a/.test(error.message),
+    );
+    await assert.rejects(
+      () => scanRootPaths('origin', [{ absolutePath: workerData, recursive: true, globs: ['', '[z-a]'] }]),
+      (error) => /globs\\[1\\]/.test(error.message),
+    );
+    await assert.rejects(
+      () => scanRootPaths('origin', [{ absolutePath: workerData, recursive: true, insensitiveGlobs: ['[z-a]'] }]),
+      (error) => /insensitiveGlobs\\[0\\]/.test(error.message),
+    );
+  `,
+    root,
+    30_000,
+  );
+});

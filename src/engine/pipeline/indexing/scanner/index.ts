@@ -4,7 +4,7 @@ import {
   chargeGlobOverhead,
   checkActiveRuleWeight,
   checkGlobRuleCount,
-  GlobWorkLimitError,
+  labeledGlobError,
   globWorkNeedsYield,
   withGlobBudget,
   withGlobOverheadOnly,
@@ -670,29 +670,33 @@ function admitScanRules(weight: number, rootPath: RootPath): number {
 function ignoreRulesWeight(rules: readonly IgnoreRule[]): number {
   let weight = 0;
   for (const rule of rules) {
-    weight += globPatternWeight(rule.pattern);
+    weight += globPatternWeight(rule.pattern, ignoreRuleLabel(rule));
   }
   return weight;
+}
+
+function ignoreRuleLabel(rule: IgnoreRule): string {
+  return `ignore rule ${rule.line > 0 ? `${rule.source}:${rule.line}` : rule.source}`;
 }
 
 function fileTypesWeight(fileTypes: FileTypePatterns): number {
   let weight = 0;
   for (const entry of fileTypes.include) {
-    weight += ripgrepPatternWeight(entry.pattern);
+    weight += ripgrepPatternWeight(entry.pattern, false, entry.origin);
   }
   for (const entry of fileTypes.exclude) {
-    weight += ripgrepPatternWeight(entry.pattern);
+    weight += ripgrepPatternWeight(entry.pattern, false, entry.origin);
   }
   return weight;
 }
 
 function selectionWeight(selection: FileSelection): number {
   let weight = 0;
-  for (const pattern of selection.globs ?? []) {
-    weight += ripgrepPatternWeight(pattern);
+  for (const [index, pattern] of (selection.globs ?? []).entries()) {
+    weight += ripgrepPatternWeight(pattern, false, `globs[${index}]`);
   }
-  for (const pattern of selection.insensitiveGlobs ?? []) {
-    weight += ripgrepPatternWeight(pattern, true);
+  for (const [index, pattern] of (selection.insensitiveGlobs ?? []).entries()) {
+    weight += ripgrepPatternWeight(pattern, true, `insensitiveGlobs[${index}]`);
   }
   return weight;
 }
@@ -702,11 +706,11 @@ function rootFilterWeight(
   fileTypes: FileTypePatterns,
 ): number {
   let weight = selectionWeight(rootPath);
-  for (const pattern of rootPath.include ?? []) {
-    weight += globPatternWeight(pattern);
+  for (const [index, pattern] of (rootPath.include ?? []).entries()) {
+    weight += globPatternWeight(pattern, `root include[${index}]`);
   }
-  for (const pattern of rootPath.exclude ?? []) {
-    weight += globPatternWeight(pattern);
+  for (const [index, pattern] of (rootPath.exclude ?? []).entries()) {
+    weight += globPatternWeight(pattern, `root exclude[${index}]`);
   }
   return weight + fileTypesWeight(fileTypes);
 }
@@ -1067,7 +1071,7 @@ function matchIgnoreRules(
     try {
       matches = ignoreRuleMatches(rule, relativePath, isDirectory);
     } catch (error) {
-      throw ignoreRuleWorkLimitError(rule, error);
+      throw ignoreRuleError(rule, error);
     }
     if (!matches) {
       continue;
@@ -1085,24 +1089,9 @@ function matchIgnoreRules(
   };
 }
 
-function ignoreRuleWorkLimitError(rule: IgnoreRule, cause: unknown): Error {
-  if (!isGlobWorkLimitFailure(cause)) {
-    return cause as Error;
-  }
-  const preview =
-    rule.pattern.length > 48 ? `${rule.pattern.slice(0, 45)}…` : rule.pattern;
+function ignoreRuleError(rule: IgnoreRule, cause: unknown): Error {
   const origin = rule.line > 0 ? `${rule.source}:${rule.line}` : rule.source;
-  return new Error(
-    `Glob matching exceeded its work limit at ignore rule ${origin} (pattern '${preview}').`,
-    { cause },
-  );
-}
-
-function isGlobWorkLimitFailure(error: unknown): boolean {
-  return (
-    error instanceof GlobWorkLimitError ||
-    (error instanceof Error && error.message.includes("matching work limit"))
-  );
+  return labeledGlobError(`ignore rule ${origin}`, rule.pattern, cause);
 }
 
 function ignoredPathExplicitlyIncluded(
