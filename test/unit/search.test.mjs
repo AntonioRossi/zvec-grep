@@ -504,7 +504,10 @@ test("many absolute filters against a long path stay within the budget", async (
     storage,
     embeddingModel: new FakeEmbeddingModel(),
   };
-  const absoluteFilters = Array.from({ length: 128 }, () => "/**");
+  const absoluteFilters = [
+    ...Array.from({ length: 4999 }, () => "/nomatch"),
+    "/**",
+  ];
   const result = await searchWorkspaceIndex(
     {
       routes: [{ mode: "fts", query: "value" }],
