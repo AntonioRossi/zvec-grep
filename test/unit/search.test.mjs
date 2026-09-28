@@ -369,3 +369,63 @@ test("entity and file diagnosis handle missing targets and fallback entity selec
     null,
   );
 });
+
+test("absolute path filters charge the budget from the matched path representation", async () => {
+  const longDir = `/${"d".repeat(3000)}`;
+  const files = [
+    { ...file("file-abs", "f.ts"), absolutePath: `${longDir}/f.ts` },
+    file("file-rel", "src/g.ts"),
+  ];
+  const storage = {
+    listFiles: () => files,
+    getFileById: (id) => files.find((item) => item.id === id) ?? null,
+    searchFts: (query, limit, filter) =>
+      files
+        .filter((item) => !filter?.fileIds || filter.fileIds.includes(item.id))
+        .map((item, index) => ({
+          fragment: {
+            id: `frag-${item.id}`,
+            fileId: item.id,
+            range: { kind: "text", startLine: 1, endLine: 2 },
+            content: "value",
+            metadata: {
+              symbolName: "Symbol",
+              symbolType: "function_declaration",
+            },
+          },
+          file: item,
+          path: "fts",
+          score: 1 - index * 0.1,
+        })),
+    searchVector: () => [],
+    optimize: () => {},
+    close: () => {},
+  };
+  const context = {
+    workspaceIndex: {
+      id: "wi",
+      name: "docs",
+      path: "/tmp/index",
+      rootPaths: [{ absolutePath: longDir, recursive: true }],
+      createdTime: 1,
+      updatedTime: 1,
+    },
+    storage,
+    embeddingModel: new FakeEmbeddingModel(),
+  };
+  const absolute = await searchWorkspaceIndex(
+    {
+      routes: [{ mode: "fts", query: "value" }],
+      includePaths: [`${longDir}/**`],
+    },
+    context,
+  );
+  assert.ok(absolute.hits.length >= 1);
+  assert.ok(absolute.hits.every((hit) => hit.file.id === "file-abs"));
+  const relative = await searchWorkspaceIndex(
+    { routes: [{ mode: "fts", query: "value" }], includePaths: ["f.ts"] },
+    context,
+  );
+  assert.ok(relative.hits.length >= 1);
+  assert.ok(relative.hits.every((hit) => hit.file.id === "file-abs"));
+});

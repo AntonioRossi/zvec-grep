@@ -41,6 +41,7 @@ import {
   normalizePathForMatch,
   normalizePathPattern,
   pathPatternMatches,
+  ripgrepPatternWeight,
 } from "../../utils/glob.js";
 import {
   matchesFileSelection,
@@ -388,7 +389,19 @@ function normalizePathFilters(
       });
     }
 
-    const pattern = normalizePathFilterPattern(item);
+    let pattern: string;
+    try {
+      pattern = normalizePathFilterPattern(item);
+    } catch (error) {
+      throw new EngineError(
+        `Search path filter ${field}[${index}] is invalid: ${error instanceof Error ? error.message : String(error)}`,
+        {
+          code: "ZVEC_GREP.ENGINE.SEARCH_PLAN.INVALID_PATH_FILTER",
+          context: `field=${field} index=${index}`,
+          cause: error,
+        },
+      );
+    }
     if (pattern.length > 0) {
       patterns.push(pattern);
     }
@@ -1093,12 +1106,15 @@ async function resolveFilteredFileIds(
       fileTypePatterns.include.length +
       fileTypePatterns.exclude.length,
   );
-  const includeMatchers = (plan.includePaths ?? []).map((pattern, index) =>
-    compilePathFilter(pattern, `includePaths[${index}]`),
-  );
-  const excludeMatchers = (plan.excludePaths ?? []).map((pattern, index) =>
-    compilePathFilter(pattern, `excludePaths[${index}]`),
-  );
+  let matchesAbsolutePath = false;
+  const includeMatchers = (plan.includePaths ?? []).map((pattern, index) => {
+    if (isAbsolutePathPattern(pattern)) matchesAbsolutePath = true;
+    return compilePathFilter(pattern, `includePaths[${index}]`);
+  });
+  const excludeMatchers = (plan.excludePaths ?? []).map((pattern, index) => {
+    if (isAbsolutePathPattern(pattern)) matchesAbsolutePath = true;
+    return compilePathFilter(pattern, `excludePaths[${index}]`);
+  });
   const activeWeight = searchFilterWeight(plan, fileTypePatterns);
   const hasModifiedFilter =
     plan.modifiedAfter !== undefined || plan.modifiedBefore !== undefined;
@@ -1122,8 +1138,14 @@ async function resolveFilteredFileIds(
     if (index > 0 && (index % 128 === 0 || globWorkNeedsYield()))
       await yieldToEventLoop();
     const file = files[index];
+    // Charge the allowance from the path representation actually matched:
+    // absolute-pattern filters match file.absolutePath, which can be far
+    // longer than the relative name.
+    const budgetPathLength = matchesAbsolutePath
+      ? Math.max(file.relativePath.length, file.absolutePath.length)
+      : file.relativePath.length;
     const keep = withGlobPathBudget(
-      file.relativePath.length,
+      budgetPathLength,
       activeWeight,
       () =>
         (includeMatchers.length === 0 ||
@@ -1151,16 +1173,16 @@ function searchFilterWeight(
     weight += globPatternWeight(pattern);
   }
   for (const pattern of plan.globs ?? []) {
-    weight += globPatternWeight(pattern);
+    weight += ripgrepPatternWeight(pattern);
   }
   for (const pattern of plan.insensitiveGlobs ?? []) {
-    weight += globPatternWeight(pattern);
+    weight += ripgrepPatternWeight(pattern, true);
   }
-  for (const pattern of fileTypePatterns.include) {
-    weight += globPatternWeight(pattern);
+  for (const entry of fileTypePatterns.include) {
+    weight += ripgrepPatternWeight(entry.pattern);
   }
-  for (const pattern of fileTypePatterns.exclude) {
-    weight += globPatternWeight(pattern);
+  for (const entry of fileTypePatterns.exclude) {
+    weight += ripgrepPatternWeight(entry.pattern);
   }
   checkActiveRuleWeight(weight, "active search filters");
   return weight;

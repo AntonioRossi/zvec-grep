@@ -12,9 +12,15 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+export type FileTypePattern = {
+  pattern: string;
+  /** Request field and type name this pattern was expanded from. */
+  origin: string;
+};
+
 export type FileTypePatterns = {
-  include: readonly string[];
-  exclude: readonly string[];
+  include: readonly FileTypePattern[];
+  exclude: readonly FileTypePattern[];
 };
 
 export type FileSelection = {
@@ -61,8 +67,8 @@ export async function resolveFileTypePatterns(
 
   const types = await ripgrepTypeMap();
   return {
-    include: resolveTypeNames(includedTypes, types),
-    exclude: resolveTypeNames(excludedTypes, types),
+    include: resolveTypeNames(includedTypes, types, "fileTypes"),
+    exclude: resolveTypeNames(excludedTypes, types, "excludedFileTypes"),
   };
 }
 
@@ -80,11 +86,11 @@ export function matchesFileSelection(
   const includedByGlob = matchesOrderedGlobs(path, selection);
   const includedByType =
     types.include.length === 0 ||
-    types.include.some((glob, index) =>
-      applyLabeledPattern(`types.include[${index}]`, glob, path, false),
+    types.include.some((entry) =>
+      applyLabeledPattern(entry.origin, entry.pattern, path, false),
     );
-  const excludedByType = types.exclude.some((glob, index) =>
-    applyLabeledPattern(`types.exclude[${index}]`, glob, path, false),
+  const excludedByType = types.exclude.some((entry) =>
+    applyLabeledPattern(entry.origin, entry.pattern, path, false),
   );
 
   return includedByGlob && includedByType && !excludedByType;
@@ -149,15 +155,17 @@ function matchesOrderedGlobs(path: string, selection: FileSelection): boolean {
 function resolveTypeNames(
   names: readonly string[] | undefined,
   types: ReadonlyMap<string, readonly string[]>,
-): string[] {
-  const patterns: string[] = [];
+  originField: string,
+): FileTypePattern[] {
+  const patterns: FileTypePattern[] = [];
   for (const rawName of names ?? []) {
     const name = rawName.trim().toLowerCase();
     if (!name) {
       continue;
     }
+    const origin = `${originField} "${rawName}"`;
     if (name === "all") {
-      patterns.push("**");
+      patterns.push({ pattern: "**", origin });
       continue;
     }
     const typeName = resolveRipgrepTypeName(name, types);
@@ -165,9 +173,16 @@ function resolveTypeNames(
     if (!typePatterns) {
       throw new Error(`Unknown ripgrep file type: ${rawName}`);
     }
-    patterns.push(...typePatterns);
+    for (const pattern of typePatterns) {
+      patterns.push({ pattern, origin });
+    }
   }
-  return [...new Set(patterns)];
+  const seen = new Set<string>();
+  return patterns.filter((entry) => {
+    if (seen.has(entry.pattern)) return false;
+    seen.add(entry.pattern);
+    return true;
+  });
 }
 
 function resolveRipgrepTypeName(

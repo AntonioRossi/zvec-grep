@@ -74,13 +74,26 @@ export function pathPatternMatchesPrepared(
 /**
  * Compiled-weight estimate for one active rule, used for the aggregate
  * active-rule bound and per-path allowances. Literal patterns never reach the
- * compiled matcher; charge their raw length instead.
+ * compiled matcher under path-prefix semantics; charge their raw length instead.
  */
 export function globPatternWeight(pattern: string): number {
   if (!hasPathGlob(pattern)) {
     return pattern.length;
   }
   return compileGlob(pattern, false).weight;
+}
+
+/**
+ * Compiled weight for a pattern applied with ripgrep glob semantics, which
+ * always compiles the matcher — literal patterns included — so their weight
+ * is the compiled matcher's, not the raw pattern length. Case-insensitive
+ * patterns must charge the case-insensitive compilation.
+ */
+export function ripgrepPatternWeight(
+  pattern: string,
+  caseInsensitive = false,
+): number {
+  return compileGlob(pattern, caseInsensitive).weight;
 }
 
 export function pathPatternMatchesCaseInsensitive(
