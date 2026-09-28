@@ -205,3 +205,56 @@ test("match-time work-limit failures identify the offending ignore rule and requ
     30_000,
   );
 });
+
+test("oversized active rule sets reject on every scanner route", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-admission-");
+  const heavy = "a".repeat(4090);
+  const file = join(root, "f.ts");
+  await writeFile(file, "export const a = 1;\n");
+  await inWorker(
+    `
+    const include = Array.from({ length: 62 }, () => ${JSON.stringify(heavy)});
+    const { scanFilePath, pathCanAffectIndex } = await import(${JSON.stringify(new URL("../../dist/engine/pipeline/indexing/scanner/index.js", import.meta.url).href)});
+    await assert.rejects(
+      () => scanRootPaths('adm', [{ absolutePath: workerData, recursive: true, include }]),
+      /active-rule limit/,
+    );
+    await assert.rejects(
+      () => scanRootPaths('adm', [{ absolutePath: ${JSON.stringify(file)}, recursive: false, include }]),
+      /active-rule limit/,
+    );
+    await assert.rejects(
+      () => scanFilePath('adm', [{ absolutePath: workerData, recursive: true, include }], ${JSON.stringify(file)}),
+      /active-rule limit/,
+    );
+    await assert.rejects(
+      () => pathCanAffectIndex([{ absolutePath: workerData, recursive: true, include }], ${JSON.stringify(file)}, false),
+      /active-rule limit/,
+    );
+  `,
+    root,
+    60_000,
+  );
+});
+
+test("scanner loading does not debit the matching pool", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-load-");
+  await inWorker(
+    `
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const comment = '#'.repeat(1_000_000) + '\\n';
+    let dir = workerData;
+    for (let i = 0; i < 101; i++) {
+      dir = join(dir, 'd' + i);
+      await mkdir(dir);
+      await writeFile(join(dir, '.gitignore'), comment);
+    }
+    await writeFile(join(dir, 'file.ts'), 'export const a = 1;\\n');
+    const result = await scanRootPaths('glob-load', [{ absolutePath: workerData, recursive: true }]);
+    assert.equal(result.files.length, 1);
+  `,
+    root,
+    240_000,
+  );
+});

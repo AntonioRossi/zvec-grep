@@ -1,12 +1,13 @@
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
-  chargeGlobWork,
+  chargeGlobOverhead,
   checkActiveRuleWeight,
   checkGlobRuleCount,
   GlobWorkLimitError,
   globWorkNeedsYield,
   withGlobBudget,
+  withGlobOverheadOnly,
   withGlobPathBudget,
 } from "../../../utils/glob-budget.js";
 import { compileGlob } from "../../../utils/glob-matcher.js";
@@ -273,7 +274,10 @@ async function scanFilePathImpl(
     );
     const acceptable = withGlobPathBudget(
       relativePath.length,
-      rootFilterWeight(root, fileTypes) + ignoreRulesWeight(rules),
+      admitScanRules(
+        rootFilterWeight(root, fileTypes) + ignoreRulesWeight(rules),
+        root,
+      ),
       () =>
         pathCanBeScanned(
           root,
@@ -350,7 +354,10 @@ async function pathCanAffectIndexImpl(
     );
     const acceptable = withGlobPathBudget(
       relativePath.length,
-      rootFilterWeight(root, pathFileTypes) + ignoreRulesWeight(rules),
+      admitScanRules(
+        rootFilterWeight(root, pathFileTypes) + ignoreRulesWeight(rules),
+        root,
+      ),
       () =>
         pathCanBeScanned(
           root,
@@ -358,7 +365,9 @@ async function pathCanAffectIndexImpl(
           basename(absolutePath),
           isDirectory,
           rules,
-        ),
+        ) &&
+        (isDirectory ||
+          matchesFileSelection(relativePath, root, pathFileTypes)),
     );
     if (
       !acceptable ||
@@ -366,13 +375,7 @@ async function pathCanAffectIndexImpl(
     ) {
       continue;
     }
-    if (isDirectory) {
-      return true;
-    }
-
-    if (matchesFileSelection(relativePath, root, pathFileTypes)) {
-      return true;
-    }
+    return true;
   }
   return false;
 }
@@ -422,12 +425,15 @@ async function scanDirectoryPathImpl(
       root.fileTypes,
       root.excludedFileTypes,
     );
-    const staticRuleWeight = rootFilterWeight(root, fileTypes);
+    const staticRuleWeight = admitScanRules(
+      rootFilterWeight(root, fileTypes),
+      root,
+    );
     const directoryAcceptable =
       !relativePath ||
       withGlobPathBudget(
         relativePath.length,
-        staticRuleWeight + ignoreRulesWeight(parentRules),
+        admitScanRules(staticRuleWeight + ignoreRulesWeight(parentRules), root),
         () =>
           pathCanBeScanned(
             root,
@@ -590,7 +596,10 @@ async function scanRootPath(
     root.fileTypes,
     root.excludedFileTypes,
   );
-  const staticRuleWeight = rootFilterWeight(root, fileTypes);
+  const staticRuleWeight = admitScanRules(
+    rootFilterWeight(root, fileTypes),
+    root,
+  );
   const info = await stat(root.absolutePath).catch(() => null);
 
   if (!info) {
@@ -647,6 +656,14 @@ async function scanRootPath(
     signal,
     knownFiles,
   );
+}
+
+function admitScanRules(weight: number, rootPath: RootPath): number {
+  checkActiveRuleWeight(
+    weight,
+    `active ignore and filter rules for ${rootPath.absolutePath}`,
+  );
+  return weight;
 }
 
 function ignoreRulesWeight(rules: readonly IgnoreRule[]): number {
@@ -716,10 +733,9 @@ async function walk(
       : await readGitIgnoreRules(rootPath, currentPath)),
   ];
   checkGlobRuleCount(ignoreRules.length);
-  const activeWeight = staticRuleWeight + ignoreRulesWeight(ignoreRules);
-  checkActiveRuleWeight(
-    activeWeight,
-    `ignore and filter rules active under ${currentPath}`,
+  const activeWeight = admitScanRules(
+    staticRuleWeight + ignoreRulesWeight(ignoreRules),
+    rootPath,
   );
 
   try {
@@ -952,7 +968,7 @@ async function readIgnoreFile(
       const { bytesRead } = await handle.read(buffer);
       if (bytesRead === 0) return Buffer.concat(chunks).toString("utf8");
       size += bytesRead;
-      chargeGlobWork(bytesRead);
+      chargeGlobOverhead(bytesRead);
       if (size > MAX_IGNORE_FILE_BYTES)
         throw new Error(
           `Ignore file exceeds the ${MAX_IGNORE_FILE_BYTES}-byte limit: ${path}`,
@@ -1014,7 +1030,7 @@ function parseGitIgnoreRule(
   pattern = directoryOnly ? pattern.replace(/\/+$/, "") : pattern;
   const anchored = pattern.startsWith("/");
   pattern = anchored ? pattern.replace(/^\/+/, "") : pattern;
-  pattern = normalizePathPattern(pattern);
+  pattern = withGlobOverheadOnly(() => normalizePathPattern(pattern));
 
   if (pattern.length === 0) {
     return null;

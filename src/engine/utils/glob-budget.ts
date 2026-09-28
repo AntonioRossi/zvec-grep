@@ -40,6 +40,7 @@ type GlobBudgetStore = {
   sinceYield: number;
   operationRemaining: number;
   pathRemaining?: number;
+  overheadOnly?: boolean;
 };
 
 const operationBudget = new AsyncLocalStorage<GlobBudgetStore>();
@@ -93,10 +94,38 @@ export function withGlobPathBudget<T>(
   }
 }
 
+/**
+ * Loading and compilation work (ignore-file reads, parse-time normalization
+ * and validation, matcher compilation): counted for cooperative yielding
+ * only, never debited from the operation pool or a path allowance. Bounded
+ * by the per-input limits and active-rule admission instead.
+ */
+export function chargeGlobOverhead(work: number): void {
+  const budget = operationBudget.getStore();
+  if (budget) budget.sinceYield += work;
+}
+
+/**
+ * Run rule loading/parsing with pool debits suspended; charges inside count
+ * for yielding only. Per-candidate matching keeps its normal accounting.
+ */
+export function withGlobOverheadOnly<T>(body: () => T): T {
+  const store = operationBudget.getStore();
+  if (!store) return body();
+  const previous = store.overheadOnly;
+  store.overheadOnly = true;
+  try {
+    return body();
+  } finally {
+    store.overheadOnly = previous;
+  }
+}
+
 export function chargeGlobWork(work: number): void {
   const budget = operationBudget.getStore();
   if (!budget) return;
   budget.sinceYield += work;
+  if (budget.overheadOnly) return;
   if (budget.pathRemaining !== undefined) {
     if ((budget.pathRemaining -= work) < 0) {
       throw new GlobWorkLimitError(

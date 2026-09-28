@@ -1,4 +1,8 @@
-import { chargeGlobWork, checkGlobLength } from "./glob-budget.js";
+import {
+  chargeGlobOverhead,
+  chargeGlobWork,
+  checkGlobLength,
+} from "./glob-budget.js";
 
 type State =
   | { kind: "accept" }
@@ -49,7 +53,7 @@ export function compileGlob(
         `Glob pattern exceeds the ${MAX_NESTING}-level nesting limit.`,
       );
     }
-    chargeGlobWork(value.length);
+    chargeGlobOverhead(value.length);
     const alternativesByStart = findAlternatives(value);
     const closingBrackets = new Int32Array(value.length + 1);
     closingBrackets[value.length] = -1;
