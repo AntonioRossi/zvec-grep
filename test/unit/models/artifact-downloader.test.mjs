@@ -295,6 +295,11 @@ test("never removes an artifact destination changed by another writer", async (t
   const concurrentBytes = Buffer.alloc(bytes.byteLength, 121);
   await new Promise((resolve) => setTimeout(resolve, 2));
   await writeFile(destination, concurrentBytes);
+  // A sleep cannot guarantee an mtime change (timestamp granularity and ms
+  // truncation), so the concurrent writer sets its mtime explicitly; the
+  // destination stat recorded before streaming must then mismatch.
+  const distinct = new Date(Date.now() + 60_000);
+  await utimes(destination, distinct, distinct);
   releaseBody();
 
   await assert.rejects(resolution, (error) => {
