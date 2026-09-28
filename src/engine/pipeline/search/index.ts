@@ -4,7 +4,7 @@ import {
   checkGlobLength,
   checkGlobRuleCount,
   globWorkNeedsYield,
-  labeledGlobWorkError,
+  labeledGlobError,
   withGlobBudget,
   withGlobPathBudget,
 } from "../../utils/glob-budget.js";
@@ -303,11 +303,21 @@ function validateSearchPlan(plan: SearchPlan): ResolvedSearchPlan {
     );
   }
 
+  const includeFilters = normalizePathFilters(
+    plan.includePaths,
+    "includePaths",
+  );
+  const excludeFilters = normalizePathFilters(
+    plan.excludePaths,
+    "excludePaths",
+  );
   return {
     ...plan,
     routes,
-    includePaths: normalizePathFilters(plan.includePaths, "includePaths"),
-    excludePaths: normalizePathFilters(plan.excludePaths, "excludePaths"),
+    includePaths: includeFilters.patterns,
+    excludePaths: excludeFilters.patterns,
+    includePathOrigins: includeFilters.origins,
+    excludePathOrigins: excludeFilters.origins,
     globs: normalizeStringFilters(plan.globs, "globs"),
     insensitiveGlobs: normalizeStringFilters(
       plan.insensitiveGlobs,
@@ -366,9 +376,9 @@ function requireEmbeddingModel(
 function normalizePathFilters(
   value: readonly string[] | undefined,
   field: "includePaths" | "excludePaths",
-): string[] | undefined {
+): { patterns: string[] | undefined; origins: number[] | undefined } {
   if (value === undefined) {
-    return undefined;
+    return { patterns: undefined, origins: undefined };
   }
 
   if (!Array.isArray(value)) {
@@ -380,6 +390,9 @@ function normalizePathFilters(
 
   checkGlobRuleCount(value.length);
   const patterns: string[] = [];
+  // Original request positions of the retained patterns, so labels report
+  // the user's indices even when empty entries are dropped.
+  const origins: number[] = [];
 
   for (const [index, item] of value.entries()) {
     if (typeof item !== "string") {
@@ -404,10 +417,13 @@ function normalizePathFilters(
     }
     if (pattern.length > 0) {
       patterns.push(pattern);
+      origins.push(index);
     }
   }
 
-  return patterns.length > 0 ? patterns : undefined;
+  return patterns.length > 0
+    ? { patterns, origins }
+    : { patterns: undefined, origins: undefined };
 }
 
 function normalizeStringFilters(
@@ -1107,13 +1123,23 @@ async function resolveFilteredFileIds(
       fileTypePatterns.exclude.length,
   );
   let matchesAbsolutePath = false;
+  const includeOriginOf = (index: number) =>
+    plan.includePathOrigins?.[index] ?? index;
+  const excludeOriginOf = (index: number) =>
+    plan.excludePathOrigins?.[index] ?? index;
   const includeMatchers = (plan.includePaths ?? []).map((pattern, index) => {
     if (isAbsolutePathPattern(pattern)) matchesAbsolutePath = true;
-    return compilePathFilter(pattern, `includePaths[${index}]`);
+    return compilePathFilter(
+      pattern,
+      `includePaths[${includeOriginOf(index)}]`,
+    );
   });
   const excludeMatchers = (plan.excludePaths ?? []).map((pattern, index) => {
     if (isAbsolutePathPattern(pattern)) matchesAbsolutePath = true;
-    return compilePathFilter(pattern, `excludePaths[${index}]`);
+    return compilePathFilter(
+      pattern,
+      `excludePaths[${excludeOriginOf(index)}]`,
+    );
   });
   const activeWeight = searchFilterWeight(plan, fileTypePatterns);
   const hasModifiedFilter =
@@ -1166,23 +1192,29 @@ function searchFilterWeight(
   fileTypePatterns: FileTypePatterns,
 ): number {
   let weight = 0;
-  for (const pattern of plan.includePaths ?? []) {
-    weight += globPatternWeight(pattern);
+  for (const [index, pattern] of (plan.includePaths ?? []).entries()) {
+    weight += globPatternWeight(
+      pattern,
+      `includePaths[${plan.includePathOrigins?.[index] ?? index}]`,
+    );
   }
-  for (const pattern of plan.excludePaths ?? []) {
-    weight += globPatternWeight(pattern);
+  for (const [index, pattern] of (plan.excludePaths ?? []).entries()) {
+    weight += globPatternWeight(
+      pattern,
+      `excludePaths[${plan.excludePathOrigins?.[index] ?? index}]`,
+    );
   }
-  for (const pattern of plan.globs ?? []) {
-    weight += ripgrepPatternWeight(pattern);
+  for (const [index, pattern] of (plan.globs ?? []).entries()) {
+    weight += ripgrepPatternWeight(pattern, false, `globs[${index}]`);
   }
-  for (const pattern of plan.insensitiveGlobs ?? []) {
-    weight += ripgrepPatternWeight(pattern, true);
+  for (const [index, pattern] of (plan.insensitiveGlobs ?? []).entries()) {
+    weight += ripgrepPatternWeight(pattern, true, `insensitiveGlobs[${index}]`);
   }
   for (const entry of fileTypePatterns.include) {
-    weight += ripgrepPatternWeight(entry.pattern);
+    weight += ripgrepPatternWeight(entry.pattern, false, entry.origin);
   }
   for (const entry of fileTypePatterns.exclude) {
-    weight += ripgrepPatternWeight(entry.pattern);
+    weight += ripgrepPatternWeight(entry.pattern, false, entry.origin);
   }
   checkActiveRuleWeight(weight, "active search filters");
   return weight;
@@ -1219,7 +1251,7 @@ function compilePathFilter(pattern: string, label: string): PathFilterMatcher {
           normalizePathForMatch(file[pathTarget]),
         );
       } catch (error) {
-        throw labeledGlobWorkError(label, pattern, error);
+        throw labeledGlobError(label, pattern, error);
       }
     };
   }
@@ -1230,7 +1262,7 @@ function compilePathFilter(pattern: string, label: string): PathFilterMatcher {
 
       return pathPatternMatches(pattern, path);
     } catch (error) {
-      throw labeledGlobWorkError(label, pattern, error);
+      throw labeledGlobError(label, pattern, error);
     }
   };
 }

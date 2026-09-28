@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import {
   checkGlobLength,
   checkGlobRuleCount,
-  labeledGlobWorkError,
+  labeledGlobError,
 } from "./glob-budget.js";
 import {
   ripgrepGlobMatches,
@@ -107,7 +107,7 @@ function applyLabeledPattern(
       ? ripgrepGlobMatchesCaseInsensitive(pattern, path)
       : ripgrepGlobMatches(pattern, path);
   } catch (error) {
-    throw labeledGlobWorkError(label, pattern, error);
+    throw labeledGlobError(label, pattern, error);
   }
 }
 

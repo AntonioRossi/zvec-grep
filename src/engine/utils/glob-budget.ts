@@ -152,20 +152,33 @@ export function isGlobWorkLimitFailure(error: unknown): boolean {
   );
 }
 
-/** Attach a rule's provenance (label and pattern preview) to a work-limit failure. */
-export function labeledGlobWorkError(
+/** Attach a rule's provenance (label and pattern preview) to any pattern
+ *  failure — work-limit exhaustion or compilation/matching errors — while
+ *  preserving the original cause. Already-labeled errors pass through. */
+const labeledGlobErrorMarker = Symbol("labeledGlobError");
+
+export function labeledGlobError(
   label: string,
   pattern: string,
   cause: unknown,
 ): Error {
-  if (!isGlobWorkLimitFailure(cause)) {
-    return cause as Error;
+  if (!(cause instanceof Error)) {
+    return new Error(`Glob pattern failed at ${label}: ${String(cause)}`);
+  }
+  const marked = cause as { [labeledGlobErrorMarker]?: boolean };
+  if (marked[labeledGlobErrorMarker]) {
+    return cause;
   }
   const preview = pattern.length > 48 ? `${pattern.slice(0, 45)}…` : pattern;
-  return new Error(
-    `Glob matching exceeded its work limit at ${label} (pattern '${preview}').`,
+  const error = new Error(
+    isGlobWorkLimitFailure(cause)
+      ? `Glob matching exceeded its work limit at ${label} (pattern '${preview}').`
+      : `Glob pattern failed at ${label} (pattern '${preview}'): ${cause.message}`,
     { cause },
   );
+  (error as { [labeledGlobErrorMarker]?: boolean })[labeledGlobErrorMarker] =
+    true;
+  return error;
 }
 
 export function checkActiveRuleWeight(weight: number, context: string): void {

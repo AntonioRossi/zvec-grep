@@ -1,4 +1,8 @@
-import { chargeGlobWork, checkGlobLength } from "./glob-budget.js";
+import {
+  chargeGlobWork,
+  checkGlobLength,
+  labeledGlobError,
+} from "./glob-budget.js";
 import { compileGlob } from "./glob-matcher.js";
 
 export function normalizePathPattern(pattern: string): string {
@@ -76,11 +80,11 @@ export function pathPatternMatchesPrepared(
  * active-rule bound and per-path allowances. Literal patterns never reach the
  * compiled matcher under path-prefix semantics; charge their raw length instead.
  */
-export function globPatternWeight(pattern: string): number {
+export function globPatternWeight(pattern: string, label?: string): number {
   if (!hasPathGlob(pattern)) {
     return pattern.length;
   }
-  return compileGlob(pattern, false).weight;
+  return compiledGlobWeight(pattern, false, label);
 }
 
 /**
@@ -92,8 +96,22 @@ export function globPatternWeight(pattern: string): number {
 export function ripgrepPatternWeight(
   pattern: string,
   caseInsensitive = false,
+  label?: string,
 ): number {
-  return compileGlob(pattern, caseInsensitive).weight;
+  return compiledGlobWeight(pattern, caseInsensitive, label);
+}
+
+function compiledGlobWeight(
+  pattern: string,
+  caseInsensitive: boolean,
+  label: string | undefined,
+): number {
+  try {
+    return compileGlob(pattern, caseInsensitive).weight;
+  } catch (error) {
+    if (label === undefined) throw error;
+    throw labeledGlobError(label, pattern, error);
+  }
 }
 
 export function pathPatternMatchesCaseInsensitive(

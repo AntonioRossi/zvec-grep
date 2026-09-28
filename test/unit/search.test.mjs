@@ -429,3 +429,89 @@ test("absolute path filters charge the budget from the matched path representati
   assert.ok(relative.hits.length >= 1);
   assert.ok(relative.hits.every((hit) => hit.file.id === "file-abs"));
 });
+
+test("pattern failures carry their original field and request index", async () => {
+  const { context } = createFixture();
+  await assert.rejects(
+    searchWorkspaceIndex(
+      { routes: [{ mode: "fts", query: "value" }], excludePaths: ["[z-a]"] },
+      context,
+    ),
+    (error) =>
+      /excludePaths\[0\]/.test(error.message) && /z-a/.test(error.message),
+  );
+  await assert.rejects(
+    searchWorkspaceIndex(
+      {
+        routes: [{ mode: "fts", query: "value" }],
+        excludePaths: ["", "[z-a]"],
+      },
+      context,
+    ),
+    (error) => /excludePaths\[1\]/.test(error.message),
+  );
+  await assert.rejects(
+    searchWorkspaceIndex(
+      {
+        routes: [{ mode: "fts", query: "value" }],
+        includePaths: ["keep.ts", "", "[z-a]"],
+      },
+      context,
+    ),
+    (error) => /includePaths\[2\]/.test(error.message),
+  );
+});
+
+test("many absolute filters against a long path stay within the budget", async () => {
+  const longDir = `/${"d".repeat(3000)}`;
+  const files = [
+    { ...file("file-abs", "f.ts"), absolutePath: `${longDir}/f.ts` },
+  ];
+  const storage = {
+    listFiles: () => files,
+    getFileById: (id) => files.find((item) => item.id === id) ?? null,
+    searchFts: (query, limit, filter) =>
+      files
+        .filter((item) => !filter?.fileIds || filter.fileIds.includes(item.id))
+        .map((item) => ({
+          fragment: {
+            id: `frag-${item.id}`,
+            fileId: item.id,
+            range: { kind: "text", startLine: 1, endLine: 2 },
+            content: "value",
+            metadata: {
+              symbolName: "Symbol",
+              symbolType: "function_declaration",
+            },
+          },
+          file: item,
+          path: "fts",
+          score: 1,
+        })),
+    searchVector: () => [],
+    optimize: () => {},
+    close: () => {},
+  };
+  const context = {
+    workspaceIndex: {
+      id: "wi",
+      name: "docs",
+      path: "/tmp/index",
+      rootPaths: [{ absolutePath: longDir, recursive: true }],
+      createdTime: 1,
+      updatedTime: 1,
+    },
+    storage,
+    embeddingModel: new FakeEmbeddingModel(),
+  };
+  const absoluteFilters = Array.from({ length: 128 }, () => "/**");
+  const result = await searchWorkspaceIndex(
+    {
+      routes: [{ mode: "fts", query: "value" }],
+      includePaths: absoluteFilters,
+    },
+    context,
+  );
+  assert.ok(result.hits.length >= 1);
+  assert.ok(result.hits.every((hit) => hit.file.id === "file-abs"));
+});
