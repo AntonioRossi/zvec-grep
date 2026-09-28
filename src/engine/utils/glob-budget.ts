@@ -19,15 +19,13 @@ export const MAX_ACTIVE_RULE_WEIGHT = 250_000;
 const PATH_WORK_BASE = 1_500_000;
 /**
  * Legitimate matching work for one path grows with the path length times the
- * compiled weight of the active rules; this multiplier keeps that headroom
- * while admitted-but-adversarial rule sets remain bounded by the path budget.
+ * compiled weight of the active rules; the bounded NFA keeps actual work at
+ * or below that linear bound, so this multiplier leaves headroom and the
+ * allowance acts as a safety net for accounting bugs rather than an
+ * adversary-reachable cap. Expensive single matches reject through the
+ * per-match cap; oversized rule sets reject at admission.
  */
 const PATH_WORK_MULTIPLIER = 4;
-/**
- * Operation-wide pool for matching work that is not yet covered by per-path
- * accounting. Per-path budgets take precedence wherever they are established.
- */
-const MAX_OPERATION_WORK = 100_000_000;
 
 export class GlobWorkLimitError extends Error {
   constructor(message: string) {
@@ -38,7 +36,6 @@ export class GlobWorkLimitError extends Error {
 
 type GlobBudgetStore = {
   sinceYield: number;
-  operationRemaining: number;
   pathRemaining?: number;
   overheadOnly?: boolean;
 };
@@ -48,10 +45,7 @@ const operationBudget = new AsyncLocalStorage<GlobBudgetStore>();
 /** Keep concurrent searches/scans independent, and share a budget with nested work. */
 export function withGlobBudget<T>(operation: () => T): T {
   if (operationBudget.getStore()) return operation();
-  return operationBudget.run(
-    { sinceYield: 0, operationRemaining: MAX_OPERATION_WORK },
-    operation,
-  );
+  return operationBudget.run({ sinceYield: 0 }, operation);
 }
 
 export function globPathAllowance(
@@ -77,11 +71,7 @@ export function withGlobPathBudget<T>(
   const store = operationBudget.getStore();
   if (!store) {
     return operationBudget.run(
-      {
-        sinceYield: 0,
-        operationRemaining: MAX_OPERATION_WORK,
-        pathRemaining: allowance,
-      },
+      { sinceYield: 0, pathRemaining: allowance },
       body,
     );
   }
@@ -125,16 +115,8 @@ export function chargeGlobWork(work: number): void {
   const budget = operationBudget.getStore();
   if (!budget) return;
   budget.sinceYield += work;
-  if (budget.overheadOnly) return;
-  if (budget.pathRemaining !== undefined) {
-    if ((budget.pathRemaining -= work) < 0) {
-      throw new GlobWorkLimitError(
-        "Path filtering exceeded its matching work limit.",
-      );
-    }
-    return;
-  }
-  if ((budget.operationRemaining -= work) < 0) {
+  if (budget.overheadOnly || budget.pathRemaining === undefined) return;
+  if ((budget.pathRemaining -= work) < 0) {
     throw new GlobWorkLimitError(
       "Path filtering exceeded its matching work limit.",
     );
@@ -161,6 +143,29 @@ export function checkGlobRuleCount(count: number): void {
   if (count > MAX_GLOB_RULES) {
     throw new Error(`Path filtering exceeds the ${MAX_GLOB_RULES}-rule limit.`);
   }
+}
+
+export function isGlobWorkLimitFailure(error: unknown): boolean {
+  return (
+    error instanceof GlobWorkLimitError ||
+    (error instanceof Error && error.message.includes("matching work limit"))
+  );
+}
+
+/** Attach a rule's provenance (label and pattern preview) to a work-limit failure. */
+export function labeledGlobWorkError(
+  label: string,
+  pattern: string,
+  cause: unknown,
+): Error {
+  if (!isGlobWorkLimitFailure(cause)) {
+    return cause as Error;
+  }
+  const preview = pattern.length > 48 ? `${pattern.slice(0, 45)}…` : pattern;
+  return new Error(
+    `Glob matching exceeded its work limit at ${label} (pattern '${preview}').`,
+    { cause },
+  );
 }
 
 export function checkActiveRuleWeight(weight: number, context: string): void {

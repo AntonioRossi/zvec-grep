@@ -1,9 +1,12 @@
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
+  checkActiveRuleWeight,
   checkGlobLength,
   checkGlobRuleCount,
   globWorkNeedsYield,
+  labeledGlobWorkError,
   withGlobBudget,
+  withGlobPathBudget,
 } from "../../utils/glob-budget.js";
 import {
   workspaceIndexDetail,
@@ -32,6 +35,7 @@ import type {
 } from "../../types.js";
 import { TimingCollector } from "../../utils/timing.js";
 import {
+  globPatternWeight,
   hasPathGlob,
   isAbsolutePathPattern,
   normalizePathForMatch,
@@ -1089,8 +1093,13 @@ async function resolveFilteredFileIds(
       fileTypePatterns.include.length +
       fileTypePatterns.exclude.length,
   );
-  const includeMatchers = (plan.includePaths ?? []).map(compilePathFilter);
-  const excludeMatchers = (plan.excludePaths ?? []).map(compilePathFilter);
+  const includeMatchers = (plan.includePaths ?? []).map((pattern, index) =>
+    compilePathFilter(pattern, `includePaths[${index}]`),
+  );
+  const excludeMatchers = (plan.excludePaths ?? []).map((pattern, index) =>
+    compilePathFilter(pattern, `excludePaths[${index}]`),
+  );
+  const activeWeight = searchFilterWeight(plan, fileTypePatterns);
   const hasModifiedFilter =
     plan.modifiedAfter !== undefined || plan.modifiedBefore !== undefined;
   const hasSharedSelection =
@@ -1113,20 +1122,48 @@ async function resolveFilteredFileIds(
     if (index > 0 && (index % 128 === 0 || globWorkNeedsYield()))
       await yieldToEventLoop();
     const file = files[index];
-    const included =
-      includeMatchers.length === 0 ||
-      includeMatchers.some((matcher) => matcher(file));
-    const excluded = excludeMatchers.some((matcher) => matcher(file));
-
-    if (
-      included &&
-      !excluded &&
-      matchesFileSelection(file.relativePath, plan, fileTypePatterns) &&
-      matchesModifiedTimeFilter(file, plan)
-    )
+    const keep = withGlobPathBudget(
+      file.relativePath.length,
+      activeWeight,
+      () =>
+        (includeMatchers.length === 0 ||
+          includeMatchers.some((matcher) => matcher(file))) &&
+        !excludeMatchers.some((matcher) => matcher(file)) &&
+        matchesFileSelection(file.relativePath, plan, fileTypePatterns) &&
+        matchesModifiedTimeFilter(file, plan),
+    );
+    if (keep) {
       matched.push(file.id);
+    }
   }
   return matched;
+}
+
+function searchFilterWeight(
+  plan: SearchPlan,
+  fileTypePatterns: FileTypePatterns,
+): number {
+  let weight = 0;
+  for (const pattern of plan.includePaths ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of plan.excludePaths ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of plan.globs ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of plan.insensitiveGlobs ?? []) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of fileTypePatterns.include) {
+    weight += globPatternWeight(pattern);
+  }
+  for (const pattern of fileTypePatterns.exclude) {
+    weight += globPatternWeight(pattern);
+  }
+  checkActiveRuleWeight(weight, "active search filters");
+  return weight;
 }
 
 function matchesModifiedTimeFilter(file: FileInfo, plan: SearchPlan): boolean {
@@ -1147,20 +1184,32 @@ function matchesModifiedTimeFilter(file: FileInfo, plan: SearchPlan): boolean {
   return true;
 }
 
-function compilePathFilter(pattern: string): PathFilterMatcher {
+function compilePathFilter(pattern: string, label: string): PathFilterMatcher {
   const pathTarget = isAbsolutePathPattern(pattern)
     ? "absolutePath"
     : "relativePath";
 
   if (hasPathGlob(pattern)) {
-    return (file) =>
-      pathPatternMatches(pattern, normalizePathForMatch(file[pathTarget]));
+    return (file) => {
+      try {
+        return pathPatternMatches(
+          pattern,
+          normalizePathForMatch(file[pathTarget]),
+        );
+      } catch (error) {
+        throw labeledGlobWorkError(label, pattern, error);
+      }
+    };
   }
 
   return (file) => {
-    const path = normalizePathForMatch(file[pathTarget]);
+    try {
+      const path = normalizePathForMatch(file[pathTarget]);
 
-    return pathPatternMatches(pattern, path);
+      return pathPatternMatches(pattern, path);
+    } catch (error) {
+      throw labeledGlobWorkError(label, pattern, error);
+    }
   };
 }
 
