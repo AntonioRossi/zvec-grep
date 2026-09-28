@@ -1,9 +1,13 @@
 import { realpathSync, statSync, type Stats } from "node:fs";
 import { dirname, relative } from "node:path";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { EngineError } from "../../errors.js";
 import type { RootPath } from "../../types.js";
 import { pathPatternMatches } from "../../utils/glob.js";
-import { labeledGlobError } from "../../utils/glob-budget.js";
+import {
+  labeledGlobError,
+  yieldGlobWorkIfNeeded,
+} from "../../utils/glob-budget.js";
 import {
   isPathInside,
   normalizePath,
@@ -52,10 +56,10 @@ export function normalizeRootPath(path: string | RootPath): RootPath {
   };
 }
 
-export function fileBelongsToRootPath(
+export async function fileBelongsToRootPath(
   absolutePath: string,
   rootPath: RootPath,
-): boolean {
+): Promise<boolean> {
   const normalizedPath = normalizePath(absolutePath);
 
   if (!isPathInside(rootPath.absolutePath, normalizedPath)) {
@@ -66,14 +70,14 @@ export function fileBelongsToRootPath(
     relative(rootPath.absolutePath, normalizedPath),
   );
 
-  return matchesRootPatterns(relativePath, rootPath);
+  return await matchesRootPatterns(relativePath, rootPath);
 }
 
-export function matchesRootPatterns(
+export async function matchesRootPatterns(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
-  if (matchesRootExcludePatterns(relativePath, rootPath)) {
+): Promise<boolean> {
+  if (await matchesRootExcludePatterns(relativePath, rootPath)) {
     return false;
   }
 
@@ -84,17 +88,17 @@ export function matchesRootPatterns(
   return matchesRootIncludePatterns(relativePath, rootPath);
 }
 
-export function matchesRootIncludePatterns(
+export async function matchesRootIncludePatterns(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+): Promise<boolean> {
   return matchesAny(relativePath, rootPath.include, "root include");
 }
 
-export function matchesRootExcludePatterns(
+export async function matchesRootExcludePatterns(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+): Promise<boolean> {
   return matchesAny(relativePath, rootPath.exclude, "root exclude");
 }
 
@@ -226,22 +230,26 @@ function directoryCoversFile(
   return directory.root.recursive || dirname(filePath) === directory.realPath;
 }
 
-function matchesAny(
+async function matchesAny(
   relativePath: string,
   patterns: readonly string[] | undefined,
   label: string,
-): boolean {
+): Promise<boolean> {
   if (!patterns || patterns.length === 0) {
     return false;
   }
 
-  return patterns.some((pattern, index) => {
+  for (const [index, pattern] of patterns.entries()) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop);
     try {
-      return patternMatches(pattern, relativePath);
+      if (patternMatches(pattern, relativePath)) {
+        return true;
+      }
     } catch (error) {
       throw labeledGlobError(`${label}[${index}]`, pattern, error);
     }
-  });
+  }
+  return false;
 }
 
 function patternMatches(pattern: string, relativePath: string): boolean {

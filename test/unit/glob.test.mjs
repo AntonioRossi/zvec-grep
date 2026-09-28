@@ -471,3 +471,36 @@ test("scanner filter families label compilation failures with their origin", asy
     30_000,
   );
 });
+
+test("candidate evaluation yields so heavy admitted rule sets cannot stall the loop", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-stall-");
+  await inWorker(
+    `
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    let dir = workerData;
+    for (let depth = 0; depth < 14; depth++) {
+      dir = join(dir, 'd'.repeat(250));
+      await mkdir(dir);
+    }
+    await writeFile(join(dir, 'f.ts'), 'export const a = 1;\\n');
+    const rules = Array.from({ length: 60 }, (_, i) => '*' + 'a'.repeat(199) + String(i % 10));
+    await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
+    async function maxHeartbeatGap(op) {
+      let maxGap = 0; let last = Date.now();
+      const timer = setInterval(() => { const now = Date.now(); maxGap = Math.max(maxGap, now - last); last = now; }, 5);
+      try { await op(); } finally { clearInterval(timer); }
+      return maxGap;
+    }
+    let files = -1;
+    const gap = await maxHeartbeatGap(async () => {
+      const result = await scanRootPaths('stall', [{ absolutePath: workerData, recursive: true }]);
+      files = result.files.length;
+    });
+    assert.equal(files, 1);
+    assert.ok(gap < 250, 'max event-loop block was ' + gap + 'ms');
+  `,
+    root,
+    120_000,
+  );
+});

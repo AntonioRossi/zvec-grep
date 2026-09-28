@@ -7,6 +7,7 @@ import {
   labeledGlobError,
   withGlobBudget,
   withGlobPathBudget,
+  yieldGlobWorkIfNeeded,
 } from "../../utils/glob-budget.js";
 import {
   workspaceIndexDetail,
@@ -101,6 +102,7 @@ type RecallRoute = ResolvedSearchPlanRoute & {
 export async function searchWorkspaceIndex(
   plan: SearchPlan,
   ctx: SearchContext,
+  options: { signal?: AbortSignal } = {},
 ): Promise<SearchPlanResult> {
   const timings = new TimingCollector();
 
@@ -119,7 +121,12 @@ export async function searchWorkspaceIndex(
     );
     const filter = await timings.time("search_filter", () =>
       withGlobBudget(() =>
-        searchPlanToStorageFilter(normalized, ctx.storage, fileTypePatterns),
+        searchPlanToStorageFilter(
+          normalized,
+          ctx.storage,
+          fileTypePatterns,
+          options.signal,
+        ),
       ),
     );
     const hasSearchableFiles = !filterMatchesNoFiles(filter);
@@ -1093,11 +1100,13 @@ async function searchPlanToStorageFilter(
   plan: SearchPlan,
   storage: WorkspaceIndexStorage,
   fileTypePatterns: FileTypePatterns,
+  signal?: AbortSignal,
 ): Promise<StorageSearchFilter | undefined> {
   const fileIds = await resolveFilteredFileIds(
     plan,
     storage.listFiles(),
     fileTypePatterns,
+    signal,
   );
   const symbolTypes =
     plan.symbolTypes && plan.symbolTypes.length > 0
@@ -1124,6 +1133,7 @@ async function resolveFilteredFileIds(
   plan: SearchPlan,
   files: readonly FileInfo[],
   fileTypePatterns: FileTypePatterns,
+  signal?: AbortSignal,
 ): Promise<string[] | undefined> {
   checkGlobRuleCount(
     (plan.includePaths?.length ?? 0) +
@@ -1181,15 +1191,41 @@ async function resolveFilteredFileIds(
     const budgetPathLength = matchesAbsolutePath
       ? Math.max(file.relativePath.length, file.absolutePath.length)
       : file.relativePath.length;
-    const keep = withGlobPathBudget(
+    const keep = await withGlobPathBudget(
       budgetPathLength,
       activeWeight,
-      () =>
-        (includeMatchers.length === 0 ||
-          includeMatchers.some((matcher) => matcher(file))) &&
-        !excludeMatchers.some((matcher) => matcher(file)) &&
-        matchesFileSelection(file.relativePath, plan, fileTypePatterns) &&
-        matchesModifiedTimeFilter(file, plan),
+      async () => {
+        if (includeMatchers.length !== 0) {
+          let included = false;
+          for (const matcher of includeMatchers) {
+            await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+            if (matcher(file)) {
+              included = true;
+              break;
+            }
+          }
+          if (!included) {
+            return false;
+          }
+        }
+        for (const matcher of excludeMatchers) {
+          await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+          if (matcher(file)) {
+            return false;
+          }
+        }
+        return (
+          (await matchesFileSelection(
+            file.relativePath,
+            plan,
+            fileTypePatterns,
+            {
+              signal,
+              yieldToEventLoop,
+            },
+          )) && matchesModifiedTimeFilter(file, plan)
+        );
+      },
     );
     if (keep) {
       matched.push(file.id);

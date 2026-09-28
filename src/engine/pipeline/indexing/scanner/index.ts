@@ -9,6 +9,7 @@ import {
   withGlobBudget,
   withGlobOverheadOnly,
   withGlobPathBudget,
+  yieldGlobWorkIfNeeded,
 } from "../../../utils/glob-budget.js";
 import { compileGlob } from "../../../utils/glob-matcher.js";
 import {
@@ -273,20 +274,20 @@ async function scanFilePathImpl(
       root.fileTypes,
       root.excludedFileTypes,
     );
-    const acceptable = withGlobPathBudget(
+    const acceptable = await withGlobPathBudget(
       relativePath.length,
       admitScanRules(
         rootFilterWeight(root, fileTypes) + ignoreRulesWeight(rules),
         root,
       ),
-      () =>
-        pathCanBeScanned(
+      async () =>
+        (await pathCanBeScanned(
           root,
           relativePath,
           basename(absolutePath),
           false,
           rules,
-        ) && matchesFileSelection(relativePath, root, fileTypes),
+        )) && matchesFileSelection(relativePath, root, fileTypes),
     );
     if (
       !acceptable ||
@@ -353,20 +354,20 @@ async function pathCanAffectIndexImpl(
       root.fileTypes,
       root.excludedFileTypes,
     );
-    const acceptable = withGlobPathBudget(
+    const acceptable = await withGlobPathBudget(
       relativePath.length,
       admitScanRules(
         rootFilterWeight(root, pathFileTypes) + ignoreRulesWeight(rules),
         root,
       ),
-      () =>
-        pathCanBeScanned(
+      async () =>
+        (await pathCanBeScanned(
           root,
           relativePath,
           basename(absolutePath),
           isDirectory,
           rules,
-        ) &&
+        )) &&
         (isDirectory ||
           matchesFileSelection(relativePath, root, pathFileTypes)),
     );
@@ -432,10 +433,10 @@ async function scanDirectoryPathImpl(
     );
     const directoryAcceptable =
       !relativePath ||
-      withGlobPathBudget(
+      (await withGlobPathBudget(
         relativePath.length,
         admitScanRules(staticRuleWeight + ignoreRulesWeight(parentRules), root),
-        () =>
+        async () =>
           pathCanBeScanned(
             root,
             relativePath,
@@ -443,7 +444,7 @@ async function scanDirectoryPathImpl(
             true,
             parentRules,
           ),
-      );
+      ));
     if (
       !directoryAcceptable ||
       (await hasExcludedNestedGitAncestor(root, absolutePath, true))
@@ -489,9 +490,13 @@ async function hasExcludedNestedGitAncestor(
     const relativeDirectory = toDisplayPath(
       relative(rootPath.absolutePath, current),
     );
+    await yieldGlobWorkIfNeeded(yieldToEventLoop);
     if (
       (await isNestedGitRepositoryDirectory(current)) &&
-      !nestedGitRepositoryExplicitlyIncluded(relativeDirectory, rootPath)
+      !(await nestedGitRepositoryExplicitlyIncluded(
+        relativeDirectory,
+        rootPath,
+      ))
     ) {
       return true;
     }
@@ -546,13 +551,14 @@ async function ignoreRulesForDirectory(
   return rules;
 }
 
-function pathCanBeScanned(
+async function pathCanBeScanned(
   rootPath: RootPath,
   relativePath: string,
   name: string,
   isDirectory: boolean,
   ignoreRules: readonly IgnoreRule[],
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (
     relativePath
       .split("/")
@@ -560,22 +566,37 @@ function pathCanBeScanned(
   ) {
     return false;
   }
-  const ignoreMatch = matchIgnoreRules(relativePath, isDirectory, ignoreRules);
+  const ignoreMatch = await matchIgnoreRules(
+    relativePath,
+    isDirectory,
+    ignoreRules,
+    signal,
+  );
   if (
     ignoreMatch.ignored &&
-    !ignoredPathExplicitlyIncluded(relativePath, rootPath, ignoreMatch)
+    !(await ignoredPathExplicitlyIncluded(
+      relativePath,
+      rootPath,
+      ignoreMatch,
+      signal,
+    ))
   ) {
     return false;
   }
-  if (matchesRootExcludePatterns(relativePath, rootPath)) {
+  if (await matchesRootExcludePatterns(relativePath, rootPath)) {
     return false;
   }
   if (isDirectory) {
-    return !shouldSkipHiddenDirectory(name, relativePath, rootPath);
+    return !(await shouldSkipHiddenDirectory(
+      name,
+      relativePath,
+      rootPath,
+      signal,
+    ));
   }
   return (
-    !shouldSkipHiddenFile(name, relativePath, rootPath) &&
-    matchesRootPatterns(relativePath, rootPath)
+    !(await shouldSkipHiddenFile(name, relativePath, rootPath, signal)) &&
+    (await matchesRootPatterns(relativePath, rootPath))
   );
 }
 
@@ -609,10 +630,10 @@ async function scanRootPath(
 
   if (info.isFile()) {
     const relativePath = basename(root.absolutePath);
-    const keepRootFile = withGlobPathBudget(
+    const keepRootFile = await withGlobPathBudget(
       relativePath.length,
       staticRuleWeight,
-      () => matchesFileSelection(relativePath, root, fileTypes),
+      async () => matchesFileSelection(relativePath, root, fileTypes),
     );
     const file = keepRootFile
       ? await readFileInfo(
@@ -775,27 +796,34 @@ async function walk(
         continue;
       }
 
-      const { skipDirectory } = withGlobPathBudget(
+      const { skipDirectory } = await withGlobPathBudget(
         relativePath.length,
         activeWeight,
-        () => {
+        async () => {
           const normalizedPath = normalizePathForMatch(relativePath);
-          const ignoreMatch = matchIgnoreRules(
+          const ignoreMatch = await matchIgnoreRules(
             normalizedPath,
             true,
             ignoreRules,
+            signal,
           );
           return {
             skipDirectory:
               HARD_SKIP_HIDDEN_NAMES.has(entry.name) ||
-              matchesRootExcludePatterns(relativePath, rootPath) ||
+              (await matchesRootExcludePatterns(relativePath, rootPath)) ||
               (ignoreMatch.ignored &&
-                !ignoredPathExplicitlyIncluded(
+                !(await ignoredPathExplicitlyIncluded(
                   normalizedPath,
                   rootPath,
                   ignoreMatch,
-                )) ||
-              shouldSkipHiddenDirectory(entry.name, normalizedPath, rootPath),
+                  signal,
+                ))) ||
+              (await shouldSkipHiddenDirectory(
+                entry.name,
+                normalizedPath,
+                rootPath,
+                signal,
+              )),
           };
         },
       );
@@ -805,7 +833,11 @@ async function walk(
 
       if (
         (await isNestedGitRepositoryDirectory(absolutePath)) &&
-        !nestedGitRepositoryExplicitlyIncluded(relativePath, rootPath)
+        !(await nestedGitRepositoryExplicitlyIncluded(
+          relativePath,
+          rootPath,
+          signal,
+        ))
       ) {
         continue;
       }
@@ -844,32 +876,48 @@ async function walk(
       continue;
     }
 
-    const keepFile = withGlobPathBudget(
+    const keepFile = await withGlobPathBudget(
       relativePath.length,
       activeWeight,
-      () => {
+      async () => {
         const normalizedPath = normalizePathForMatch(relativePath);
-        const ignoreMatch = matchIgnoreRules(
+        const ignoreMatch = await matchIgnoreRules(
           normalizedPath,
           false,
           ignoreRules,
+          signal,
         );
         if (
           ignoreMatch.ignored &&
-          !ignoredPathExplicitlyIncluded(normalizedPath, rootPath, ignoreMatch)
+          !(await ignoredPathExplicitlyIncluded(
+            normalizedPath,
+            rootPath,
+            ignoreMatch,
+            signal,
+          ))
         ) {
           return false;
         }
 
-        if (shouldSkipHiddenFile(entry.name, normalizedPath, rootPath)) {
+        if (
+          await shouldSkipHiddenFile(
+            entry.name,
+            normalizedPath,
+            rootPath,
+            signal,
+          )
+        ) {
           return false;
         }
 
-        if (!matchesRootPatterns(normalizedPath, rootPath)) {
+        if (!(await matchesRootPatterns(normalizedPath, rootPath))) {
           return false;
         }
 
-        return matchesFileSelection(normalizedPath, rootPath, fileTypes);
+        return matchesFileSelection(normalizedPath, rootPath, fileTypes, {
+          signal,
+          yieldToEventLoop,
+        });
       },
     );
     if (!keepFile) {
@@ -1056,17 +1104,19 @@ function parseGitIgnoreRule(
   };
 }
 
-function matchIgnoreRules(
+async function matchIgnoreRules(
   relativePath: string,
   isDirectory: boolean,
   rules: readonly IgnoreRule[],
-): IgnoreMatch {
+  signal?: AbortSignal,
+): Promise<IgnoreMatch> {
   checkGlobRuleCount(rules.length);
   let ignored = false;
   let matchedNegation = false;
   let matchedRule: IgnoreRule | undefined;
 
   for (const rule of rules) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
     let matches: boolean;
     try {
       matches = ignoreRuleMatches(rule, relativePath, isDirectory);
@@ -1094,22 +1144,32 @@ function ignoreRuleError(rule: IgnoreRule, cause: unknown): Error {
   return labeledGlobError(`ignore rule ${origin}`, rule.pattern, cause);
 }
 
-function ignoredPathExplicitlyIncluded(
+async function ignoredPathExplicitlyIncluded(
   relativePath: string,
   rootPath: RootPath,
   ignoreMatch: IgnoreMatch,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!ignoreMatch.ignored || !ignoreMatch.matchedRule || !rootPath.include) {
     return false;
   }
 
-  return rootPath.include.some((pattern) =>
-    includePatternNamesIgnoredPath(
-      pattern,
-      relativePath,
-      ignoreMatch.matchedRule!.pattern,
-    ),
-  );
+  for (const [includeIndex, pattern] of rootPath.include.entries()) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    try {
+      if (
+        includePatternNamesIgnoredPath(
+          pattern,
+          relativePath,
+          ignoreMatch.matchedRule!.pattern,
+        )
+      )
+        return true;
+    } catch (error) {
+      throw labeledGlobError(`root include[${includeIndex}]`, pattern, error);
+    }
+  }
+  return false;
 }
 
 function includePatternNamesIgnoredPath(
@@ -1232,27 +1292,33 @@ function isLiteralGlobText(value: string): boolean {
   );
 }
 
-function shouldSkipHiddenDirectory(
+async function shouldSkipHiddenDirectory(
   name: string,
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!isHiddenName(name) || rootPath.hidden) {
     return false;
   }
 
-  return !hasIncludeDescendant(relativePath, rootPath.include);
+  return !(await hasIncludeDescendant(relativePath, rootPath.include, signal));
 }
 
-function shouldSkipHiddenFile(
+async function shouldSkipHiddenFile(
   name: string,
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   return (
     isHiddenName(name) &&
     !rootPath.hidden &&
-    !hasExplicitHiddenFileInclude(relativePath, rootPath.include)
+    !(await hasExplicitHiddenFileInclude(
+      relativePath,
+      rootPath.include,
+      signal,
+    ))
   );
 }
 
@@ -1263,52 +1329,73 @@ async function isNestedGitRepositoryDirectory(
   return marker !== null && (marker.isFile() || marker.isDirectory());
 }
 
-function nestedGitRepositoryExplicitlyIncluded(
+async function nestedGitRepositoryExplicitlyIncluded(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!rootPath.include || rootPath.include.length === 0) {
     return false;
   }
 
   const normalizedRelativePath = normalizePathPattern(relativePath);
-  return rootPath.include.some((pattern) => {
+  for (const [includeIndex, pattern] of rootPath.include.entries()) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
     const normalizedPattern = normalizePathPattern(pattern);
-    return (
-      pathPatternMatches(normalizedPattern, normalizedRelativePath) ||
-      normalizedPattern.startsWith(`${normalizedRelativePath}/`)
-    );
-  });
+    try {
+      if (
+        pathPatternMatches(normalizedPattern, normalizedRelativePath) ||
+        normalizedPattern.startsWith(`${normalizedRelativePath}/`)
+      ) {
+        return true;
+      }
+    } catch (error) {
+      throw labeledGlobError(`root include[${includeIndex}]`, pattern, error);
+    }
+  }
+  return false;
 }
 
-function hasIncludeDescendant(
+async function hasIncludeDescendant(
   relativePath: string,
   includePatterns: readonly string[] | undefined,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!includePatterns || includePatterns.length === 0) {
     return false;
   }
 
-  return includePatterns.some(
-    (pattern) =>
+  for (const pattern of includePatterns) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    if (
       includePatternDeclaresHiddenDirectory(pattern, relativePath) &&
-      pathPatternMightMatchDescendant(pattern, relativePath),
-  );
+      pathPatternMightMatchDescendant(pattern, relativePath)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
-function hasExplicitHiddenFileInclude(
+async function hasExplicitHiddenFileInclude(
   relativePath: string,
   includePatterns: readonly string[] | undefined,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!includePatterns || includePatterns.length === 0) {
     return false;
   }
 
-  return includePatterns.some(
-    (pattern) =>
+  for (const pattern of includePatterns) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    if (
       includePatternDeclaresHiddenDirectory(pattern, relativePath) &&
-      pathPatternMatches(pattern, relativePath),
-  );
+      pathPatternMatches(pattern, relativePath)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function includePatternDeclaresHiddenDirectory(

@@ -543,3 +543,76 @@ test("oversized glob filters report their field and original index", async () =>
       /4096-character/.test(error.message),
   );
 });
+
+test("search candidate evaluation yields under heavy admitted globs", async () => {
+  const files = [file("file-a", `${"s".repeat(990)}/a.ts`)];
+  const storage = {
+    listFiles: () => files,
+    getFileById: (id) => files.find((item) => item.id === id) ?? null,
+    searchFts: (query, limit, filter) =>
+      files
+        .filter((item) => !filter?.fileIds || filter.fileIds.includes(item.id))
+        .map((item) => ({
+          fragment: {
+            id: `frag-${item.id}`,
+            fileId: item.id,
+            range: { kind: "text", startLine: 1, endLine: 2 },
+            content: "value",
+            metadata: {
+              symbolName: "Symbol",
+              symbolType: "function_declaration",
+            },
+          },
+          file: item,
+          path: "fts",
+          score: 1,
+        })),
+    searchVector: () => [],
+    optimize: () => {},
+    close: () => {},
+  };
+  const context = {
+    workspaceIndex: {
+      id: "wi",
+      name: "docs",
+      path: "/tmp/index",
+      rootPaths: [{ absolutePath: "/repo", recursive: true }],
+      createdTime: 1,
+      updatedTime: 1,
+    },
+    storage,
+    embeddingModel: new FakeEmbeddingModel(),
+  };
+  const heavyGlobs = Array.from(
+    { length: 39 },
+    (_, i) => `*${"a".repeat(1022)}${i % 10}`,
+  );
+  async function maxHeartbeatGap(op) {
+    let maxGap = 0;
+    let last = Date.now();
+    const timer = setInterval(() => {
+      const now = Date.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+    }, 5);
+    try {
+      await op();
+    } finally {
+      clearInterval(timer);
+    }
+    return maxGap;
+  }
+  let hits = -1;
+  const gap = await maxHeartbeatGap(async () => {
+    const result = await searchWorkspaceIndex(
+      {
+        routes: [{ mode: "fts", query: "value" }],
+        globs: [...heavyGlobs, "**"],
+      },
+      context,
+    );
+    hits = result.hits.length;
+  });
+  assert.ok(hits >= 1);
+  assert.ok(gap < 250, "max event-loop block was " + gap + "ms");
+});

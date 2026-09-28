@@ -20,10 +20,9 @@ const PATH_WORK_BASE = 1_500_000;
 /**
  * Legitimate matching work for one path grows with the path length times the
  * compiled weight of the active rules; the bounded NFA keeps actual work at
- * or below that linear bound, so this multiplier leaves headroom and the
- * allowance acts as a safety net for accounting bugs rather than an
- * adversary-reachable cap. Expensive single matches reject through the
- * per-match cap; oversized rule sets reject at admission.
+ * or below that linear bound, so this multiplier leaves headroom. The fixed
+ * candidate ceiling provides the adversary-reachable cumulative cap;
+ * yielding between rule chunks bounds event-loop block time.
  */
 const PATH_WORK_MULTIPLIER = 4;
 
@@ -42,7 +41,18 @@ type GlobBudgetStore = {
 
 const operationBudget = new AsyncLocalStorage<GlobBudgetStore>();
 
-/** Keep concurrent searches/scans independent, and share a budget with nested work. */
+/**
+ * Hard ceiling on one candidate's cumulative matching work, independent of
+ * path length or rule weight. Calibrated empirically: 20,000,000 rejects an
+ * accepted long-path regression (~15M units) while 50,000,000 admits it;
+ * ordinary repositories use roughly 1M per path. Supplements intra-candidate
+ * yielding — it does not replace it.
+ */
+const MAX_CANDIDATE_WORK = 50_000_000;
+
+/**
+ * Keep concurrent searches/scans independent, and share a budget with nested work.
+ */
 export function withGlobBudget<T>(operation: () => T): T {
   if (operationBudget.getStore()) return operation();
   return operationBudget.run({ sinceYield: 0 }, operation);
@@ -59,15 +69,21 @@ export function globPathAllowance(
 
 /**
  * Charge all rule checks for one candidate path against a shared allowance
- * sized by that path and the active rule weight. Nested calls restore the
- * enclosing path budget. Yield and cancellation accounting is unaffected.
+ * sized by that path and the active rule weight, capped by the fixed
+ * candidate ceiling. The body may be asynchronous: the allowance stays
+ * active across awaited chunks and is restored only after the body settles,
+ * keeping concurrent operations isolated. Yield and cancellation accounting
+ * is unaffected; yields never replenish the allowance.
  */
-export function withGlobPathBudget<T>(
+export async function withGlobPathBudget<T>(
   pathLength: number,
   activeRuleWeight: number,
-  body: () => T,
-): T {
-  const allowance = globPathAllowance(pathLength, activeRuleWeight);
+  body: () => T | Promise<T>,
+): Promise<T> {
+  const allowance = Math.min(
+    globPathAllowance(pathLength, activeRuleWeight),
+    MAX_CANDIDATE_WORK,
+  );
   const store = operationBudget.getStore();
   if (!store) {
     return operationBudget.run(
@@ -78,7 +94,7 @@ export function withGlobPathBudget<T>(
   const previous = store.pathRemaining;
   store.pathRemaining = allowance;
   try {
-    return body();
+    return await body();
   } finally {
     store.pathRemaining = previous;
   }
@@ -129,6 +145,27 @@ export function globWorkNeedsYield(): boolean {
   if (!budget || budget.sinceYield < 100_000) return false;
   budget.sinceYield = 0;
   return true;
+}
+
+/**
+ * Yield the event loop between candidate rule chunks when the work counter
+ * trips, checking cancellation first. Charges nothing and never replenishes
+ * any allowance; one uninterrupted block stays near a single rule's cost.
+ */
+export async function yieldGlobWorkIfNeeded(
+  yieldToEventLoop: () => Promise<unknown>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!globWorkNeedsYield()) return;
+  throwIfAbortedSignal(signal);
+  await yieldToEventLoop();
+}
+
+function throwIfAbortedSignal(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Indexing was cancelled.");
 }
 
 export function checkGlobLength(value: string, kind: "pattern" | "path"): void {

@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setImmediate as defaultYieldToEventLoop } from "node:timers/promises";
 import {
   checkGlobLength,
   checkGlobRuleCount,
   labeledGlobError,
+  yieldGlobWorkIfNeeded,
 } from "./glob-budget.js";
 import {
   ripgrepGlobMatches,
@@ -72,28 +74,56 @@ export async function resolveFileTypePatterns(
   };
 }
 
-export function matchesFileSelection(
+export type SelectionYieldOptions = {
+  signal?: AbortSignal;
+  yieldToEventLoop?: () => Promise<unknown>;
+};
+
+export async function matchesFileSelection(
   path: string,
   selection: FileSelection,
   types: FileTypePatterns,
-): boolean {
+  options: SelectionYieldOptions = {},
+): Promise<boolean> {
   checkGlobRuleCount(
     (selection.globs?.length ?? 0) +
       (selection.insensitiveGlobs?.length ?? 0) +
       types.include.length +
       types.exclude.length,
   );
-  const includedByGlob = matchesOrderedGlobs(path, selection);
+  const yieldFn = options.yieldToEventLoop ?? defaultYieldToEventLoop;
+  const includedByGlob = await matchesOrderedGlobs(
+    path,
+    selection,
+    yieldFn,
+    options.signal,
+  );
   const includedByType =
     types.include.length === 0 ||
-    types.include.some((entry) =>
-      applyLabeledPattern(entry.origin, entry.pattern, path, false),
-    );
-  const excludedByType = types.exclude.some((entry) =>
-    applyLabeledPattern(entry.origin, entry.pattern, path, false),
+    (await someTypeMatches(types.include, path, yieldFn, options.signal));
+  const excludedByType = await someTypeMatches(
+    types.exclude,
+    path,
+    yieldFn,
+    options.signal,
   );
 
   return includedByGlob && includedByType && !excludedByType;
+}
+
+async function someTypeMatches(
+  entries: readonly FileTypePattern[],
+  path: string,
+  yieldFn: () => Promise<unknown>,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  for (const entry of entries) {
+    await yieldGlobWorkIfNeeded(yieldFn, signal);
+    if (applyLabeledPattern(entry.origin, entry.pattern, path, false)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function applyLabeledPattern(
@@ -111,7 +141,12 @@ function applyLabeledPattern(
   }
 }
 
-function matchesOrderedGlobs(path: string, selection: FileSelection): boolean {
+async function matchesOrderedGlobs(
+  path: string,
+  selection: FileSelection,
+  yieldFn: () => Promise<unknown>,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
   const rules = [
     ...(selection.globs ?? []).map((pattern, index) => ({
       label: `globs[${index}]`,
@@ -133,6 +168,7 @@ function matchesOrderedGlobs(path: string, selection: FileSelection): boolean {
   let included = !hasPositiveRule;
 
   for (const rule of rules) {
+    await yieldGlobWorkIfNeeded(yieldFn, signal);
     const negated = rule.pattern.startsWith("!");
     const pattern = negated ? rule.pattern.slice(1).trim() : rule.pattern;
     if (!pattern) {
