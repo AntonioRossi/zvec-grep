@@ -79,11 +79,18 @@ that directory.
 Path filtering uses bounded glob matching for both search filters and ignore
 rules. Engine limits are 4,096 characters per pattern, 32 levels of brace
 alternation, 32,768 characters per matched path, 10,000 rules per effective rule
-set, and 1 MiB per ignore file. MCP request limits may be stricter. Matching also
-has per-pattern and per-operation work limits; unusually expensive selections
-fail with an error instead of blocking indefinitely. Ignore-file validation
-errors identify the file and line. An invalid ignore rule stops the operation;
-it is never silently dropped. These protections require no client configuration.
+set, and 1 MiB per ignore file. MCP request limits may be stricter. Each
+individual match is bounded by a per-pattern work cap, and every rule check for
+one candidate path — ignore rules, root include/exclude patterns, request
+globs, and expanded file types — shares a single per-candidate allowance sized
+by the matched path representation and the compiled weight of the active
+rules. The combined compiled weight of all active rules is itself bounded:
+oversized rule sets are rejected before matching begins. Unusually expensive
+selections fail with an error instead of blocking indefinitely, and limit or
+compilation failures identify their rule — an ignore file and line, a request
+field and original index, or the file type a pattern was expanded from. An
+invalid ignore rule stops the operation; it is never silently dropped. These
+protections require no client configuration.
 
 Without an explicit `--max-filesize`, indexing uses type-aware safety limits:
 1 MiB for code, 256 MiB for text and Markdown, 16 MiB for structured data, and

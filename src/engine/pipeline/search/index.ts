@@ -447,7 +447,18 @@ function normalizeStringFilters(
         context: `field=${field} index=${index}`,
       });
     }
-    checkGlobLength(item, "pattern");
+    try {
+      checkGlobLength(item, "pattern");
+    } catch (error) {
+      throw new EngineError(
+        `Search filter ${field}[${index}] is invalid: ${error instanceof Error ? error.message : String(error)}`,
+        {
+          code: "ZVEC_GREP.ENGINE.SEARCH_PLAN.INVALID_FILTER",
+          context: `field=${field} index=${index}`,
+          cause: error,
+        },
+      );
+    }
     return item.trim();
   });
   return values.length > 0 ? values : undefined;
