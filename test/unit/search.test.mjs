@@ -6,6 +6,7 @@ import {
   searchWorkspaceIndex,
 } from "../../dist/engine/pipeline/search/index.js";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
+import { inSearchWorker } from "../helpers/search-worker.mjs";
 
 function file(id, relativePath, lastModifiedTime = 100) {
   return {
@@ -545,93 +546,102 @@ test("oversized glob filters report their field and original index", async () =>
 });
 
 test("search candidate evaluation yields under heavy slash-bearing admitted globs", async () => {
-  const files = [file("file-a", `${"s".repeat(990)}/a.ts`)];
-  const storage = {
-    listFiles: () => files,
-    getFileById: (id) => files.find((item) => item.id === id) ?? null,
-    searchFts: (query, limit, filter) =>
-      files
-        .filter((item) => !filter?.fileIds || filter.fileIds.includes(item.id))
-        .map((item) => ({
-          fragment: {
-            id: `frag-${item.id}`,
-            fileId: item.id,
-            range: { kind: "text", startLine: 1, endLine: 2 },
-            content: "value",
-            metadata: {
-              symbolName: "Symbol",
-              symbolType: "function_declaration",
+  // Runs in a worker thread: the heartbeat monitor measures the worker's own
+  // event loop (the loop the stall blocks), while the parent enforces the
+  // external deadline and terminates the worker on timeout.
+  await inSearchWorker(
+    `
+    const files = [
+      {
+        id: "file-a",
+        absolutePath: "/repo/" + "s".repeat(990) + "/a.ts",
+        relativePath: "s".repeat(990) + "/a.ts",
+        rootPath: "/repo",
+        sizeBytes: 10,
+        lastModifiedTime: 100,
+        kind: "code",
+        format: "typescript",
+      },
+    ];
+    const storage = {
+      listFiles: () => files,
+      getFileById: (id) => files.find((item) => item.id === id) ?? null,
+      searchFts: (query, limit, filter) =>
+        files
+          .filter(
+            (item) => !filter?.fileIds || filter.fileIds.includes(item.id),
+          )
+          .map((item) => ({
+            fragment: {
+              id: "frag-" + item.id,
+              fileId: item.id,
+              range: { kind: "text", startLine: 1, endLine: 2 },
+              content: "value",
+              metadata: {
+                symbolName: "Symbol",
+                symbolType: "function_declaration",
+              },
             },
-          },
-          file: item,
-          path: "fts",
-          score: 1,
-        })),
-    searchVector: () => [],
-    optimize: () => {},
-    close: () => {},
-  };
-  const context = {
-    workspaceIndex: {
-      id: "wi",
-      name: "docs",
-      path: "/tmp/index",
-      rootPaths: [{ absolutePath: "/repo", recursive: true }],
-      createdTime: 1,
-      updatedTime: 1,
-    },
-    storage,
-    embeddingModel: new FakeEmbeddingModel(),
-  };
-  const heavyGlobs = Array.from(
-    { length: 100 },
-    (_, i) => `${"*s".repeat(150)}/b${i}*`,
-  );
-  async function maxHeartbeatGap(op) {
+            file: item,
+            path: "fts",
+            score: 1,
+          })),
+      searchVector: () => [],
+      optimize: () => {},
+      close: () => {},
+    };
+    const context = {
+      workspaceIndex: {
+        id: "wi",
+        name: "docs",
+        path: "/tmp/index",
+        rootPaths: [{ absolutePath: "/repo", recursive: true }],
+        createdTime: 1,
+        updatedTime: 1,
+      },
+      storage,
+      embeddingModel: new FakeEmbeddingModel(),
+    };
+    const heavyGlobs = Array.from(
+      { length: 100 },
+      (_, i) => "*s".repeat(150) + "/b" + i + "*",
+    );
     let maxGap = 0;
     let last = Date.now();
+    let timer;
     const tick = () => {
       const now = Date.now();
       maxGap = Math.max(maxGap, now - last);
       last = now;
     };
-    const timer = setInterval(tick, 5);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    last = Date.now();
     try {
-      let deadline;
-      try {
-        await Promise.race([
-          op(),
-          new Promise((_, reject) => {
-            deadline = setTimeout(
-              () => reject(new Error("external deadline")),
-              60_000,
-            );
-          }),
-        ]);
-      } finally {
-        clearTimeout(deadline);
-      }
+      timer = setInterval(tick, 5);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      last = Date.now();
+      let hits = -1;
+      await search(
+        {
+          routes: [{ mode: "fts", query: "value" }],
+          globs: [...heavyGlobs, "*a.ts"],
+        },
+        context,
+      ).then((result) => {
+        hits = result.hits.length;
+      });
+      assert.ok(hits >= 1, "expected the file to match");
+      assert.ok(
+        maxGap < 250,
+        "max event-loop block was " + maxGap + "ms",
+      );
     } finally {
       clearInterval(timer);
+      maxGap = Math.max(maxGap, Date.now() - last);
     }
-    maxGap = Math.max(maxGap, Date.now() - last);
-    return maxGap;
-  }
-  let hits = -1;
-  const gap = await maxHeartbeatGap(async () => {
-    const result = await searchWorkspaceIndex(
-      {
-        routes: [{ mode: "fts", query: "value" }],
-        globs: [...heavyGlobs, "*a.ts"],
-      },
-      context,
-    );
-    hits = result.hits.length;
-  });
-  assert.ok(hits >= 1);
-  assert.ok(gap < 250, "max event-loop block was " + gap + "ms");
+    assert.ok(maxGap < 250, "max event-loop block (drained) was " + maxGap + "ms");
+  `,
+    undefined,
+    120_000,
+  );
 });
 
 test("cancellation after unfiltered-search entry and during embedding rejects", async () => {
