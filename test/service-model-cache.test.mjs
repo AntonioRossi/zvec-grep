@@ -8,10 +8,13 @@ import { BaseEmbeddingModel } from "../dist/engine/models/embeddings.js";
 import { embeddingModelPoolKeyForIdentity } from "../dist/engine/service/index.js";
 import { createZvecGrep } from "../dist/index.js";
 import {
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
   createRemoteEmbeddingOperationPermit,
   createRemoteEmbeddingTarget,
   withRemoteEmbeddingOperationPermit,
 } from "../dist/authorization/index.js";
+
+useIsolatedZvecGrepHome();
 
 test("embedding model cache identities are stable without exposing API keys", () => {
   const identity = { provider: "qwen", name: "text-embedding-v4" };

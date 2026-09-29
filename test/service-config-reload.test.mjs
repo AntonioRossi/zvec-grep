@@ -6,10 +6,13 @@ import test from "node:test";
 import { updateGlobalConfig } from "../dist/engine/config.js";
 import { createZvecGrep } from "../dist/index.js";
 import {
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
   createRemoteEmbeddingOperationPermit,
   createRemoteEmbeddingTarget,
   withRemoteEmbeddingOperationPermit,
 } from "../dist/authorization/index.js";
+
+useIsolatedZvecGrepHome();
 
 test("explicit embedding reference reloads provider config before refresh and query", async () => {
   const temporaryDirectory = await mkdtemp(

@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseArgs } from "../dist/cli/args.js";
 import {
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
   MCP_MAX_QUERY_GROUPS,
   zvecGrepCliSearchInputSchema,
   zvecGrepIndexInputSchema,
   zvecGrepSearchInputSchema,
 } from "../dist/mcp/schemas.js";
+
+useIsolatedZvecGrepHome();
 
 test("stdio MCP entry points are not public CLI commands", () => {
   assert.throws(() => parseArgs(["serve", "--mcp"]), /Unknown option/i);

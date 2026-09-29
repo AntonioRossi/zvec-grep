@@ -21,12 +21,15 @@ import {
 } from "../dist/daemon/config.js";
 import { DaemonHttpServer } from "../dist/daemon/http-server.js";
 import { readInstanceRecord } from "../dist/daemon/server-controller.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const execFileAsync = promisify(execFile);
 const cliPath = resolve("dist/cli/index.js");
 const packageVersion = JSON.parse(
   await readFile(new URL("../package.json", import.meta.url), "utf8"),
 ).version;
+
+useIsolatedZvecGrepHome();
 
 test("server run parses a loopback listen address", () => {
   const parsed = parseArgs(["--server", "run", "--listen", "127.0.0.1:8123"]);

@@ -23,6 +23,7 @@ import { createZvecGrep } from "../dist/index.js";
 import { DaemonClient } from "../dist/client/daemon-client.js";
 
 import { createDaemonLogger } from "../dist/daemon/logger.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 const token = "server-http-test-token-at-least-32-characters";
 
@@ -30,6 +31,8 @@ function assertAdminSearchStructured(search) {
   assert.ok(search.structuredContent);
   assert.ok(Array.isArray(search.structuredContent.result.groupResults));
 }
+
+useIsolatedZvecGrepHome();
 
 test("HTTP server rolls back state after a listen failure", async () => {
   const backend = {};
