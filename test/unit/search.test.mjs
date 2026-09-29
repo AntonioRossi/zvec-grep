@@ -544,7 +544,7 @@ test("oversized glob filters report their field and original index", async () =>
   );
 });
 
-test("search yields under heavy admitted globs and pre-aborted searches reject", async () => {
+test("search candidate evaluation yields under heavy slash-bearing admitted globs", async () => {
   const files = [file("file-a", `${"s".repeat(990)}/a.ts`)];
   const storage = {
     listFiles: () => files,
@@ -583,20 +583,10 @@ test("search yields under heavy admitted globs and pre-aborted searches reject",
     storage,
     embeddingModel: new FakeEmbeddingModel(),
   };
-  const controller = new AbortController();
-  controller.abort();
-  await assert.rejects(
-    searchWorkspaceIndex(
-      { routes: [{ mode: "fts", query: "value" }], globs: ["**"] },
-      context,
-      { signal: controller.signal },
-    ),
-    /cancel|abort/i,
+  const heavyGlobs = Array.from(
+    { length: 100 },
+    (_, i) => `${"*s".repeat(150)}/b${i}*`,
   );
-  const heavyGlobs = Array.from({ length: 127 }, (_, i) => {
-    const head = "s".repeat(300);
-    return i % 2 ? `${head}a*` : `${head}b*`;
-  });
   async function maxHeartbeatGap(op) {
     let maxGap = 0;
     let last = Date.now();
@@ -609,12 +599,20 @@ test("search yields under heavy admitted globs and pre-aborted searches reject",
     await new Promise((resolve) => setTimeout(resolve, 20));
     last = Date.now();
     try {
-      await Promise.race([
-        op(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("external deadline")), 60_000),
-        ),
-      ]);
+      let deadline;
+      try {
+        await Promise.race([
+          op(),
+          new Promise((_, reject) => {
+            deadline = setTimeout(
+              () => reject(new Error("external deadline")),
+              60_000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(deadline);
+      }
     } finally {
       clearInterval(timer);
     }
@@ -634,4 +632,56 @@ test("search yields under heavy admitted globs and pre-aborted searches reject",
   });
   assert.ok(hits >= 1);
   assert.ok(gap < 250, "max event-loop block was " + gap + "ms");
+});
+
+test("cancellation after unfiltered-search entry and during embedding rejects", async () => {
+  const files = [file("file-a", "src/a.ts")];
+  const storage = {
+    listFiles: () => files,
+    getFileById: (id) => files.find((item) => item.id === id) ?? null,
+    searchFts: () => [],
+    searchVector: () => [],
+    optimize: () => {},
+    close: () => {},
+  };
+  const context = {
+    workspaceIndex: {
+      id: "wi",
+      name: "docs",
+      path: "/tmp/index",
+      rootPaths: [{ absolutePath: "/repo", recursive: true }],
+      createdTime: 1,
+      updatedTime: 1,
+    },
+    storage,
+    embeddingModel: new FakeEmbeddingModel(),
+  };
+  const reason = new Error("stop-unfiltered");
+  const pre = new AbortController();
+  pre.abort(reason);
+  await assert.rejects(
+    searchWorkspaceIndex(
+      { routes: [{ mode: "vector", query: "value" }] },
+      context,
+      { signal: pre.signal },
+    ),
+    (error) => error === reason,
+  );
+  const midController = new AbortController();
+  const midReason = new Error("stop-embedding");
+  const slowModel = new FakeEmbeddingModel();
+  const originalEmbed = slowModel.embed.bind(slowModel);
+  slowModel.embed = async (...args) => {
+    midController.abort(midReason);
+    await new Promise((resolve) => setImmediate(resolve));
+    return originalEmbed(...args);
+  };
+  await assert.rejects(
+    searchWorkspaceIndex(
+      { routes: [{ mode: "vector", query: "value" }] },
+      { ...context, embeddingModel: slowModel },
+      { signal: midController.signal },
+    ),
+    (error) => error === midReason,
+  );
 });

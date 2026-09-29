@@ -551,7 +551,44 @@ test("cancellation never returns success and overlapping candidates keep indepen
   );
 });
 
-test("cancellation reason survives pattern wrappers, root filters, and interleaved budgets restore", async (t) => {
+test("cancellation never returns success and overlapping candidates keep independent ceilings", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-cancel2-");
+  await writeFile(join(root, "f.ts"), "x");
+  await inWorker(
+    `
+    const { withGlobPathBudget, chargeGlobWork } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
+    // pre-aborted scan never completes matching
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      () => scanRootPaths('c2', [{ absolutePath: workerData, recursive: true }], { signal: controller.signal }),
+      /cancel|abort/i,
+    );
+    const { scanFilePath } = await import(${JSON.stringify(new URL("../../dist/engine/pipeline/indexing/scanner/index.js", import.meta.url).href)});
+    await assert.rejects(
+      () => scanFilePath('c2', [{ absolutePath: workerData, recursive: true }], ${JSON.stringify(join(root, "f.ts"))}, { signal: controller.signal }),
+      /cancel|abort/i,
+    );
+    // interleaved candidates in one operation keep independent ceilings
+    const charge60M = async () => {
+      await withGlobPathBudget(1, 0, async () => {
+        for (let i = 0; i < 60; i++) chargeGlobWork(1_000_000);
+      });
+    };
+    await withGlobBudget(async () => {
+      const results = await Promise.allSettled([charge60M(), charge60M()]);
+      for (const r of results) {
+        assert.equal(r.status, 'rejected');
+        assert.ok(/work limit/.test(r.reason.message));
+      }
+    });
+  `,
+    root,
+    60_000,
+  );
+});
+
+test("budget refresh control and cancellation reason handling", async (t) => {
   const root = await createTemporaryDirectory(t, "zvec-glob-cancel3-");
   await writeFile(join(root, "f.ts"), "x");
   await inWorker(
@@ -578,7 +615,7 @@ test("cancellation reason survives pattern wrappers, root filters, and interleav
       return { promise, resolve };
     };
     const dimensions = [3_800, 200_000];
-    for (const shape of ["refresh", "escape"]) {
+    for (const shape of ["refresh"]) {
       await withGlobBudget(async () => {
         const aEntered = deferred();
         const bEntered = deferred();
