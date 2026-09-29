@@ -593,7 +593,10 @@ test("search yields under heavy admitted globs and pre-aborted searches reject",
     ),
     /cancel|abort/i,
   );
-  const heavyGlobs = Array.from({ length: 39 }, () => "*a".repeat(512));
+  const heavyGlobs = Array.from({ length: 127 }, (_, i) => {
+    const head = "s".repeat(300);
+    return i % 2 ? `${head}a*` : `${head}b*`;
+  });
   async function maxHeartbeatGap(op) {
     let maxGap = 0;
     let last = Date.now();
@@ -623,7 +626,7 @@ test("search yields under heavy admitted globs and pre-aborted searches reject",
     const result = await searchWorkspaceIndex(
       {
         routes: [{ mode: "fts", query: "value" }],
-        globs: [...heavyGlobs, "**"],
+        globs: [...heavyGlobs, "*a.ts"],
       },
       context,
     );

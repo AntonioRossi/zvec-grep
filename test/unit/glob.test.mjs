@@ -479,12 +479,12 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
     const { mkdir, writeFile } = await import('node:fs/promises');
     const { join } = await import('node:path');
     let dir = workerData;
-    for (let depth = 0; depth < 14; depth++) {
-      dir = join(dir, 'd'.repeat(250));
+    for (let depth = 0; depth < 12; depth++) {
+      dir = join(dir, 'd'.repeat(230));
       await mkdir(dir);
     }
     await writeFile(join(dir, 'f.ts'), 'export const a = 1;\\n');
-    const rules = Array.from({ length: 66 }, () => '*a'.repeat(101) + '/');
+    const rules = Array.from({ length: 100 }, () => '*a'.repeat(45) + '/');
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
     async function maxHeartbeatGap(op) {
       let maxGap = 0; let last = Date.now();
@@ -504,7 +504,7 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
       files = result.files.length;
     });
     assert.equal(files, 1);
-    // 66 rules x ~750k units ~= 49M, just under the 50M candidate ceiling:
+    // 100 rules x ~500k units ~= 49M, just under the 50M candidate ceiling:
     // ~200ms as one monolithic block on the reference system, timer-quantum
     // gaps when chunked. 100ms separates the two reference behaviors.
     assert.ok(gap < 100, 'max event-loop block was ' + gap + 'ms');
@@ -545,6 +545,45 @@ test("cancellation never returns success and overlapping candidates keep indepen
         assert.ok(/work limit/.test(r.reason.message));
       }
     });
+  `,
+    root,
+    60_000,
+  );
+});
+
+test("cancellation reason survives pattern wrappers, root filters, and interleaved budgets restore", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-cancel3-");
+  await writeFile(join(root, "f.ts"), "x");
+  await inWorker(
+    `
+    const { withGlobPathBudget, chargeGlobWork, isGlobCancellation } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
+    // root-filter cancellation with reason identity
+    const reason = new Error('stop-a');
+    const controller = new AbortController();
+    controller.abort(reason);
+    await assert.rejects(
+      () => scanRootPaths('c3', [{ absolutePath: workerData, recursive: true, exclude: ['x'.repeat(4090)] }], { signal: controller.signal }),
+      (error) => error === reason || (error.cause === reason && isGlobCancellation(error)),
+    );
+    // barrier-interleaved 30M+30M charges: both candidates await a tick between
+    // 10M chunks, so their evaluation interleaves; independent ceilings let both
+    // complete where a shared store would wrongly reject at the 50M ceiling.
+    const tick = () => new Promise((resolve) => setImmediate(resolve));
+    const run = async () => withGlobPathBudget(1, 450_000, async () => {
+      for (let chunk = 0; chunk < 3; chunk++) {
+        chargeGlobWork(10_000_000);
+        await tick();
+      }
+    });
+    const both = await Promise.allSettled([run(), run()]);
+    assert.equal(both[0].status, 'fulfilled');
+    assert.equal(both[1].status, 'fulfilled');
+    // scope restoration after a work-limit error
+    await assert.rejects(
+      () => withGlobPathBudget(1, 0, async () => { chargeGlobWork(60_000_000); }),
+      /work limit/,
+    );
+    assert.equal(await withGlobPathBudget(1, 0, async () => 'ok'), 'ok');
   `,
     root,
     60_000,

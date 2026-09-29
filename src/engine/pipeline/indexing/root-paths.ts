@@ -76,8 +76,9 @@ export async function fileBelongsToRootPath(
 export async function matchesRootPatterns(
   relativePath: string,
   rootPath: RootPath,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  if (await matchesRootExcludePatterns(relativePath, rootPath)) {
+  if (await matchesRootExcludePatterns(relativePath, rootPath, signal)) {
     return false;
   }
 
@@ -85,21 +86,23 @@ export async function matchesRootPatterns(
     return true;
   }
 
-  return matchesRootIncludePatterns(relativePath, rootPath);
+  return matchesRootIncludePatterns(relativePath, rootPath, signal);
 }
 
 export async function matchesRootIncludePatterns(
   relativePath: string,
   rootPath: RootPath,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  return matchesAny(relativePath, rootPath.include, "root include");
+  return matchesAny(relativePath, rootPath.include, "root include", signal);
 }
 
 export async function matchesRootExcludePatterns(
   relativePath: string,
   rootPath: RootPath,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  return matchesAny(relativePath, rootPath.exclude, "root exclude");
+  return matchesAny(relativePath, rootPath.exclude, "root exclude", signal);
 }
 
 type RootScanDomain = {
@@ -234,13 +237,14 @@ async function matchesAny(
   relativePath: string,
   patterns: readonly string[] | undefined,
   label: string,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   if (!patterns || patterns.length === 0) {
     return false;
   }
 
   for (const [index, pattern] of patterns.entries()) {
-    await yieldGlobWorkIfNeeded(yieldToEventLoop);
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
     try {
       if (patternMatches(pattern, relativePath)) {
         return true;

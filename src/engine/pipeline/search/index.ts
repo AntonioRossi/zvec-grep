@@ -1,6 +1,7 @@
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
   checkActiveRuleWeight,
+  checkGlobCancellation,
   checkGlobLength,
   checkGlobRuleCount,
   globWorkNeedsYield,
@@ -104,6 +105,7 @@ export async function searchWorkspaceIndex(
   ctx: SearchContext,
   options: { signal?: AbortSignal } = {},
 ): Promise<SearchPlanResult> {
+  checkGlobCancellation(options.signal);
   const timings = new TimingCollector();
 
   const result = await timings.time("search_total", async () => {

@@ -170,11 +170,44 @@ export async function yieldGlobWorkIfNeeded(
   throwIfAbortedSignal(signal);
 }
 
+const cancellationMarker = Symbol("globCancellation");
+
+/** Preserve the signal's reason and mark it so pattern-error wrappers rethrow
+ *  cancellation untouched instead of relabeling it as a pattern failure. */
+export function globCancellationError(signal: AbortSignal): Error {
+  const reason = signal.reason instanceof Error ? signal.reason : null;
+  const error =
+    reason ??
+    (Object.assign(new Error("Indexing was cancelled."), {
+      cause: signal.reason,
+    }) as Error);
+  if (
+    !(error as unknown as { [k: symbol]: boolean | undefined })[
+      cancellationMarker
+    ]
+  ) {
+    (error as unknown as { [k: symbol]: boolean | undefined })[
+      cancellationMarker
+    ] = true;
+  }
+  return error;
+}
+
+export function isGlobCancellation(error: unknown): boolean {
+  return Boolean(
+    (error as unknown as { [k: symbol]: boolean | undefined })[
+      cancellationMarker
+    ],
+  );
+}
+
+export function checkGlobCancellation(signal?: AbortSignal): void {
+  if (signal?.aborted) throw globCancellationError(signal);
+}
+
 function throwIfAbortedSignal(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return;
-  throw signal.reason instanceof Error
-    ? signal.reason
-    : new Error("Indexing was cancelled.");
+  throw globCancellationError(signal);
 }
 
 export function checkGlobLength(value: string, kind: "pattern" | "path"): void {
@@ -210,6 +243,9 @@ export function labeledGlobError(
 ): Error {
   if (!(cause instanceof Error)) {
     return new Error(`Glob pattern failed at ${label}: ${String(cause)}`);
+  }
+  if (isGlobCancellation(cause)) {
+    return cause;
   }
   const marked = cause as { [labeledGlobErrorMarker]?: boolean };
   if (marked[labeledGlobErrorMarker]) {

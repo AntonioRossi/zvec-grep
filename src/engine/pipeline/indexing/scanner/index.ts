@@ -593,7 +593,7 @@ async function pathCanBeScanned(
   ) {
     return false;
   }
-  if (await matchesRootExcludePatterns(relativePath, rootPath)) {
+  if (await matchesRootExcludePatterns(relativePath, rootPath, signal)) {
     return false;
   }
   if (isDirectory) {
@@ -606,7 +606,7 @@ async function pathCanBeScanned(
   }
   return (
     !(await shouldSkipHiddenFile(name, relativePath, rootPath, signal)) &&
-    (await matchesRootPatterns(relativePath, rootPath))
+    (await matchesRootPatterns(relativePath, rootPath, signal))
   );
 }
 
@@ -820,7 +820,11 @@ async function walk(
           return {
             skipDirectory:
               HARD_SKIP_HIDDEN_NAMES.has(entry.name) ||
-              (await matchesRootExcludePatterns(relativePath, rootPath)) ||
+              (await matchesRootExcludePatterns(
+                relativePath,
+                rootPath,
+                signal,
+              )) ||
               (ignoreMatch.ignored &&
                 !(await ignoredPathExplicitlyIncluded(
                   normalizedPath,
@@ -920,7 +924,7 @@ async function walk(
           return false;
         }
 
-        if (!(await matchesRootPatterns(normalizedPath, rootPath))) {
+        if (!(await matchesRootPatterns(normalizedPath, rootPath, signal))) {
           return false;
         }
 
