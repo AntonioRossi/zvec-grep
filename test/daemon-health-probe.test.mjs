@@ -547,7 +547,7 @@ test("teardown failure path preserves evidence with a live daemon", async (t) =>
   }
   assert.ok(threw, "teardown must throw when termination is unconfirmed");
   assert.match(threw.message, /teardown unconfirmed/);
-  let alive = false;
+  let alive;
   try {
     process.kill(record.pid, 0);
     alive = true;
@@ -569,7 +569,7 @@ test("query result assertion rejects zero-hit and wrong-file outputs", async () 
     stdout:
       "query groups (1):\nQ1 [supplemental]: HealthProbeSymbol\nhits: 0\n",
   };
-  let threw = null;
+  let threw;
   try {
     const problems = queryResultProblems(zeroHit, expected);
     if (problems.length === 0)
