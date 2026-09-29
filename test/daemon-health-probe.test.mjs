@@ -186,7 +186,7 @@ async function runHealthProbe(options) {
       !indexed?.code &&
       /Workspace index: succeeded/.test(String(indexed.stdout ?? ""));
     const queriedOk =
-      !queried?.code && /HealthProbeSymbol/.test(String(queried.stdout ?? ""));
+      queryResultProblems(queried, `f${"g".repeat(201)}.ts`).length === 0;
     if (expectWorkloadSuccess) {
       if (!indexedOk)
         problems.push(
@@ -197,9 +197,8 @@ async function runHealthProbe(options) {
         );
       if (!queriedOk)
         problems.push(
-          `query did not find the symbol: ${String(queried?.stderr ?? queried)}`.slice(
-            0,
-            200,
+          ...queryResultProblems(queried, `f${"g".repeat(201)}.ts`).map(
+            (problem) => `query result: ${problem}`,
           ),
         );
     }
@@ -208,6 +207,38 @@ async function runHealthProbe(options) {
     polling = false;
     await pollLoop;
   }
+}
+
+/**
+ * A query result counts only with successful execution, a positive parsed
+ * hit count, and the expected file among the matched entries — echoing the
+ * query text alone proves nothing.
+ */
+function queryResultProblems(queried, expectedFileName) {
+  const problems = [];
+  const stdout = String(queried?.stdout ?? "");
+  if (queried?.code) {
+    problems.push(
+      `query failed: ${String(queried?.stderr ?? queried).slice(0, 120)}`,
+    );
+    return problems;
+  }
+  const match = /hits: (\d+)/.exec(stdout);
+  const hitCount = match ? Number.parseInt(match[1], 10) : 0;
+  if (!match) {
+    problems.push("query output has no parseable hit count");
+  } else if (hitCount < 1) {
+    problems.push(`query returned ${hitCount} hits`);
+  }
+  if (
+    hitCount >= 1 &&
+    !new RegExp(`matchedBy=\\S+ .*${expectedFileName}`).test(stdout)
+  ) {
+    problems.push(
+      `expected file ${expectedFileName} not among matched entries`,
+    );
+  }
+  return problems;
 }
 
 async function readInstanceRecord(home) {
@@ -396,15 +427,30 @@ test("health probe negative control: failed workload fails the probe", async (t)
     await ownedTeardown({ home, root, env, port });
     await removeTemporaryDirectory(temporaryDirectory);
   });
-  const { problems } = await runHealthProbe({ root, home, env, port });
-  assert.ok(
-    problems.length > 0,
-    "probe unexpectedly passed with a failed workload",
-  );
-  assert.ok(
-    /indexing did not succeed/.test(problems.join("; ")),
-    JSON.stringify(problems),
-  );
+  let problems = null;
+  let warmupThrew = null;
+  try {
+    ({ problems } = await runHealthProbe({ root, home, env, port }));
+  } catch (error) {
+    warmupThrew = error;
+  }
+  if (warmupThrew) {
+    // With a broken embedding endpoint the warmup index of the target store
+    // fails and propagates — itself a detected workload failure.
+    assert.match(
+      String(warmupThrew.message ?? warmupThrew),
+      /Command failed|warmup index .* failed|REQUEST_FAILED/,
+    );
+  } else {
+    assert.ok(
+      problems.length > 0,
+      "probe unexpectedly passed with a failed workload",
+    );
+    assert.ok(
+      /indexing did not succeed/.test(problems.join("; ")),
+      JSON.stringify(problems),
+    );
+  }
   await ownedTeardown({ home, root, env, port });
   await removeTemporaryDirectory(temporaryDirectory);
 });
@@ -514,4 +560,41 @@ test("teardown failure path preserves evidence with a live daemon", async (t) =>
     "utf8",
   );
   assert.match(preserved, new RegExp(`"pid":${record.pid}`));
+});
+
+test("query result assertion rejects zero-hit and wrong-file outputs", async () => {
+  const expected = `f${"g".repeat(201)}.ts`;
+  const zeroHit = {
+    code: 0,
+    stdout:
+      "query groups (1):\nQ1 [supplemental]: HealthProbeSymbol\nhits: 0\n",
+  };
+  let threw = null;
+  try {
+    const problems = queryResultProblems(zeroHit, expected);
+    if (problems.length === 0)
+      throw new Error("zero-hit output unexpectedly accepted");
+    threw = problems;
+  } catch (error) {
+    threw = [String(error.message)];
+  }
+  assert.ok(
+    threw.some((p) => /returned 0 hits/.test(p)),
+    "expected the zero-hit failure at the hit-count assertion",
+  );
+  const wrongFile = {
+    code: 0,
+    stdout:
+      "query groups (1):\nhits: 1\n#1 matchedBy=fts src/other.ts:1-2\nexport const HealthProbeSymbol = 42;\n",
+  };
+  const wrongFileProblems = queryResultProblems(wrongFile, expected);
+  assert.ok(
+    wrongFileProblems.some((p) => /not among matched entries/.test(p)),
+    "expected the wrong-file failure at the file assertion",
+  );
+  const good = {
+    code: 0,
+    stdout: `query groups (1):\nhits: 1\n#1 matchedBy=fts some/dir/${expected}:1-2\nexport const HealthProbeSymbol = 42;\n`,
+  };
+  assert.deepEqual(queryResultProblems(good, expected), []);
 });
