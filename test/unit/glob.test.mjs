@@ -484,12 +484,18 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
       await mkdir(dir);
     }
     await writeFile(join(dir, 'f.ts'), 'export const a = 1;\\n');
-    const rules = Array.from({ length: 60 }, (_, i) => '*' + 'a'.repeat(199) + String(i % 10));
+    const rules = Array.from({ length: 66 }, () => '*a'.repeat(101) + '/');
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
     async function maxHeartbeatGap(op) {
       let maxGap = 0; let last = Date.now();
-      const timer = setInterval(() => { const now = Date.now(); maxGap = Math.max(maxGap, now - last); last = now; }, 5);
-      try { await op(); } finally { clearInterval(timer); }
+      const tick = () => { const now = Date.now(); maxGap = Math.max(maxGap, now - last); last = now; };
+      const timer = setInterval(tick, 5);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      last = Date.now();
+      try {
+        await Promise.race([op(), new Promise((_, reject) => setTimeout(() => reject(new Error('external deadline')), 60_000))]);
+      } finally { clearInterval(timer); }
+      maxGap = Math.max(maxGap, Date.now() - last);
       return maxGap;
     }
     let files = -1;
@@ -498,9 +504,49 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
       files = result.files.length;
     });
     assert.equal(files, 1);
-    assert.ok(gap < 250, 'max event-loop block was ' + gap + 'ms');
+    // 66 rules x ~750k units ~= 49M, just under the 50M candidate ceiling:
+    // ~200ms as one monolithic block on the reference system, timer-quantum
+    // gaps when chunked. 100ms separates the two reference behaviors.
+    assert.ok(gap < 100, 'max event-loop block was ' + gap + 'ms');
   `,
     root,
     120_000,
+  );
+});
+
+test("cancellation never returns success and overlapping candidates keep independent ceilings", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-cancel2-");
+  await writeFile(join(root, "f.ts"), "x");
+  await inWorker(
+    `
+    const { withGlobPathBudget, chargeGlobWork } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
+    // pre-aborted scan never completes matching
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      () => scanRootPaths('c2', [{ absolutePath: workerData, recursive: true }], { signal: controller.signal }),
+      /cancel|abort/i,
+    );
+    const { scanFilePath } = await import(${JSON.stringify(new URL("../../dist/engine/pipeline/indexing/scanner/index.js", import.meta.url).href)});
+    await assert.rejects(
+      () => scanFilePath('c2', [{ absolutePath: workerData, recursive: true }], ${JSON.stringify(join(root, "f.ts"))}, { signal: controller.signal }),
+      /cancel|abort/i,
+    );
+    // interleaved candidates in one operation keep independent ceilings
+    const charge60M = async () => {
+      await withGlobPathBudget(1, 0, async () => {
+        for (let i = 0; i < 60; i++) chargeGlobWork(1_000_000);
+      });
+    };
+    await withGlobBudget(async () => {
+      const results = await Promise.allSettled([charge60M(), charge60M()]);
+      for (const r of results) {
+        assert.equal(r.status, 'rejected');
+        assert.ok(/work limit/.test(r.reason.message));
+      }
+    });
+  `,
+    root,
+    60_000,
   );
 });

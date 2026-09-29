@@ -287,7 +287,11 @@ async function scanFilePathImpl(
           basename(absolutePath),
           false,
           rules,
-        )) && matchesFileSelection(relativePath, root, fileTypes),
+          options.signal,
+        )) &&
+        matchesFileSelection(relativePath, root, fileTypes, {
+          signal: options.signal,
+        }),
     );
     if (
       !acceptable ||
@@ -313,9 +317,10 @@ export async function pathCanAffectIndex(
   rootPaths: readonly RootPath[],
   absolutePath: string,
   isDirectory: boolean,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   return withGlobBudget(() =>
-    pathCanAffectIndexImpl(rootPaths, absolutePath, isDirectory),
+    pathCanAffectIndexImpl(rootPaths, absolutePath, isDirectory, signal),
   );
 }
 
@@ -323,6 +328,7 @@ async function pathCanAffectIndexImpl(
   rootPaths: readonly RootPath[],
   absolutePath: string,
   isDirectory: boolean,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   for (const configuredRoot of rootPaths) {
     const root = normalizeRootPath(configuredRoot);
@@ -367,9 +373,12 @@ async function pathCanAffectIndexImpl(
           basename(absolutePath),
           isDirectory,
           rules,
+          signal,
         )) &&
         (isDirectory ||
-          matchesFileSelection(relativePath, root, pathFileTypes)),
+          matchesFileSelection(relativePath, root, pathFileTypes, {
+            signal,
+          })),
     );
     if (
       !acceptable ||
@@ -443,6 +452,7 @@ async function scanDirectoryPathImpl(
             basename(absolutePath),
             true,
             parentRules,
+            options.signal,
           ),
       ));
     if (
@@ -1119,7 +1129,12 @@ async function matchIgnoreRules(
     await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
     let matches: boolean;
     try {
-      matches = ignoreRuleMatches(rule, relativePath, isDirectory);
+      matches = await ignoreRuleMatches(
+        rule,
+        relativePath,
+        isDirectory,
+        signal,
+      );
     } catch (error) {
       throw ignoreRuleError(rule, error);
     }
@@ -1131,6 +1146,7 @@ async function matchIgnoreRules(
     matchedNegation = rule.negated;
     matchedRule = rule;
   }
+  await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
 
   return {
     ignored,
@@ -1214,11 +1230,12 @@ function includeSegmentNamesIgnoredPath(
   );
 }
 
-function ignoreRuleMatches(
+async function ignoreRuleMatches(
   rule: IgnoreRule,
   relativePath: string,
   isDirectory: boolean,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   const path = relativeToIgnoreRuleBase(relativePath, rule.basePath);
   if (path === null || path.length === 0) {
     return false;
@@ -1229,14 +1246,17 @@ function ignoreRuleMatches(
       return pathPatternMatchesPrepared(rule.pattern, path);
     }
 
-    return pathContainsMatchingSegment(path, rule.pattern);
+    return pathContainsMatchingSegment(path, rule.pattern, signal);
   }
 
   if (rule.anchored || rule.hasSlash) {
     return pathPatternMatchesPrepared(rule.pattern, path);
   }
 
-  if (isDirectory && pathContainsMatchingSegment(path, rule.pattern)) {
+  if (
+    isDirectory &&
+    (await pathContainsMatchingSegment(path, rule.pattern, signal))
+  ) {
     return true;
   }
 
@@ -1261,8 +1281,18 @@ function relativeToIgnoreRuleBase(
     : null;
 }
 
-function pathContainsMatchingSegment(path: string, pattern: string): boolean {
-  return path.split("/").some((segment) => segmentMatches(pattern, segment));
+async function pathContainsMatchingSegment(
+  path: string,
+  pattern: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  for (const segment of path.split("/")) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    if (segmentMatches(pattern, segment)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function segmentMatches(pattern: string, segment: string): boolean {

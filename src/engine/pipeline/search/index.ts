@@ -1214,17 +1214,17 @@ async function resolveFilteredFileIds(
             return false;
           }
         }
-        return (
-          (await matchesFileSelection(
-            file.relativePath,
-            plan,
-            fileTypePatterns,
-            {
-              signal,
-              yieldToEventLoop,
-            },
-          )) && matchesModifiedTimeFilter(file, plan)
+        const selected = await matchesFileSelection(
+          file.relativePath,
+          plan,
+          fileTypePatterns,
+          {
+            signal,
+            yieldToEventLoop,
+          },
         );
+        await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+        return selected && matchesModifiedTimeFilter(file, plan);
       },
     );
     if (keep) {

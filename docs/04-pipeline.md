@@ -79,7 +79,11 @@ that directory.
 Path filtering uses bounded glob matching for both search filters and ignore
 rules. Engine limits are 4,096 characters per pattern, 32 levels of brace
 alternation, 32,768 characters per matched path, 10,000 rules per effective rule
-set, and 1 MiB per ignore file. MCP request limits may be stricter. Each
+set, and 1 MiB per ignore file. MCP request limits may be stricter. Candidate
+evaluation is chunked: rule checks yield to the event loop whenever a work
+threshold trips, so one path cannot monopolize the loop, and cancellation is
+honored at every checkpoint. A fixed cumulative ceiling per candidate bounds
+the whole evaluation independently of path length or rule weight. Each
 individual match is bounded by a per-pattern work cap, and every rule check for
 one candidate path — ignore rules, root include/exclude patterns, request
 globs, and expanded file types — shares a single per-candidate allowance sized

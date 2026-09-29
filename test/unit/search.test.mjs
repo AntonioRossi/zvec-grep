@@ -544,7 +544,7 @@ test("oversized glob filters report their field and original index", async () =>
   );
 });
 
-test("search candidate evaluation yields under heavy admitted globs", async () => {
+test("search yields under heavy admitted globs and pre-aborted searches reject", async () => {
   const files = [file("file-a", `${"s".repeat(990)}/a.ts`)];
   const storage = {
     listFiles: () => files,
@@ -583,23 +583,39 @@ test("search candidate evaluation yields under heavy admitted globs", async () =
     storage,
     embeddingModel: new FakeEmbeddingModel(),
   };
-  const heavyGlobs = Array.from(
-    { length: 39 },
-    (_, i) => `*${"a".repeat(1022)}${i % 10}`,
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    searchWorkspaceIndex(
+      { routes: [{ mode: "fts", query: "value" }], globs: ["**"] },
+      context,
+      { signal: controller.signal },
+    ),
+    /cancel|abort/i,
   );
+  const heavyGlobs = Array.from({ length: 39 }, () => "*a".repeat(512));
   async function maxHeartbeatGap(op) {
     let maxGap = 0;
     let last = Date.now();
-    const timer = setInterval(() => {
+    const tick = () => {
       const now = Date.now();
       maxGap = Math.max(maxGap, now - last);
       last = now;
-    }, 5);
+    };
+    const timer = setInterval(tick, 5);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    last = Date.now();
     try {
-      await op();
+      await Promise.race([
+        op(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("external deadline")), 60_000),
+        ),
+      ]);
     } finally {
       clearInterval(timer);
     }
+    maxGap = Math.max(maxGap, Date.now() - last);
     return maxGap;
   }
   let hits = -1;

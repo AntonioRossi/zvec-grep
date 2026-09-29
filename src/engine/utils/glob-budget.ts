@@ -84,6 +84,10 @@ export async function withGlobPathBudget<T>(
     globPathAllowance(pathLength, activeRuleWeight),
     MAX_CANDIDATE_WORK,
   );
+  // Each candidate runs in its own store so interleaved candidates within one
+  // enclosing operation can neither clobber nor inherit each other's
+  // allowance; the save/restore pattern is only safe for strictly nested
+  // calls, which concurrent candidates are not.
   const store = operationBudget.getStore();
   if (!store) {
     return operationBudget.run(
@@ -91,13 +95,14 @@ export async function withGlobPathBudget<T>(
       body,
     );
   }
-  const previous = store.pathRemaining;
-  store.pathRemaining = allowance;
-  try {
-    return await body();
-  } finally {
-    store.pathRemaining = previous;
-  }
+  return operationBudget.run(
+    {
+      sinceYield: store.sinceYield,
+      overheadOnly: store.overheadOnly,
+      pathRemaining: allowance,
+    },
+    body,
+  );
 }
 
 /**
@@ -156,9 +161,13 @@ export async function yieldGlobWorkIfNeeded(
   yieldToEventLoop: () => Promise<unknown>,
   signal?: AbortSignal,
 ): Promise<void> {
-  if (!globWorkNeedsYield()) return;
+  // Cancellation is checked on every call, regardless of the work threshold,
+  // again immediately after yielding: a pre-aborted operation never starts
+  // matching, and an abort during the final chunk cannot return success.
   throwIfAbortedSignal(signal);
+  if (!globWorkNeedsYield()) return;
   await yieldToEventLoop();
+  throwIfAbortedSignal(signal);
 }
 
 function throwIfAbortedSignal(signal: AbortSignal | undefined): void {
