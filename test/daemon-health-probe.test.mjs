@@ -92,9 +92,6 @@ async function runHealthProbe(options) {
           okPolls++;
           if (loadStartedAt && Date.now() >= loadStartedAt) {
             loadOkPolls++;
-            if (elapsed > 200) {
-              console.log("SLOW", Date.now() - loadStartedAt, elapsed);
-            }
             worstHealthMs = Math.max(worstHealthMs, elapsed);
           }
         }
