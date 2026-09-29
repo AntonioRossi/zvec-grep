@@ -160,7 +160,9 @@ async function runHealthProbe(options) {
 }
 
 async function readInstanceRecord(home) {
-  const recordPath = join(home, ".zvec-grep", "instance.lock");
+  // The daemon stores its record under <home>/daemon/instance.lock
+  // (daemonHome in src/daemon/config.ts).
+  const recordPath = join(home, "daemon", "instance.lock");
   const content = await readFile(recordPath, "utf8").catch(() => null);
   if (content === null) return null;
   try {
@@ -216,6 +218,9 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
   const temporaryDirectory = await createTemporaryDirectory(
     t,
     "zvec-grep-health-probe-",
+    {
+      cleanup: false,
+    },
   );
   const root = await prepareHeavyFixture(temporaryDirectory, ".");
   const home = join(temporaryDirectory, "home");
@@ -231,9 +236,10 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     ZVEC_GREP_SERVER_URL: `http://127.0.0.1:${port}/mcp`,
   };
   t.after(async () => {
-    await ownedTeardown({ home, root, env, port }).finally(() =>
-      removeTemporaryDirectory(temporaryDirectory),
-    );
+    // Removal happens only after confirmed termination and listener release;
+    // an unconfirmed teardown throws and the directories remain as evidence.
+    await ownedTeardown({ home, root, env, port });
+    await removeTemporaryDirectory(temporaryDirectory);
   });
 
   const { problems, worstHealthMs, okPolls } = await runHealthProbe({
@@ -256,6 +262,9 @@ test("health probe negative control: unavailable health fails the probe", async 
   const temporaryDirectory = await createTemporaryDirectory(
     t,
     "zvec-grep-health-dead-",
+    {
+      cleanup: false,
+    },
   );
   const root = await prepareHeavyFixture(temporaryDirectory, ".");
   const home = join(temporaryDirectory, "home");
@@ -272,9 +281,10 @@ test("health probe negative control: unavailable health fails the probe", async 
     ZVEC_GREP_SERVER_URL: `http://127.0.0.1:${port}/mcp`,
   };
   t.after(async () => {
-    await ownedTeardown({ home, root, env, port }).finally(() =>
-      removeTemporaryDirectory(temporaryDirectory),
-    );
+    // Removal happens only after confirmed termination and listener release;
+    // an unconfirmed teardown throws and the directories remain as evidence.
+    await ownedTeardown({ home, root, env, port });
+    await removeTemporaryDirectory(temporaryDirectory);
   });
   // Polling a port with no listener: the probe must report failure even
   // though the daemon itself and its workload are healthy.
@@ -301,6 +311,9 @@ test("health probe negative control: failed workload fails the probe", async (t)
   const temporaryDirectory = await createTemporaryDirectory(
     t,
     "zvec-grep-health-broken-",
+    {
+      cleanup: false,
+    },
   );
   const root = await prepareHeavyFixture(temporaryDirectory, ".");
   const home = join(temporaryDirectory, "home");
@@ -316,9 +329,10 @@ test("health probe negative control: failed workload fails the probe", async (t)
     ZVEC_GREP_SERVER_URL: `http://127.0.0.1:${port}/mcp`,
   };
   t.after(async () => {
-    await ownedTeardown({ home, root, env, port }).finally(() =>
-      removeTemporaryDirectory(temporaryDirectory),
-    );
+    // Removal happens only after confirmed termination and listener release;
+    // an unconfirmed teardown throws and the directories remain as evidence.
+    await ownedTeardown({ home, root, env, port });
+    await removeTemporaryDirectory(temporaryDirectory);
   });
   const { problems } = await runHealthProbe({ root, home, env, port });
   assert.ok(
@@ -337,15 +351,18 @@ test("teardown preserves ownership evidence when termination is unconfirmed", as
   const temporaryDirectory = await createTemporaryDirectory(
     t,
     "zvec-grep-teardown-preserve-",
+    {
+      cleanup: false,
+    },
   );
   const home = join(temporaryDirectory, "home");
-  await mkdir(join(home, ".zvec-grep"), { recursive: true });
+  await mkdir(join(home, "daemon"), { recursive: true });
   const port = await availablePort();
   // A fabricated live daemon record: termination can never be confirmed, so
   // the teardown must throw and must NOT have removed the record or home.
   const fakePid = process.pid;
   await writeFile(
-    join(home, ".zvec-grep", "instance.lock"),
+    join(home, "daemon", "instance.lock"),
     `${JSON.stringify({ pid: fakePid, serverUrl: `http://127.0.0.1:${port}` })}\n`,
   );
   let threw = null;
@@ -364,8 +381,75 @@ test("teardown preserves ownership evidence when termination is unconfirmed", as
   assert.match(threw.message, /preserved/);
   // Ownership evidence preserved: record and home still exist.
   const preserved = await readFile(
-    join(home, ".zvec-grep", "instance.lock"),
+    join(home, "daemon", "instance.lock"),
     "utf8",
   );
   assert.match(preserved, new RegExp(`"pid":${fakePid}`));
+});
+
+test("teardown failure path preserves evidence with a live daemon", async (t) => {
+  const temporaryDirectory = await createTemporaryDirectory(
+    t,
+    "zvec-grep-teardown-live-",
+    { cleanup: false },
+  );
+  const root = temporaryDirectory;
+  const home = join(temporaryDirectory, "home");
+  await mkdir(join(home, "daemon"), { recursive: true });
+  const port = await availablePort();
+  const env = {
+    ...process.env,
+    ZVEC_GREP_HOME: home,
+    HOME: home,
+    NO_COLOR: "1",
+  };
+  const started = await runCli(
+    ["--server", "on", "--listen", `127.0.0.1:${port}`, "--home", home],
+    { cwd: root, env },
+  );
+  assert.match(started.stdout, /Server: ready/);
+  const record = JSON.parse(
+    await readFile(join(home, "daemon", "instance.lock"), "utf8"),
+  );
+  // Contained cleanup for the test itself: a correct stop that must succeed.
+  t.after(async () => {
+    await runCli(["--server", "off", "--home", home], { cwd: root, env }).catch(
+      () => undefined,
+    );
+    try {
+      process.kill(record.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+    await removeTemporaryDirectory(temporaryDirectory);
+  });
+  // Sabotaged termination: the owning teardown is pointed at a home whose
+  // record it cannot read and whose listener stays up, so termination is
+  // unconfirmed; it must throw and preserve the real home's evidence.
+  let threw = null;
+  try {
+    await ownedTeardown({
+      home: join(temporaryDirectory, "elsewhere"),
+      root,
+      env,
+      port,
+    });
+  } catch (error) {
+    threw = error;
+  }
+  assert.ok(threw, "teardown must throw when termination is unconfirmed");
+  assert.match(threw.message, /teardown unconfirmed/);
+  let alive = false;
+  try {
+    process.kill(record.pid, 0);
+    alive = true;
+  } catch {
+    alive = false;
+  }
+  assert.ok(alive, "daemon should still be alive in the failure path");
+  const preserved = await readFile(
+    join(home, "daemon", "instance.lock"),
+    "utf8",
+  );
+  assert.match(preserved, new RegExp(`"pid":${record.pid}`));
 });
