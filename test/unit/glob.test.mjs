@@ -509,8 +509,9 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
     });
     assert.equal(files, 1);
     // 100 rules x ~500k units ~= 49M, just under the 50M candidate ceiling:
-    // ~200ms as one monolithic block on the reference system, timer-quantum
-    // gaps when chunked. 100ms separates the two reference behaviors.
+    // roughly half a second as one monolithic block on the reference system
+    // (recorded 542-563ms on the withdrawn head), timer-quantum gaps when
+    // chunked. 100ms separates the two reference behaviors.
     assert.ok(gap < 100, 'max event-loop block was ' + gap + 'ms');
   `,
     root,
