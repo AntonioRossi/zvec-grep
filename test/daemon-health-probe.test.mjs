@@ -72,22 +72,29 @@ async function runHealthProbe(options) {
   assert.match(started.stdout, /Server: ready/);
 
   let polling = true;
+  let loadStartedAt = 0;
   let worstHealthMs = 0;
   let okPolls = 0;
+  let loadOkPolls = 0;
   const failures = [];
-  const t0 = Date.now();
   const healthUrl_ = healthUrl ?? `http://127.0.0.1:${port}/healthz`;
   const pollLoop = (async () => {
     while (polling) {
       const requestStart = Date.now();
       try {
-        const response = await fetch(healthUrl_);
+        const response = await fetch(healthUrl_, {
+          signal: AbortSignal.timeout(2_000),
+        });
         const elapsed = Date.now() - requestStart;
         if (response.status !== 200) {
           failures.push(`status ${response.status}`);
         } else {
           okPolls++;
-          if (Date.now() - t0 > 2_000) {
+          if (loadStartedAt && Date.now() >= loadStartedAt) {
+            loadOkPolls++;
+            if (elapsed > 200) {
+              console.log("SLOW", Date.now() - loadStartedAt, elapsed);
+            }
             worstHealthMs = Math.max(worstHealthMs, elapsed);
           }
         }
@@ -97,66 +104,106 @@ async function runHealthProbe(options) {
       await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
     }
   })();
+  try {
+    const warmupDeadline = Date.now() + 15_000;
+    while (okPolls === 0 && Date.now() < warmupDeadline) {
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+    }
+    assert.ok(okPolls > 0, "health endpoint never answered during warmup");
 
-  const queryArgs = [
-    "--fts",
-    "HealthProbeSymbol",
-    "--limit",
-    "1",
-    "--refresh",
-    "off",
-    "--allow-remote",
-  ];
-  const [indexed, queried] = await Promise.all([
-    runCli(["--index", "--mode", "server", "--allow-remote", root], {
-      cwd: root,
-      env,
-      timeout: 180_000,
-    }).catch((error) => error),
-    (async () => {
-      await new Promise((resolveSleep) => setTimeout(resolveSleep, 200));
-      return runCli([...queryArgs, "--mode", "server"], {
+    // Expensive search filters: heavy globs evaluated against the fixture's
+    // deep paths, alongside the matching pattern.
+    const heavyGlobs = Array.from(
+      { length: 100 },
+      (_, i) => "*a".repeat(100) + "*Z" + i,
+    );
+    const queryArgs = [
+      "--fts",
+      "HealthProbeSymbol",
+      "--limit",
+      "1",
+      "--refresh",
+      "off",
+      "--allow-remote",
+      ...heavyGlobs.flatMap((glob) => ["--glob", glob]),
+      "--glob",
+      "*.ts",
+    ];
+    // Warmup completes only after the daemon has actually served workload:
+    // a tiny warmup index triggers model preparation before measured load.
+    const warmupRoot = join(root, "..", "warmup-repo");
+    await mkdir(warmupRoot, { recursive: true });
+    await writeFile(
+      join(warmupRoot, "warmup.ts"),
+      "export const Warmup = 1;\n",
+    );
+    await runCli(
+      ["--index", "--mode", "server", "--allow-remote", warmupRoot],
+      { cwd: warmupRoot, env, timeout: 120_000 },
+    ).catch(() => undefined);
+
+    loadStartedAt = Date.now();
+    const [indexed, queried] = await Promise.all([
+      runCli(["--index", "--mode", "server", "--allow-remote", root], {
         cwd: root,
         env,
-        timeout: 120_000,
-      }).catch((error) => error);
-    })(),
-  ]);
-  polling = false;
-  await pollLoop;
+        timeout: 180_000,
+      }).catch((error) => error),
+      (async () => {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 200));
+        return runCli([...queryArgs, "--mode", "server"], {
+          cwd: root,
+          env,
+          timeout: 120_000,
+        }).catch((error) => error);
+      })(),
+    ]);
+    polling = false;
+    await pollLoop;
 
-  const problems = [];
-  if (failures.length > 0) {
-    problems.push(`${failures.length} health requests failed (${failures[0]})`);
-  }
-  if (okPolls < minOkPolls) {
-    problems.push(`only ${okPolls} successful health responses`);
-  }
-  if (worstHealthMs >= maxMs) {
-    problems.push(`worst steady-state health latency ${worstHealthMs}ms`);
-  }
-  const indexedOk =
-    !indexed?.code &&
-    /Workspace index: succeeded/.test(String(indexed.stdout ?? ""));
-  const queriedOk =
-    !queried?.code && /HealthProbeSymbol/.test(String(queried.stdout ?? ""));
-  if (expectWorkloadSuccess) {
-    if (!indexedOk)
+    const problems = [];
+    if (failures.length > 0) {
       problems.push(
-        `indexing did not succeed: ${String(indexed?.stderr ?? indexed)}`.slice(
-          0,
-          200,
-        ),
+        `${failures.length} health requests failed (${failures[0]})`,
       );
-    if (!queriedOk)
+    }
+    if (okPolls < minOkPolls) {
+      problems.push(`only ${okPolls} successful health responses`);
+    }
+    if (loadOkPolls < 20) {
       problems.push(
-        `query did not find the symbol: ${String(queried?.stderr ?? queried)}`.slice(
-          0,
-          200,
-        ),
+        `only ${loadOkPolls} health responses during confirmed load`,
       );
+    }
+    if (worstHealthMs >= maxMs) {
+      problems.push(`worst steady-state health latency ${worstHealthMs}ms`);
+    }
+    const indexedOk =
+      !indexed?.code &&
+      /Workspace index: succeeded/.test(String(indexed.stdout ?? ""));
+    const queriedOk =
+      !queried?.code && /HealthProbeSymbol/.test(String(queried.stdout ?? ""));
+    if (expectWorkloadSuccess) {
+      if (!indexedOk)
+        problems.push(
+          `indexing did not succeed: ${String(indexed?.stderr ?? indexed)}`.slice(
+            0,
+            200,
+          ),
+        );
+      if (!queriedOk)
+        problems.push(
+          `query did not find the symbol: ${String(queried?.stderr ?? queried)}`.slice(
+            0,
+            200,
+          ),
+        );
+    }
+    return { problems, worstHealthMs, okPolls, loadOkPolls };
+  } finally {
+    polling = false;
+    await pollLoop;
   }
-  return { problems, worstHealthMs, okPolls };
 }
 
 async function readInstanceRecord(home) {
@@ -286,23 +333,34 @@ test("health probe negative control: unavailable health fails the probe", async 
     await ownedTeardown({ home, root, env, port });
     await removeTemporaryDirectory(temporaryDirectory);
   });
-  // Polling a port with no listener: the probe must report failure even
+  // Polling a port with no listener: the probe must fail — either at warmup
+  // (the endpoint never answers) or through reported request failures — even
   // though the daemon itself and its workload are healthy.
-  const { problems } = await runHealthProbe({
-    root,
-    home,
-    env,
-    port,
-    healthUrl: `http://127.0.0.1:${deadPort}/healthz`,
-  });
-  assert.ok(
-    problems.length > 0,
-    "probe unexpectedly passed with no health listener",
-  );
-  assert.ok(
-    problems.some((p) => /health requests failed|successful health/.test(p)),
-    JSON.stringify(problems),
-  );
+  let problems = null;
+  let warmupThrew = null;
+  try {
+    ({ problems } = await runHealthProbe({
+      root,
+      home,
+      env,
+      port,
+      healthUrl: `http://127.0.0.1:${deadPort}/healthz`,
+    }));
+  } catch (error) {
+    warmupThrew = error;
+  }
+  if (warmupThrew) {
+    assert.match(warmupThrew.message, /never answered during warmup/);
+  } else {
+    assert.ok(
+      problems.length > 0,
+      "probe unexpectedly passed with no health listener",
+    );
+    assert.ok(
+      problems.some((p) => /health requests failed|successful health/.test(p)),
+      JSON.stringify(problems),
+    );
+  }
   await ownedTeardown({ home, root, env, port });
   await removeTemporaryDirectory(temporaryDirectory);
 });
