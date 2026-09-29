@@ -686,9 +686,25 @@ test("adversarial 400-rule fixture rejects at the labeled candidate ceiling", as
     await writeFile(join(dir, 'f.ts'), 'x');
     const rules = Array.from({ length: 400 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
+    const { GlobWorkLimitError } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
+    const started = Date.now();
     await assert.rejects(
       () => scanRootPaths('ceiling', [{ absolutePath: workerData, recursive: true }]),
-      (error) => /work limit/.test(error.message) && /\\.gitignore:\\d+/.test(error.message),
+      (error) => {
+        const rejectionMs = Date.now() - started;
+        assert.match(error.message, /work limit/);
+        assert.match(error.message, /\\.gitignore:\\d+/);
+        let cause = error;
+        while (cause instanceof Error && cause.cause instanceof Error) {
+          cause = cause.cause;
+        }
+        assert.ok(
+          cause instanceof GlobWorkLimitError,
+          'expected the candidate-ceiling cause, got ' + cause.constructor.name,
+        );
+        assert.ok(rejectionMs < 5_000, 'rejection took ' + rejectionMs + 'ms');
+        return true;
+      },
     );
   `,
     root,
@@ -718,4 +734,40 @@ test("frozen and non-error cancellation reasons are preserved unmuted", async (t
     root,
     30_000,
   );
+});
+
+test("charged sibling scopes recover after child error and cancellation", async () => {
+  const { withGlobBudget, withGlobPathBudget, chargeGlobWork } =
+    await import("../../dist/engine/utils/glob-budget.js");
+  const dimensions = [3_800, 200_000];
+  const charge60M = () =>
+    withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(60_000_000);
+    });
+  // A child that exhausts its ceiling must not damage a sibling's ceiling.
+  await withGlobBudget(async () => {
+    await assert.rejects(charge60M(), /work limit/);
+    await assert.rejects(charge60M(), /work limit/);
+  });
+  // A child cancelled mid-charge must not damage a sibling's ceiling either.
+  const controller = new AbortController();
+  const reason = new Error("stop-child");
+  controller.abort(reason);
+  await withGlobBudget(async () => {
+    await assert.rejects(
+      withGlobPathBudget(...dimensions, async () => {
+        chargeGlobWork(10_000_000);
+        await Promise.resolve();
+        const { yieldGlobWorkIfNeeded } =
+          await import("../../dist/engine/utils/glob-budget.js");
+        await yieldGlobWorkIfNeeded(
+          () => new Promise((resolve) => setImmediate(resolve)),
+          controller.signal,
+        );
+        chargeGlobWork(10_000_000);
+      }),
+      (error) => error === reason,
+    );
+    await assert.rejects(charge60M(), /work limit/);
+  });
 });
