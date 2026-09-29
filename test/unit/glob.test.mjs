@@ -806,15 +806,18 @@ test("charged scopes resume correctly after a child work-limit error", async () 
       chargeGlobWork(20_000_000);
       await assert.rejects(failingChild(), /work limit/);
       chargeGlobWork(25_000_000);
+      // Cumulative excess inside the SAME resumed scope: 20M + 25M + 6M
+      // exceeds the 50M allowance and must reject even though a fresh
+      // scope would still have its full allowance.
+      await assert.rejects(
+        (async () => {
+          chargeGlobWork(6_000_000);
+        })(),
+        /work limit/,
+      );
       return "parent-resumed";
     });
     assert.equal(result, "parent-resumed");
-    await assert.rejects(
-      withGlobPathBudget(...dimensions, async () => {
-        chargeGlobWork(51_000_000);
-      }),
-      /work limit/,
-    );
   });
   // Sibling resume: sibling B charges 20M, a child of B fails, B resumes.
   await withGlobBudget(async () => {
@@ -830,6 +833,13 @@ test("charged scopes resume correctly after a child work-limit error", async () 
       chargeGlobWork(20_000_000);
       await assert.rejects(failingChild(), /work limit/);
       chargeGlobWork(25_000_000);
+      // Cumulative excess inside the same resumed sibling scope.
+      await assert.rejects(
+        (async () => {
+          chargeGlobWork(6_000_000);
+        })(),
+        /work limit/,
+      );
       return "sibling-resumed";
     });
     assert.equal(sibling, "sibling-resumed");
@@ -863,14 +873,15 @@ test("charged scopes resume correctly after a child cancellation", async () => {
         (error) => error === reason,
       );
       chargeGlobWork(25_000_000);
+      // Cumulative excess inside the same resumed scope after cancellation.
+      await assert.rejects(
+        (async () => {
+          chargeGlobWork(6_000_000);
+        })(),
+        /work limit/,
+      );
       return "resumed-after-cancel";
     });
     assert.equal(result, "resumed-after-cancel");
-    await assert.rejects(
-      withGlobPathBudget(...dimensions, async () => {
-        chargeGlobWork(51_000_000);
-      }),
-      /work limit/,
-    );
   });
 });
