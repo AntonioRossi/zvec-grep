@@ -1444,11 +1444,15 @@ function resolveEmbeddingConcurrencyPolicy(
     Number.isInteger(requestedConcurrency) &&
     requestedConcurrency > 0
   ) {
+    const concurrency = Math.min(
+      requestedConcurrency,
+      model.info.limits.maxConcurrentBatches ?? requestedConcurrency,
+    );
     return {
-      initial: requestedConcurrency,
+      initial: concurrency,
       min: 1,
-      max: requestedConcurrency,
-      adaptive: requestedConcurrency > 1,
+      max: concurrency,
+      adaptive: concurrency > 1,
     };
   }
 
@@ -1647,7 +1651,8 @@ function classifyEmbeddingRetry(
     (code) =>
       code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DOWNLOAD_FAILED" ||
       code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_LOAD_FAILED" ||
-      code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DISPOSED",
+      code === "ZVEC_GREP.ENGINE.MODELS.MODEL2VEC_DISPOSED" ||
+      code === "ZVEC_GREP.ENGINE.MODELS.TRANSFORMERS_JS_LOAD_FAILED",
   );
   const retryable =
     !sharedLocalModelFailure &&

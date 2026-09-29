@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { DaemonError } from "../dist/daemon/errors.js";
 import { JobScheduler } from "../dist/daemon/job-scheduler.js";
+import { createDaemonLogger, rootIdentity } from "../dist/daemon/logger.js";
 import { EngineError } from "../dist/engine/errors.js";
+import { createTemporaryDirectory } from "./helpers/fixtures.mjs";
 
 test("scheduler reuses same-root jobs and enforces global concurrency", async () => {
   const scheduler = new JobScheduler({ concurrency: 1 });
@@ -119,6 +123,82 @@ test("scheduler wait observes current and future index progress", async () => {
   assert.equal(observed[1].filesIndexed, 2);
   assert.equal(observed[1].filesTotal, 5);
   await scheduler.close();
+});
+
+test("scheduler persists model warnings while forwarding progress and does not retry model load failures", async (t) => {
+  const home = await createTemporaryDirectory(t, "zvec-grep-model-warning-");
+  const logger = createDaemonLogger(home);
+  const scheduler = new JobScheduler({
+    logger,
+    maxAttempts: 3,
+    retryBaseDelayMs: 1,
+  });
+  t.after(() => scheduler.close());
+  const root = "/repo-model-warning";
+  const providerCause = "libcublasLt.so.12: cannot open shared object file";
+  const warning = {
+    phase: "indexing",
+    embedding: {
+      stage: "warning",
+      model: "local/test-transformers",
+      message: `CUDA initialization failed: ${providerCause}; token=secret-value`,
+    },
+  };
+  const followingProgress = {
+    phase: "indexing",
+    detail: "embedding first.ts",
+  };
+  let start;
+  const ready = new Promise((resolve) => {
+    start = resolve;
+  });
+  let attempts = 0;
+  const submitted = scheduler.submit({
+    canonicalRoot: root,
+    reason: "manual",
+    run: async (report) => {
+      attempts++;
+      await ready;
+      report(warning);
+      report(followingProgress);
+      throw new EngineError("Transformers.js initialization failed", {
+        code: "ZVEC_GREP.ENGINE.MODELS.TRANSFORMERS_JS_LOAD_FAILED",
+        cause: new Error(providerCause),
+      });
+    },
+  });
+  const observed = [];
+  const completed = scheduler.wait(submitted.job.id, (progress) => {
+    observed.push(progress);
+  });
+  start();
+  const result = await completed;
+  await logger.flush();
+
+  assert.equal(result.state, "failed");
+  assert.equal(result.attempt, 1);
+  assert.equal(attempts, 1);
+  assert.deepEqual(observed, [warning, followingProgress]);
+  assert.deepEqual(result.progress, followingProgress);
+  const records = (
+    await readFile(join(home, "daemon", "logs", "server.log"), "utf8")
+  )
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const warnings = records.filter((record) => record.event === "model.warning");
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].root_id, rootIdentity(root));
+  assert.equal(warnings[0].job_id, submitted.job.id);
+  assert.equal(warnings[0].model, warning.embedding.model);
+  assert.equal(warnings[0].attempt, 1);
+  assert.ok(warnings[0].message.includes(providerCause));
+  assert.match(warnings[0].message, /token=\[redacted\]/);
+  assert.doesNotMatch(JSON.stringify(records), /secret-value/);
+  assert.equal(
+    records.some((record) => record.event === "job.retry"),
+    false,
+  );
 });
 
 test("scheduler keeps one follow-up for changes submitted while a root is running", async () => {
@@ -490,6 +570,129 @@ test("scheduler keeps failures without context backward compatible", async (t) =
   }
 });
 
+test("scheduler releases finished run closures and bounds retained jobs", async (t) => {
+  const scheduler = new JobScheduler({ concurrency: 1 });
+  t.after(() => scheduler.close());
+  const submitted = [];
+  for (let index = 0; index < 300; index++) {
+    submitted.push(
+      scheduler.submit({
+        canonicalRoot: `/repo-${index}`,
+        reason: "manual",
+        run: async () => {},
+      }).job,
+    );
+  }
+  const finished = [];
+  for (const job of submitted) {
+    finished.push(await scheduler.wait(job.id));
+  }
+  assert.ok(
+    finished.every((job) => job.state === "succeeded"),
+    "every job should succeed",
+  );
+
+  // Terminal jobs keep their snapshots for late lookups but must not pin the
+  // run closure (which can capture credentials from the index options).
+  const newest = submitted[submitted.length - 1];
+  const internals = scheduler;
+  assert.equal(internals.jobs.get(newest.id)?.run, undefined);
+  assert.equal(scheduler.get(newest.id)?.state, "succeeded");
+  assert.equal(scheduler.getByRoot(newest.canonicalRoot)?.state, "succeeded");
+
+  // The jobs Map stays bounded; the oldest finished jobs are evicted.
+  assert.equal(internals.jobs.size, 256);
+  assert.equal(scheduler.get(submitted[0].id), undefined);
+  assert.equal((await scheduler.wait(newest.id)).state, "succeeded");
+});
+
+test("scheduler clears the run reference once a job reaches a terminal state", async (t) => {
+  const scheduler = new JobScheduler({
+    concurrency: 1,
+    maxAttempts: 2,
+    retryBaseDelayMs: 5,
+  });
+  t.after(() => scheduler.close());
+  let attempts = 0;
+  const retrying = scheduler.submit({
+    canonicalRoot: "/repo-retry",
+    reason: "manual",
+    run: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new DaemonError("INDEX_BUSY", "busy", true);
+      }
+    },
+  });
+  assert.equal((await scheduler.wait(retrying.job.id)).state, "succeeded");
+  assert.equal(attempts, 2);
+  const internals = scheduler;
+  assert.equal(internals.jobs.get(retrying.job.id)?.run, undefined);
+});
+
+test("scheduler forgetRoot releases a dropped root's bookkeeping", async (t) => {
+  const scheduler = new JobScheduler({ concurrency: 1 });
+  t.after(() => scheduler.close());
+  const first = scheduler.submit({
+    canonicalRoot: "/repo-a",
+    reason: "manual",
+    run: async () => {},
+  });
+  await scheduler.wait(first.job.id);
+  const second = scheduler.submit({
+    canonicalRoot: "/repo-b",
+    reason: "manual",
+    run: async () => {},
+  });
+  await scheduler.wait(second.job.id);
+  const internals = scheduler;
+  assert.equal(internals.jobs.size, 2);
+
+  scheduler.forgetRoot("/repo-a");
+  assert.equal(scheduler.getByRoot("/repo-a"), undefined);
+  assert.equal(scheduler.get(first.job.id), undefined);
+  assert.equal(internals.finishedJobIds.includes(first.job.id), false);
+  // Other roots are untouched.
+  assert.equal(scheduler.getByRoot("/repo-b")?.state, "succeeded");
+  assert.equal(internals.jobs.size, 1);
+
+  // The forgotten root can be indexed again afterwards.
+  const again = scheduler.submit({
+    canonicalRoot: "/repo-a",
+    reason: "manual",
+    run: async () => {},
+  });
+  assert.equal(again.reused, false);
+  assert.equal((await scheduler.wait(again.job.id)).state, "succeeded");
+});
+
+test("scheduler forgetRoot cancels an active job for the root", async (t) => {
+  const scheduler = new JobScheduler({ concurrency: 1 });
+  t.after(() => scheduler.close());
+  let aborted = false;
+  const running = scheduler.submit({
+    canonicalRoot: "/repo-live",
+    reason: "manual",
+    run: (_report, signal) =>
+      new Promise((resolve) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            aborted = true;
+            resolve();
+          },
+          { once: true },
+        );
+      }),
+  });
+  await waitFor(() => scheduler.get(running.job.id)?.state === "running");
+  scheduler.forgetRoot("/repo-live");
+  assert.equal(scheduler.getByRoot("/repo-live"), undefined);
+  const result = await scheduler.wait(running.job.id);
+  assert.equal(aborted, true);
+  assert.equal(result.state, "cancelled");
+});
+
 async function waitFor(predicate) {
   for (let attempt = 0; attempt < 100; attempt++) {
     if (predicate()) {
@@ -499,3 +702,36 @@ async function waitFor(predicate) {
   }
   throw new Error("Condition was not reached.");
 }
+
+test("scheduler persists the native failure message and context", async (t) => {
+  const home = await createTemporaryDirectory(t, "zvec-grep-job-error-");
+  const logger = createDaemonLogger(home);
+  const scheduler = new JobScheduler({ logger });
+  t.after(() => scheduler.close());
+  const message =
+    "FtsRocksdbReducer: source postings is not BitPacked. field=text";
+  const submitted = scheduler.submit({
+    canonicalRoot: "/repo-fts-failure",
+    reason: "manual",
+    run: async () => {
+      throw new EngineError(message, {
+        code: "ZVEC_INTERNAL_ERROR",
+        context: "segment=1",
+        cause: new Error("merge failed"),
+      });
+    },
+  });
+  await scheduler.wait(submitted.job.id);
+  await logger.flush();
+  const records = (
+    await readFile(join(home, "daemon", "logs", "server.log"), "utf8")
+  )
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const finished = records.find((record) => record.event === "job.finished");
+  assert.equal(finished.error_code, "ZVEC_INTERNAL_ERROR");
+  assert.equal(finished.error_message, message);
+  assert.equal(finished.error_context, "segment=1");
+  assert.match(finished.error_cause, /merge failed/);
+});
