@@ -479,12 +479,12 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
     const { mkdir, writeFile } = await import('node:fs/promises');
     const { join } = await import('node:path');
     let dir = workerData;
-    for (let depth = 0; depth < 12; depth++) {
-      dir = join(dir, 'd'.repeat(230));
+    for (let depth = 0; depth < 8; depth++) {
+      dir = join(dir, 'a'.repeat(200));
       await mkdir(dir);
     }
-    await writeFile(join(dir, 'f.ts'), 'export const a = 1;\\n');
-    const rules = Array.from({ length: 100 }, () => '*a'.repeat(45) + '/');
+    await writeFile(join(dir, 'f' + 'g'.repeat(201) + '.ts'), 'export const a = 1;\\n');
+    const rules = Array.from({ length: 100 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
     async function maxHeartbeatGap(op) {
       let maxGap = 0; let last = Date.now();
@@ -565,19 +565,37 @@ test("cancellation reason survives pattern wrappers, root filters, and interleav
       () => scanRootPaths('c3', [{ absolutePath: workerData, recursive: true, exclude: ['x'.repeat(4090)] }], { signal: controller.signal }),
       (error) => error === reason || (error.cause === reason && isGlobCancellation(error)),
     );
-    // barrier-interleaved 30M+30M charges: both candidates await a tick between
-    // 10M chunks, so their evaluation interleaves; independent ceilings let both
-    // complete where a shared store would wrongly reject at the 50M ceiling.
+    // Real overlap reaching the 50M ceiling: shared outer operation, weight
+    // 200,000 with path length 3,800 gives allowance min(...,50M)=50M.
+    // Candidate A charges 30M and suspends at a barrier; sibling B then
+    // charges 45M. With independent candidate stores both fulfill; a shared
+    // store (the withdrawn save/restore) would see a 20M remainder and
+    // wrongly reject B.
     const tick = () => new Promise((resolve) => setImmediate(resolve));
-    const run = async () => withGlobPathBudget(1, 450_000, async () => {
-      for (let chunk = 0; chunk < 3; chunk++) {
-        chargeGlobWork(10_000_000);
-        await tick();
-      }
+    const dimensions = [3_800, 200_000];
+    let releaseA;
+    const barrier = new Promise((resolve) => (releaseA = resolve));
+    let bDone;
+    const bFinished = new Promise((resolve) => (bDone = resolve));
+    let bSettled = 'pending';
+    await withGlobBudget(async () => {
+      const a = withGlobPathBudget(dimensions[0], dimensions[1], async () => {
+        chargeGlobWork(30_000_000);
+        releaseA();
+        await bFinished;
+      });
+      const bStarted = barrier.then(() =>
+        withGlobPathBudget(dimensions[0], dimensions[1], async () => {
+          chargeGlobWork(45_000_000);
+          bSettled = 'charged';
+        }),
+      );
+      bStarted.then(bDone, bDone);
+      const both = await Promise.allSettled([a, bStarted]);
+      assert.equal(both[0].status, 'fulfilled', 'A rejected: ' + both[0].reason);
+      assert.equal(both[1].status, 'fulfilled', 'B rejected: ' + both[1].reason);
+      assert.equal(bSettled, 'charged');
     });
-    const both = await Promise.allSettled([run(), run()]);
-    assert.equal(both[0].status, 'fulfilled');
-    assert.equal(both[1].status, 'fulfilled');
     // scope restoration after a work-limit error
     await assert.rejects(
       () => withGlobPathBudget(1, 0, async () => { chargeGlobWork(60_000_000); }),
@@ -587,5 +605,53 @@ test("cancellation reason survives pattern wrappers, root filters, and interleav
   `,
     root,
     60_000,
+  );
+});
+
+test("adversarial 400-rule fixture rejects at the labeled candidate ceiling", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-ceiling-");
+  await inWorker(
+    `
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    let dir = workerData;
+    for (let depth = 0; depth < 8; depth++) {
+      dir = join(dir, 'a'.repeat(200));
+      await mkdir(dir);
+    }
+    await writeFile(join(dir, 'f.ts'), 'x');
+    const rules = Array.from({ length: 400 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
+    await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
+    await assert.rejects(
+      () => scanRootPaths('ceiling', [{ absolutePath: workerData, recursive: true }]),
+      (error) => /work limit/.test(error.message) && /\\.gitignore:\\d+/.test(error.message),
+    );
+  `,
+    root,
+    120_000,
+  );
+});
+
+test("frozen and non-error cancellation reasons are preserved unmuted", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-reason-");
+  await writeFile(join(root, "f.ts"), "x");
+  await inWorker(
+    `
+    const frozen = Object.freeze(new Error('frozen-stop'));
+    const c1 = new AbortController();
+    c1.abort(frozen);
+    await assert.rejects(
+      () => scanRootPaths('reason', [{ absolutePath: workerData, recursive: true }], { signal: c1.signal }),
+      (error) => error === frozen,
+    );
+    const c2 = new AbortController();
+    c2.abort('plain-string-reason');
+    await assert.rejects(
+      () => scanRootPaths('reason', [{ absolutePath: workerData, recursive: true }], { signal: c2.signal }),
+      (error) => error.message === 'Indexing was cancelled.' && error.cause === 'plain-string-reason',
+    );
+  `,
+    root,
+    30_000,
   );
 });

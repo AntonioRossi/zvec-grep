@@ -3,6 +3,7 @@ import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
   chargeGlobOverhead,
   checkActiveRuleWeight,
+  checkGlobCancellation,
   checkGlobRuleCount,
   labeledGlobError,
   globWorkNeedsYield,
@@ -953,12 +954,7 @@ async function walk(
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) {
-    return;
-  }
-  throw signal.reason instanceof Error
-    ? signal.reason
-    : new Error("Indexing was cancelled.");
+  checkGlobCancellation(signal);
 }
 
 function isHiddenName(name: string): boolean {

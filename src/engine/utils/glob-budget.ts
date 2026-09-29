@@ -170,7 +170,7 @@ export async function yieldGlobWorkIfNeeded(
   throwIfAbortedSignal(signal);
 }
 
-const cancellationMarker = Symbol("globCancellation");
+const cancellationErrors = new WeakSet<object>();
 
 /** Preserve the signal's reason and mark it so pattern-error wrappers rethrow
  *  cancellation untouched instead of relabeling it as a pattern failure. */
@@ -181,24 +181,13 @@ export function globCancellationError(signal: AbortSignal): Error {
     (Object.assign(new Error("Indexing was cancelled."), {
       cause: signal.reason,
     }) as Error);
-  if (
-    !(error as unknown as { [k: symbol]: boolean | undefined })[
-      cancellationMarker
-    ]
-  ) {
-    (error as unknown as { [k: symbol]: boolean | undefined })[
-      cancellationMarker
-    ] = true;
-  }
+  // Mark via WeakSet: never mutate the reason, which callers may freeze.
+  cancellationErrors.add(error);
   return error;
 }
 
 export function isGlobCancellation(error: unknown): boolean {
-  return Boolean(
-    (error as unknown as { [k: symbol]: boolean | undefined })[
-      cancellationMarker
-    ],
-  );
+  return cancellationErrors.has(error as object);
 }
 
 export function checkGlobCancellation(signal?: AbortSignal): void {

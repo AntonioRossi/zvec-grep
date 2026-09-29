@@ -1233,6 +1233,9 @@ async function resolveFilteredFileIds(
       matched.push(file.id);
     }
   }
+  // A filter matching no files never enters the per-candidate path; check
+  // cancellation before returning a successful (possibly empty) result.
+  checkGlobCancellation(signal);
   return matched;
 }
 
