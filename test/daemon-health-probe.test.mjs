@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join } from "node:path";
 import test from "node:test";
 import {
   createTemporaryDirectory,
