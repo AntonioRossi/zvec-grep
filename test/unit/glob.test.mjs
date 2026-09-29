@@ -1,3 +1,7 @@
+function setImmediatePromise() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -514,78 +518,68 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
   );
 });
 
-test("cancellation never returns success and overlapping candidates keep independent ceilings", async (t) => {
-  const root = await createTemporaryDirectory(t, "zvec-glob-cancel2-");
-  await writeFile(join(root, "f.ts"), "x");
+test("pre-aborted scans reject without completing matching", async (t) => {
+  const root = await createTemporaryDirectory(t, "zvec-glob-preabort-");
+  const target = join(root, "f.ts");
+  await writeFile(target, "x");
   await inWorker(
     `
-    const { withGlobPathBudget, chargeGlobWork } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
-    // pre-aborted scan never completes matching
+    const { scanFilePath } = await import(${JSON.stringify(new URL("../../dist/engine/pipeline/indexing/scanner/index.js", import.meta.url).href)});
     const controller = new AbortController();
     controller.abort();
     await assert.rejects(
-      () => scanRootPaths('c2', [{ absolutePath: workerData, recursive: true }], { signal: controller.signal }),
+      () => scanRootPaths('pre', [{ absolutePath: workerData, recursive: true }], { signal: controller.signal }),
       /cancel|abort/i,
     );
-    const { scanFilePath } = await import(${JSON.stringify(new URL("../../dist/engine/pipeline/indexing/scanner/index.js", import.meta.url).href)});
     await assert.rejects(
-      () => scanFilePath('c2', [{ absolutePath: workerData, recursive: true }], ${JSON.stringify(join(root, "f.ts"))}, { signal: controller.signal }),
+      () => scanFilePath('pre', [{ absolutePath: workerData, recursive: true }], ${JSON.stringify(target)}, { signal: controller.signal }),
       /cancel|abort/i,
     );
-    // interleaved candidates in one operation keep independent ceilings
-    const charge60M = async () => {
-      await withGlobPathBudget(1, 0, async () => {
-        for (let i = 0; i < 60; i++) chargeGlobWork(1_000_000);
-      });
-    };
-    await withGlobBudget(async () => {
-      const results = await Promise.allSettled([charge60M(), charge60M()]);
-      for (const r of results) {
-        assert.equal(r.status, 'rejected');
-        assert.ok(/work limit/.test(r.reason.message));
-      }
-    });
   `,
     root,
-    60_000,
+    30_000,
   );
 });
 
-test("cancellation never returns success and overlapping candidates keep independent ceilings", async (t) => {
-  const root = await createTemporaryDirectory(t, "zvec-glob-cancel2-");
-  await writeFile(join(root, "f.ts"), "x");
-  await inWorker(
-    `
-    const { withGlobPathBudget, chargeGlobWork } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
-    // pre-aborted scan never completes matching
-    const controller = new AbortController();
-    controller.abort();
-    await assert.rejects(
-      () => scanRootPaths('c2', [{ absolutePath: workerData, recursive: true }], { signal: controller.signal }),
-      /cancel|abort/i,
+test("budget escape control rejects cumulative escaped sibling work", async () => {
+  const { withGlobBudget, withGlobPathBudget, chargeGlobWork } =
+    await import("../../dist/engine/utils/glob-budget.js");
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => (resolve = r));
+    return { promise, resolve };
+  };
+  const dimensions = [3_800, 200_000];
+  await withGlobBudget(async () => {
+    const aEntered = deferred();
+    const bEntered = deferred();
+    let bSuccessfulWork = 0;
+    const a = withGlobPathBudget(...dimensions, async () => {
+      aEntered.resolve();
+      await bEntered.promise.then(() => setImmediatePromise());
+    });
+    const aSettled = a.then(
+      () => undefined,
+      () => undefined,
     );
-    const { scanFilePath } = await import(${JSON.stringify(new URL("../../dist/engine/pipeline/indexing/scanner/index.js", import.meta.url).href)});
-    await assert.rejects(
-      () => scanFilePath('c2', [{ absolutePath: workerData, recursive: true }], ${JSON.stringify(join(root, "f.ts"))}, { signal: controller.signal }),
-      /cancel|abort/i,
-    );
-    // interleaved candidates in one operation keep independent ceilings
-    const charge60M = async () => {
-      await withGlobPathBudget(1, 0, async () => {
-        for (let i = 0; i < 60; i++) chargeGlobWork(1_000_000);
-      });
-    };
-    await withGlobBudget(async () => {
-      const results = await Promise.allSettled([charge60M(), charge60M()]);
-      for (const r of results) {
-        assert.equal(r.status, 'rejected');
-        assert.ok(/work limit/.test(r.reason.message));
+    await aEntered.promise;
+    const b = withGlobPathBudget(...dimensions, async () => {
+      bEntered.resolve();
+      await aSettled;
+      for (let i = 0; i < 6; i++) {
+        chargeGlobWork(10_000_000);
+        bSuccessfulWork += 10_000_000;
       }
     });
-  `,
-    root,
-    60_000,
-  );
+    const results = await Promise.allSettled([a, b]);
+    assert.equal(results[0].status, "fulfilled", "escape sibling A");
+    assert.equal(
+      results[1].status,
+      "rejected",
+      "escape B accepted " + bSuccessfulWork,
+    );
+    assert.match(results[1].reason.message, /work limit/);
+  });
 });
 
 test("budget refresh control and cancellation reason handling", async (t) => {
