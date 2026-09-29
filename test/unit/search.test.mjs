@@ -644,7 +644,7 @@ test("search candidate evaluation yields under heavy slash-bearing admitted glob
   );
 });
 
-test("cancellation after unfiltered-search entry and during embedding rejects", async () => {
+function searchCancellationFixture() {
   const files = [file("file-a", "src/a.ts")];
   const storage = {
     listFiles: () => files,
@@ -654,19 +654,25 @@ test("cancellation after unfiltered-search entry and during embedding rejects", 
     optimize: () => {},
     close: () => {},
   };
-  const context = {
-    workspaceIndex: {
-      id: "wi",
-      name: "docs",
-      path: "/tmp/index",
-      rootPaths: [{ absolutePath: "/repo", recursive: true }],
-      createdTime: 1,
-      updatedTime: 1,
+  return {
+    context: {
+      workspaceIndex: {
+        id: "wi",
+        name: "docs",
+        path: "/tmp/index",
+        rootPaths: [{ absolutePath: "/repo", recursive: true }],
+        createdTime: 1,
+        updatedTime: 1,
+      },
+      storage,
+      embeddingModel: new FakeEmbeddingModel(),
     },
-    storage,
-    embeddingModel: new FakeEmbeddingModel(),
   };
-  const reason = new Error("stop-unfiltered");
+}
+
+test("pre-aborted search rejects at entry preserving its reason", async () => {
+  const { context } = searchCancellationFixture();
+  const reason = new Error("stop-entry");
   const pre = new AbortController();
   pre.abort(reason);
   await assert.rejects(
@@ -677,12 +683,31 @@ test("cancellation after unfiltered-search entry and during embedding rejects", 
     ),
     (error) => error === reason,
   );
-  const midController = new AbortController();
-  const midReason = new Error("stop-embedding");
+});
+
+test("unfiltered search aborting after entry rejects before success", async () => {
+  const { context } = searchCancellationFixture();
+  const reason = new Error("stop-after-entry");
+  const controller = new AbortController();
+  // The entry check runs synchronously at call time; aborting immediately
+  // after the call delivers the signal after entry but before any result.
+  const pending = searchWorkspaceIndex(
+    { routes: [{ mode: "vector", query: "value" }] },
+    context,
+    { signal: controller.signal },
+  );
+  controller.abort(reason);
+  await assert.rejects(pending, (error) => error === reason);
+});
+
+test("abort during embedding rejects preserving its reason", async () => {
+  const { context } = searchCancellationFixture();
+  const controller = new AbortController();
+  const reason = new Error("stop-embedding");
   const slowModel = new FakeEmbeddingModel();
   const originalEmbed = slowModel.embed.bind(slowModel);
   slowModel.embed = async (...args) => {
-    midController.abort(midReason);
+    controller.abort(reason);
     await new Promise((resolve) => setImmediate(resolve));
     return originalEmbed(...args);
   };
@@ -690,8 +715,8 @@ test("cancellation after unfiltered-search entry and during embedding rejects", 
     searchWorkspaceIndex(
       { routes: [{ mode: "vector", query: "value" }] },
       { ...context, embeddingModel: slowModel },
-      { signal: midController.signal },
+      { signal: controller.signal },
     ),
-    (error) => error === midReason,
+    (error) => error === reason,
   );
 });
