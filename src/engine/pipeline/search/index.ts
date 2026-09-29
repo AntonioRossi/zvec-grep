@@ -133,6 +133,7 @@ export async function searchWorkspaceIndex(
     );
     const hasSearchableFiles = !filterMatchesNoFiles(filter);
     const candidates = new Map<string, Candidate>();
+    checkGlobCancellation(options.signal);
     const vectorByRoute =
       hasSearchableFiles && planUsesVector(normalized)
         ? await timings.time("query_embedding", () =>
@@ -142,6 +143,7 @@ export async function searchWorkspaceIndex(
             ),
           )
         : new Map<string, number[]>();
+    checkGlobCancellation(options.signal);
     let recallDepth = RECALL_INITIAL_DEPTH;
 
     if (hasSearchableFiles) {
@@ -1179,6 +1181,7 @@ async function resolveFilteredFileIds(
     !hasModifiedFilter &&
     !hasSharedSelection
   ) {
+    checkGlobCancellation(signal);
     return undefined;
   }
 

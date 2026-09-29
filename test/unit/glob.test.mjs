@@ -565,43 +565,76 @@ test("cancellation reason survives pattern wrappers, root filters, and interleav
       () => scanRootPaths('c3', [{ absolutePath: workerData, recursive: true, exclude: ['x'.repeat(4090)] }], { signal: controller.signal }),
       (error) => error === reason || (error.cause === reason && isGlobCancellation(error)),
     );
-    // Real overlap reaching the 50M ceiling: shared outer operation, weight
-    // 200,000 with path length 3,800 gives allowance min(...,50M)=50M.
-    // Candidate A charges 30M and suspends at a barrier; sibling B then
-    // charges 45M. With independent candidate stores both fulfill; a shared
-    // store (the withdrawn save/restore) would see a 20M remainder and
-    // wrongly reject B.
-    const tick = () => new Promise((resolve) => setImmediate(resolve));
+    // Refresh and escape controls (adopted from the round-12 review): a shared
+    // outer operation with dimensions reaching the 50M ceiling. Under refresh,
+    // A charges 30M, suspends until B enters and settles, then charges 45M
+    // more and must reject its cumulative 75M. Under escape, B charges 6x10M
+    // after A settles and must reject its cumulative 60M. A shared-bucket
+    // implementation (entry refresh / restore-to-undefined escape) wrongly
+    // accepts both.
+    const deferred = () => {
+      let resolve;
+      const promise = new Promise((r) => (resolve = r));
+      return { promise, resolve };
+    };
     const dimensions = [3_800, 200_000];
-    let releaseA;
-    const barrier = new Promise((resolve) => (releaseA = resolve));
-    let bDone;
-    const bFinished = new Promise((resolve) => (bDone = resolve));
-    let bSettled = 'pending';
-    await withGlobBudget(async () => {
-      const a = withGlobPathBudget(dimensions[0], dimensions[1], async () => {
-        chargeGlobWork(30_000_000);
-        releaseA();
-        await bFinished;
+    for (const shape of ["refresh", "escape"]) {
+      await withGlobBudget(async () => {
+        const aEntered = deferred();
+        const bEntered = deferred();
+        let aSuccessfulWork = 0;
+        let bSuccessfulWork = 0;
+        const a = withGlobPathBudget(...dimensions, async () => {
+          if (shape === "refresh") {
+            chargeGlobWork(30_000_000);
+            aSuccessfulWork += 30_000_000;
+          }
+          aEntered.resolve();
+          await bEntered.promise;
+          if (shape === "refresh") {
+            chargeGlobWork(45_000_000);
+            aSuccessfulWork += 45_000_000;
+          }
+        });
+        const aSettled = a.then(
+          () => undefined,
+          () => undefined,
+        );
+        await aEntered.promise;
+        const b = withGlobPathBudget(...dimensions, async () => {
+          bEntered.resolve();
+          await aSettled;
+          if (shape === "escape") {
+            for (let i = 0; i < 6; i++) {
+              chargeGlobWork(10_000_000);
+              bSuccessfulWork += 10_000_000;
+            }
+          }
+        });
+        const results = await Promise.allSettled([a, b]);
+        if (shape === "refresh") {
+          assert.equal(results[1].status, "fulfilled", "refresh sibling B");
+          assert.equal(results[0].status, "rejected", "refresh A accepted " + aSuccessfulWork);
+          assert.match(results[0].reason.message, /work limit/);
+        } else {
+          assert.equal(results[0].status, "fulfilled", "escape sibling A");
+          assert.equal(results[1].status, "rejected", "escape B accepted " + bSuccessfulWork);
+          assert.match(results[1].reason.message, /work limit/);
+        }
       });
-      const bStarted = barrier.then(() =>
-        withGlobPathBudget(dimensions[0], dimensions[1], async () => {
-          chargeGlobWork(45_000_000);
-          bSettled = 'charged';
-        }),
-      );
-      bStarted.then(bDone, bDone);
-      const both = await Promise.allSettled([a, bStarted]);
-      assert.equal(both[0].status, 'fulfilled', 'A rejected: ' + both[0].reason);
-      assert.equal(both[1].status, 'fulfilled', 'B rejected: ' + both[1].reason);
-      assert.equal(bSettled, 'charged');
-    });
+    }
     // scope restoration after a work-limit error
     await assert.rejects(
-      () => withGlobPathBudget(1, 0, async () => { chargeGlobWork(60_000_000); }),
+      () => withGlobPathBudget(3_800, 200_000, async () => { chargeGlobWork(60_000_000); }),
       /work limit/,
     );
-    assert.equal(await withGlobPathBudget(1, 0, async () => 'ok'), 'ok');
+    assert.equal(
+      await withGlobPathBudget(3_800, 200_000, async () => {
+        chargeGlobWork(10_000_000);
+        return 'ok';
+      }),
+      'ok',
+    );
   `,
     root,
     60_000,
