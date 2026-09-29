@@ -885,3 +885,60 @@ test("charged scopes resume correctly after a child cancellation", async () => {
     assert.equal(result, "resumed-after-cancel");
   });
 });
+
+test("concurrent sibling retains consumed allowance across a cancelled child", async () => {
+  const { withGlobBudget, withGlobPathBudget, chargeGlobWork } =
+    await import("../../dist/engine/utils/glob-budget.js");
+  const dimensions = [3_800, 200_000];
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => (resolve = r));
+    return { promise, resolve };
+  };
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  const controller = new AbortController();
+  const reason = new Error("stop-sibling");
+  await withGlobBudget(async () => {
+    const aEntered = deferred();
+    const bEntered = deferred();
+    const aMayFinish = deferred();
+    // Sibling A suspends at a barrier after entering, proving B's charges
+    // happen while A's scope is alive (concurrent activity, not sequence).
+    const a = withGlobPathBudget(...dimensions, async () => {
+      aEntered.resolve();
+      await aMayFinish.promise;
+      return "a-untouched";
+    });
+    await aEntered.promise;
+    const sibling = await withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(20_000_000);
+      bEntered.resolve();
+      // A cancelled child: its reason identity must survive.
+      controller.abort(reason);
+      await assert.rejects(
+        withGlobPathBudget(...dimensions, async () => {
+          chargeGlobWork(10_000_000);
+          const { yieldGlobWorkIfNeeded } =
+            await import("../../dist/engine/utils/glob-budget.js");
+          await yieldGlobWorkIfNeeded(tick, controller.signal);
+          chargeGlobWork(10_000_000);
+        }),
+        (error) => error === reason,
+      );
+      // Same resumed scope: 20M consumed, 25M more fits, 6M beyond must
+      // exceed the 50M ceiling.
+      chargeGlobWork(25_000_000);
+      await assert.rejects(
+        (async () => {
+          chargeGlobWork(6_000_000);
+        })(),
+        /work limit/,
+      );
+      return "sibling-resumed";
+    });
+    aMayFinish.resolve();
+    assert.equal(await a, "a-untouched");
+    assert.equal(sibling, "sibling-resumed");
+    void bEntered;
+  });
+});
