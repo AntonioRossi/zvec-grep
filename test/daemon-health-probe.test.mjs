@@ -126,18 +126,25 @@ async function runHealthProbe(options) {
       "--glob",
       "*.ts",
     ];
-    // Warmup completes only after the daemon has actually served workload:
-    // a tiny warmup index triggers model preparation before measured load.
-    const warmupRoot = join(root, "..", "warmup-repo");
-    await mkdir(warmupRoot, { recursive: true });
-    await writeFile(
-      join(warmupRoot, "warmup.ts"),
-      "export const Warmup = 1;\n",
+    // Warmup completes only after the daemon has actually served workload on
+    // the MEASURED target: a first index of the target repo opens its store
+    // and prepares its model. Warmup failures propagate — a cold store must
+    // never be measured as load.
+    const warmupIndex = await runCli(
+      ["--index", "--mode", "server", "--allow-remote", root],
+      { cwd: root, env, timeout: 120_000 },
     );
-    await runCli(
-      ["--index", "--mode", "server", "--allow-remote", warmupRoot],
-      { cwd: warmupRoot, env, timeout: 120_000 },
-    ).catch(() => undefined);
+    assert.match(
+      String(warmupIndex.stdout),
+      /Workspace index: succeeded/,
+      "warmup index of the target store failed",
+    );
+    // Mutate the fixture input so the measured index performs real work
+    // (rescan plus heavy-rule matching) against the already-warm store.
+    await writeFile(
+      join(root, "mutation.ts"),
+      "export const HealthProbeMutation = 7;\n",
+    );
 
     loadStartedAt = Date.now();
     const [indexed, queried] = await Promise.all([
