@@ -1,5 +1,6 @@
 import { realpathSync, statSync, type BigIntStats } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { EngineError } from "../../errors.js";
 import type { WorkspaceManifestRootPath } from "../../manifest.js";
 import type { RootPath } from "../../types.js";
@@ -9,6 +10,10 @@ import {
   type CanonicalPathResolver,
 } from "../../utils/canonical-path.js";
 import { pathPatternMatches } from "../../utils/glob.js";
+import {
+  labeledGlobError,
+  yieldGlobWorkIfNeeded,
+} from "../../utils/glob-budget.js";
 import {
   isPathInside,
   normalizePath,
@@ -130,10 +135,10 @@ export function normalizeRootPath(path: string | RootPath): RootPath {
   };
 }
 
-export function fileBelongsToRootPath(
+export async function fileBelongsToRootPath(
   absolutePath: string,
   rootPath: RootPath,
-): boolean {
+): Promise<boolean> {
   const normalizedPath = normalizePath(absolutePath);
 
   if (!isPathInside(rootPath.absolutePath, normalizedPath)) {
@@ -144,14 +149,15 @@ export function fileBelongsToRootPath(
     relative(rootPath.absolutePath, normalizedPath),
   );
 
-  return matchesRootPatterns(relativePath, rootPath);
+  return await matchesRootPatterns(relativePath, rootPath);
 }
 
-export function matchesRootPatterns(
+export async function matchesRootPatterns(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
-  if (matchesAny(relativePath, rootPath.exclude)) {
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (await matchesRootExcludePatterns(relativePath, rootPath, signal)) {
     return false;
   }
 
@@ -159,21 +165,23 @@ export function matchesRootPatterns(
     return true;
   }
 
-  return matchesAny(relativePath, rootPath.include);
+  return matchesRootIncludePatterns(relativePath, rootPath, signal);
 }
 
-export function matchesRootIncludePatterns(
+export async function matchesRootIncludePatterns(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
-  return matchesAny(relativePath, rootPath.include);
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return matchesAny(relativePath, rootPath.include, "root include", signal);
 }
 
-export function matchesRootExcludePatterns(
+export async function matchesRootExcludePatterns(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
-  return matchesAny(relativePath, rootPath.exclude);
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return matchesAny(relativePath, rootPath.exclude, "root exclude", signal);
 }
 
 type RootScanDomain = {
@@ -305,15 +313,27 @@ function directoryCoversFile(
   return directory.root.recursive || dirname(filePath) === directory.realPath;
 }
 
-function matchesAny(
+async function matchesAny(
   relativePath: string,
   patterns: readonly string[] | undefined,
-): boolean {
+  label: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!patterns || patterns.length === 0) {
     return false;
   }
 
-  return patterns.some((pattern) => patternMatches(pattern, relativePath));
+  for (const [index, pattern] of patterns.entries()) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    try {
+      if (patternMatches(pattern, relativePath)) {
+        return true;
+      }
+    } catch (error) {
+      throw labeledGlobError(`${label}[${index}]`, pattern, error);
+    }
+  }
+  return false;
 }
 
 function patternMatches(pattern: string, relativePath: string): boolean {

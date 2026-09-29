@@ -1,11 +1,18 @@
+import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
-  lstat,
-  open,
-  readFile,
-  readdir,
-  realpath,
-  stat,
-} from "node:fs/promises";
+  chargeGlobOverhead,
+  checkActiveRuleWeight,
+  checkGlobCancellation,
+  checkGlobRuleCount,
+  labeledGlobError,
+  globWorkNeedsYield,
+  withGlobBudget,
+  withGlobOverheadOnly,
+  withGlobPathBudget,
+  yieldGlobWorkIfNeeded,
+} from "../../../utils/glob-budget.js";
+import { compileGlob } from "../../../utils/glob-matcher.js";
 import {
   basename,
   dirname,
@@ -34,12 +41,18 @@ import { sha256Text } from "../../../utils/hash.js";
 import {
   matchesFileSelection,
   resolveFileTypePatterns,
+  type FileSelection,
   type FileTypePatterns,
 } from "../../../utils/file-selection.js";
 import {
+  globPatternWeight,
+  hasPathGlob,
+  normalizePathForMatch,
   normalizePathPattern,
   pathPatternMatches,
+  pathPatternMatchesPrepared,
   pathPatternMightMatchDescendant,
+  ripgrepPatternWeight,
 } from "../../../utils/glob.js";
 import {
   isPathInside,
@@ -57,6 +70,9 @@ import {
 const BINARY_SNIFF_BYTES = 8192;
 const BINARY_CONTROL_CHAR_RATIO = 0.3;
 const MAX_GITIGNORE_CACHE_ENTRIES = 4_096;
+const MAX_IGNORE_FILE_BYTES = 1_048_576;
+const MAX_GITIGNORE_CACHE_CHARS = 8_388_608;
+let gitIgnoreCacheChars = 0;
 
 const DEFAULT_IGNORED_DIRECTORY_NAMES = [
   "node_modules",
@@ -138,6 +154,8 @@ type IgnoreRule = {
   directoryOnly: boolean;
   anchored: boolean;
   hasSlash: boolean;
+  source: string;
+  line: number;
 };
 
 type IgnoreMatch = {
@@ -145,6 +163,8 @@ type IgnoreMatch = {
   matchedNegation: boolean;
   matchedRule?: IgnoreRule;
 };
+
+const BUILT_IN_IGNORE_RULE_SOURCE = "built-in ignore rules";
 
 const DEFAULT_IGNORE_RULES: readonly IgnoreRule[] = [
   ...DEFAULT_IGNORED_DIRECTORY_NAMES.map((pattern) => ({
@@ -154,6 +174,8 @@ const DEFAULT_IGNORE_RULES: readonly IgnoreRule[] = [
     directoryOnly: true,
     anchored: false,
     hasSlash: false,
+    source: BUILT_IN_IGNORE_RULE_SOURCE,
+    line: 0,
   })),
   ...DEFAULT_IGNORED_FILE_PATTERNS.map((pattern) => ({
     basePath: "",
@@ -162,6 +184,8 @@ const DEFAULT_IGNORE_RULES: readonly IgnoreRule[] = [
     directoryOnly: false,
     anchored: false,
     hasSlash: false,
+    source: BUILT_IN_IGNORE_RULE_SOURCE,
+    line: 0,
   })),
 ];
 
@@ -198,6 +222,16 @@ export async function scanRootPaths(
   rootPaths: readonly RootPath[],
   options: ScanOptions = {},
 ): Promise<ScanResult> {
+  return withGlobBudget(() =>
+    scanRootPathsImpl(workspaceIndexId, rootPaths, options),
+  );
+}
+
+async function scanRootPathsImpl(
+  workspaceIndexId: string,
+  rootPaths: readonly RootPath[],
+  options: ScanOptions = {},
+): Promise<ScanResult> {
   let validatedRootPaths = validateRootPaths(rootPaths);
   if (options.workspaceRoot !== undefined) {
     // Persisted roots are re-validated for real containment at every scan;
@@ -228,6 +262,17 @@ export async function scanRootPaths(
 }
 
 export async function scanFilePath(
+  workspaceIndexId: string,
+  rootPaths: readonly RootPath[],
+  absolutePath: string,
+  options: ScanOptions = {},
+): Promise<ScanResult> {
+  return withGlobBudget(() =>
+    scanFilePathImpl(workspaceIndexId, rootPaths, absolutePath, options),
+  );
+}
+
+async function scanFilePathImpl(
   workspaceIndexId: string,
   rootPaths: readonly RootPath[],
   absolutePath: string,
@@ -278,15 +323,27 @@ export async function scanFilePath(
       root.fileTypes,
       root.excludedFileTypes,
     );
-    if (
-      !pathCanBeScanned(
+    const acceptable = await withGlobPathBudget(
+      relativePath.length,
+      admitScanRules(
+        rootFilterWeight(root, fileTypes) + ignoreRulesWeight(rules),
         root,
-        relativePath,
-        basename(absolutePath),
-        false,
-        rules,
-      ) ||
-      !matchesFileSelection(relativePath, root, fileTypes) ||
+      ),
+      async () =>
+        (await pathCanBeScanned(
+          root,
+          relativePath,
+          basename(absolutePath),
+          false,
+          rules,
+          options.signal,
+        )) &&
+        matchesFileSelection(relativePath, root, fileTypes, {
+          signal: options.signal,
+        }),
+    );
+    if (
+      !acceptable ||
       (await hasExcludedNestedGitAncestor(root, absolutePath, false))
     ) {
       continue;
@@ -310,6 +367,18 @@ export async function pathCanAffectIndex(
   rootPaths: readonly RootPath[],
   absolutePath: string,
   isDirectory: boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return withGlobBudget(() =>
+    pathCanAffectIndexImpl(rootPaths, absolutePath, isDirectory, signal),
+  );
+}
+
+async function pathCanAffectIndexImpl(
+  rootPaths: readonly RootPath[],
+  absolutePath: string,
+  isDirectory: boolean,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   for (const configuredRoot of rootPaths) {
     const root = normalizeRootPath(configuredRoot);
@@ -337,34 +406,53 @@ export async function pathCanAffectIndex(
 
     const relativePath = toDisplayPath(pathFromRoot);
     const rules = await ignoreRulesForDirectory(root, dirname(absolutePath));
-    if (
-      !pathCanBeScanned(
+    const pathFileTypes = await resolveFileTypePatterns(
+      root.fileTypes,
+      root.excludedFileTypes,
+    );
+    const acceptable = await withGlobPathBudget(
+      relativePath.length,
+      admitScanRules(
+        rootFilterWeight(root, pathFileTypes) + ignoreRulesWeight(rules),
         root,
-        relativePath,
-        basename(absolutePath),
-        isDirectory,
-        rules,
-      ) ||
+      ),
+      async () =>
+        (await pathCanBeScanned(
+          root,
+          relativePath,
+          basename(absolutePath),
+          isDirectory,
+          rules,
+          signal,
+        )) &&
+        (isDirectory ||
+          matchesFileSelection(relativePath, root, pathFileTypes, {
+            signal,
+          })),
+    );
+    if (
+      !acceptable ||
       (await hasExcludedNestedGitAncestor(root, absolutePath, isDirectory))
     ) {
       continue;
     }
-    if (isDirectory) {
-      return true;
-    }
-
-    const fileTypes = await resolveFileTypePatterns(
-      root.fileTypes,
-      root.excludedFileTypes,
-    );
-    if (matchesFileSelection(relativePath, root, fileTypes)) {
-      return true;
-    }
+    return true;
   }
   return false;
 }
 
 export async function scanDirectoryPath(
+  workspaceIndexId: string,
+  rootPaths: readonly RootPath[],
+  absolutePath: string,
+  options: ScanOptions = {},
+): Promise<ScanResult> {
+  return withGlobBudget(() =>
+    scanDirectoryPathImpl(workspaceIndexId, rootPaths, absolutePath, options),
+  );
+}
+
+async function scanDirectoryPathImpl(
   workspaceIndexId: string,
   rootPaths: readonly RootPath[],
   absolutePath: string,
@@ -398,16 +486,28 @@ export async function scanDirectoryPath(
       root.fileTypes,
       root.excludedFileTypes,
     );
+    const staticRuleWeight = admitScanRules(
+      rootFilterWeight(root, fileTypes),
+      root,
+    );
+    const directoryAcceptable =
+      !relativePath ||
+      (await withGlobPathBudget(
+        relativePath.length,
+        admitScanRules(staticRuleWeight + ignoreRulesWeight(parentRules), root),
+        async () =>
+          pathCanBeScanned(
+            root,
+            relativePath,
+            basename(absolutePath),
+            true,
+            parentRules,
+            options.signal,
+          ),
+      ));
     if (
-      relativePath &&
-      (!pathCanBeScanned(
-        root,
-        relativePath,
-        basename(absolutePath),
-        true,
-        parentRules,
-      ) ||
-        (await hasExcludedNestedGitAncestor(root, absolutePath, true)))
+      !directoryAcceptable ||
+      (await hasExcludedNestedGitAncestor(root, absolutePath, true))
     ) {
       continue;
     }
@@ -426,6 +526,7 @@ export async function scanDirectoryPath(
       diagnostics,
       parentRules,
       fileTypes,
+      staticRuleWeight,
       new Set([rootRealPath, directoryRealPath]),
       depth,
       options.signal,
@@ -450,9 +551,13 @@ async function hasExcludedNestedGitAncestor(
     const relativeDirectory = toDisplayPath(
       relative(rootPath.absolutePath, current),
     );
+    await yieldGlobWorkIfNeeded(yieldToEventLoop);
     if (
       (await isNestedGitRepositoryDirectory(current)) &&
-      !nestedGitRepositoryExplicitlyIncluded(relativeDirectory, rootPath)
+      !(await nestedGitRepositoryExplicitlyIncluded(
+        relativeDirectory,
+        rootPath,
+      ))
     ) {
       return true;
     }
@@ -507,13 +612,14 @@ async function ignoreRulesForDirectory(
   return rules;
 }
 
-function pathCanBeScanned(
+async function pathCanBeScanned(
   rootPath: RootPath,
   relativePath: string,
   name: string,
   isDirectory: boolean,
   ignoreRules: readonly IgnoreRule[],
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (
     relativePath
       .split("/")
@@ -521,22 +627,37 @@ function pathCanBeScanned(
   ) {
     return false;
   }
-  const ignoreMatch = matchIgnoreRules(relativePath, isDirectory, ignoreRules);
+  const ignoreMatch = await matchIgnoreRules(
+    relativePath,
+    isDirectory,
+    ignoreRules,
+    signal,
+  );
   if (
     ignoreMatch.ignored &&
-    !ignoredPathExplicitlyIncluded(relativePath, rootPath, ignoreMatch)
+    !(await ignoredPathExplicitlyIncluded(
+      relativePath,
+      rootPath,
+      ignoreMatch,
+      signal,
+    ))
   ) {
     return false;
   }
-  if (matchesRootExcludePatterns(relativePath, rootPath)) {
+  if (await matchesRootExcludePatterns(relativePath, rootPath, signal)) {
     return false;
   }
   if (isDirectory) {
-    return !shouldSkipHiddenDirectory(name, relativePath, rootPath);
+    return !(await shouldSkipHiddenDirectory(
+      name,
+      relativePath,
+      rootPath,
+      signal,
+    ));
   }
   return (
-    !shouldSkipHiddenFile(name, relativePath, rootPath) &&
-    matchesRootPatterns(relativePath, rootPath)
+    !(await shouldSkipHiddenFile(name, relativePath, rootPath, signal)) &&
+    (await matchesRootPatterns(relativePath, rootPath, signal))
   );
 }
 
@@ -559,6 +680,10 @@ async function scanRootPath(
     root.fileTypes,
     root.excludedFileTypes,
   );
+  const staticRuleWeight = admitScanRules(
+    rootFilterWeight(root, fileTypes),
+    root,
+  );
   const info = await stat(root.absolutePath).catch(() => null);
 
   if (!info) {
@@ -567,7 +692,12 @@ async function scanRootPath(
 
   if (info.isFile()) {
     const relativePath = basename(root.absolutePath);
-    const file = matchesFileSelection(relativePath, root, fileTypes)
+    const keepRootFile = await withGlobPathBudget(
+      relativePath.length,
+      staticRuleWeight,
+      async () => matchesFileSelection(relativePath, root, fileTypes),
+    );
+    const file = keepRootFile
       ? await readFileInfo(
           workspaceIndexId,
           root,
@@ -605,12 +735,69 @@ async function scanRootPath(
       ...(await readConfiguredIgnoreRules(root)),
     ],
     fileTypes,
+    staticRuleWeight,
     new Set([rootRealPath]),
     0,
     signal,
     knownFiles,
     workspaceRoot,
   );
+}
+
+function admitScanRules(weight: number, rootPath: RootPath): number {
+  checkActiveRuleWeight(
+    weight,
+    `active ignore and filter rules for ${rootPath.absolutePath}`,
+  );
+  return weight;
+}
+
+function ignoreRulesWeight(rules: readonly IgnoreRule[]): number {
+  let weight = 0;
+  for (const rule of rules) {
+    weight += globPatternWeight(rule.pattern, ignoreRuleLabel(rule));
+  }
+  return weight;
+}
+
+function ignoreRuleLabel(rule: IgnoreRule): string {
+  return `ignore rule ${rule.line > 0 ? `${rule.source}:${rule.line}` : rule.source}`;
+}
+
+function fileTypesWeight(fileTypes: FileTypePatterns): number {
+  let weight = 0;
+  for (const entry of fileTypes.include) {
+    weight += ripgrepPatternWeight(entry.pattern, false, entry.origin);
+  }
+  for (const entry of fileTypes.exclude) {
+    weight += ripgrepPatternWeight(entry.pattern, false, entry.origin);
+  }
+  return weight;
+}
+
+function selectionWeight(selection: FileSelection): number {
+  let weight = 0;
+  for (const [index, pattern] of (selection.globs ?? []).entries()) {
+    weight += ripgrepPatternWeight(pattern, false, `globs[${index}]`);
+  }
+  for (const [index, pattern] of (selection.insensitiveGlobs ?? []).entries()) {
+    weight += ripgrepPatternWeight(pattern, true, `insensitiveGlobs[${index}]`);
+  }
+  return weight;
+}
+
+function rootFilterWeight(
+  rootPath: RootPath,
+  fileTypes: FileTypePatterns,
+): number {
+  let weight = selectionWeight(rootPath);
+  for (const [index, pattern] of (rootPath.include ?? []).entries()) {
+    weight += globPatternWeight(pattern, `root include[${index}]`);
+  }
+  for (const [index, pattern] of (rootPath.exclude ?? []).entries()) {
+    weight += globPatternWeight(pattern, `root exclude[${index}]`);
+  }
+  return weight + fileTypesWeight(fileTypes);
 }
 
 async function walk(
@@ -621,6 +808,7 @@ async function walk(
   diagnostics: FileScanDiagnostics,
   parentIgnoreRules: readonly IgnoreRule[],
   fileTypes: FileTypePatterns,
+  staticRuleWeight: number,
   visitedDirectories: Set<string>,
   depth: number,
   signal?: AbortSignal,
@@ -635,6 +823,11 @@ async function walk(
       ? []
       : await readGitIgnoreRules(rootPath, currentPath)),
   ];
+  checkGlobRuleCount(ignoreRules.length);
+  const activeWeight = admitScanRules(
+    staticRuleWeight + ignoreRulesWeight(ignoreRules),
+    rootPath,
+  );
 
   try {
     entries = await readdir(currentPath, { withFileTypes: true });
@@ -663,7 +856,10 @@ async function walk(
     }
   }
 
+  let entriesProcessed = 0;
   for (const entry of entries) {
+    if (++entriesProcessed % 128 === 0 || globWorkNeedsYield())
+      await yieldToEventLoop();
     throwIfAborted(signal);
     const absolutePath = join(currentPath, entry.name);
     const relativePath = toDisplayPath(
@@ -686,24 +882,52 @@ async function walk(
         continue;
       }
 
-      const ignoreMatch = matchIgnoreRules(relativePath, true, ignoreRules);
-      if (
-        HARD_SKIP_HIDDEN_NAMES.has(entry.name) ||
-        matchesRootExcludePatterns(relativePath, rootPath) ||
-        (ignoreMatch.ignored &&
-          !ignoredPathExplicitlyIncluded(
-            relativePath,
-            rootPath,
-            ignoreMatch,
-          )) ||
-        shouldSkipHiddenDirectory(entry.name, relativePath, rootPath)
-      ) {
+      const { skipDirectory } = await withGlobPathBudget(
+        relativePath.length,
+        activeWeight,
+        async () => {
+          const normalizedPath = normalizePathForMatch(relativePath);
+          const ignoreMatch = await matchIgnoreRules(
+            normalizedPath,
+            true,
+            ignoreRules,
+            signal,
+          );
+          return {
+            skipDirectory:
+              HARD_SKIP_HIDDEN_NAMES.has(entry.name) ||
+              (await matchesRootExcludePatterns(
+                relativePath,
+                rootPath,
+                signal,
+              )) ||
+              (ignoreMatch.ignored &&
+                !(await ignoredPathExplicitlyIncluded(
+                  normalizedPath,
+                  rootPath,
+                  ignoreMatch,
+                  signal,
+                ))) ||
+              (await shouldSkipHiddenDirectory(
+                entry.name,
+                normalizedPath,
+                rootPath,
+                signal,
+              )),
+          };
+        },
+      );
+      if (skipDirectory) {
         continue;
       }
 
       if (
         (await isNestedGitRepositoryDirectory(absolutePath)) &&
-        !nestedGitRepositoryExplicitlyIncluded(relativePath, rootPath)
+        !(await nestedGitRepositoryExplicitlyIncluded(
+          relativePath,
+          rootPath,
+          signal,
+        ))
       ) {
         continue;
       }
@@ -727,6 +951,7 @@ async function walk(
         diagnostics,
         ignoreRules,
         fileTypes,
+        staticRuleWeight,
         visitedDirectories,
         depth + 1,
         signal,
@@ -748,23 +973,51 @@ async function walk(
       continue;
     }
 
-    const ignoreMatch = matchIgnoreRules(relativePath, false, ignoreRules);
-    if (
-      ignoreMatch.ignored &&
-      !ignoredPathExplicitlyIncluded(relativePath, rootPath, ignoreMatch)
-    ) {
-      continue;
-    }
+    const keepFile = await withGlobPathBudget(
+      relativePath.length,
+      activeWeight,
+      async () => {
+        const normalizedPath = normalizePathForMatch(relativePath);
+        const ignoreMatch = await matchIgnoreRules(
+          normalizedPath,
+          false,
+          ignoreRules,
+          signal,
+        );
+        if (
+          ignoreMatch.ignored &&
+          !(await ignoredPathExplicitlyIncluded(
+            normalizedPath,
+            rootPath,
+            ignoreMatch,
+            signal,
+          ))
+        ) {
+          return false;
+        }
 
-    if (shouldSkipHiddenFile(entry.name, relativePath, rootPath)) {
-      continue;
-    }
+        if (
+          await shouldSkipHiddenFile(
+            entry.name,
+            normalizedPath,
+            rootPath,
+            signal,
+          )
+        ) {
+          return false;
+        }
 
-    if (!matchesRootPatterns(relativePath, rootPath)) {
-      continue;
-    }
+        if (!(await matchesRootPatterns(normalizedPath, rootPath, signal))) {
+          return false;
+        }
 
-    if (!matchesFileSelection(relativePath, rootPath, fileTypes)) {
+        return matchesFileSelection(normalizedPath, rootPath, fileTypes, {
+          signal,
+          yieldToEventLoop,
+        });
+      },
+    );
+    if (!keepFile) {
       continue;
     }
 
@@ -800,12 +1053,7 @@ async function walk(
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) {
-    return;
-  }
-  throw signal.reason instanceof Error
-    ? signal.reason
-    : new Error("Indexing was cancelled.");
+  checkGlobCancellation(signal);
 }
 
 function isHiddenName(name: string): boolean {
@@ -817,10 +1065,12 @@ async function readGitIgnoreRules(
   currentPath: string,
 ): Promise<IgnoreRule[]> {
   const ignorePath = join(currentPath, ".gitignore");
-  const content = await readFile(ignorePath, "utf8").catch(() => null);
+  const content = await readIgnoreFile(ignorePath, true);
   const basePath = toDisplayPath(relative(rootPath.absolutePath, currentPath));
   const cacheKey = `${ignorePath}\0${basePath}`;
   if (content === null) {
+    gitIgnoreCacheChars -=
+      gitIgnoreRuleCache.get(cacheKey)?.content.length ?? 0;
     gitIgnoreRuleCache.delete(cacheKey);
     return [];
   }
@@ -829,10 +1079,17 @@ async function readGitIgnoreRules(
   if (cached?.content === content) {
     return cached.rules;
   }
-  const rules = parseGitIgnoreRules(content, basePath);
+  const rules = parseGitIgnoreRules(content, basePath, ignorePath);
+  gitIgnoreCacheChars -= cached?.content.length ?? 0;
+  gitIgnoreCacheChars += content.length;
   gitIgnoreRuleCache.set(cacheKey, { content, rules });
-  if (gitIgnoreRuleCache.size > MAX_GITIGNORE_CACHE_ENTRIES) {
-    gitIgnoreRuleCache.delete(gitIgnoreRuleCache.keys().next().value!);
+  while (
+    gitIgnoreRuleCache.size > MAX_GITIGNORE_CACHE_ENTRIES ||
+    gitIgnoreCacheChars > MAX_GITIGNORE_CACHE_CHARS
+  ) {
+    const oldest = gitIgnoreRuleCache.keys().next().value!;
+    gitIgnoreCacheChars -= gitIgnoreRuleCache.get(oldest)!.content.length;
+    gitIgnoreRuleCache.delete(oldest);
   }
   return rules;
 }
@@ -841,30 +1098,79 @@ async function readConfiguredIgnoreRules(
   rootPath: RootPath,
 ): Promise<IgnoreRule[]> {
   const rules: IgnoreRule[] = [];
+  checkGlobRuleCount(rootPath.ignoreFiles?.length ?? 0);
   for (const path of rootPath.ignoreFiles ?? []) {
     const absolutePath = isAbsolute(path)
       ? path
       : resolve(rootPath.absolutePath, path);
-    const content = await readFile(absolutePath, "utf8");
-    rules.push(...parseGitIgnoreRules(content, ""));
+    const content = await readIgnoreFile(absolutePath, false);
+    rules.push(...parseGitIgnoreRules(content!, "", absolutePath));
+    checkGlobRuleCount(rules.length);
   }
   return rules;
 }
 
-function parseGitIgnoreRules(content: string, basePath: string): IgnoreRule[] {
+async function readIgnoreFile(
+  path: string,
+  optional: boolean,
+): Promise<string | null> {
+  const handle = await open(path, "r").catch((error: unknown) => {
+    if (optional && (error as NodeJS.ErrnoException).code === "ENOENT")
+      return null;
+    throw error;
+  });
+  if (!handle) return null;
+  try {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for (;;) {
+      const buffer = Buffer.alloc(
+        Math.min(65_536, MAX_IGNORE_FILE_BYTES + 1 - size),
+      );
+      const { bytesRead } = await handle.read(buffer);
+      if (bytesRead === 0) return Buffer.concat(chunks).toString("utf8");
+      size += bytesRead;
+      chargeGlobOverhead(bytesRead);
+      if (size > MAX_IGNORE_FILE_BYTES)
+        throw new Error(
+          `Ignore file exceeds the ${MAX_IGNORE_FILE_BYTES}-byte limit: ${path}`,
+        );
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseGitIgnoreRules(
+  content: string,
+  basePath: string,
+  source: string,
+): IgnoreRule[] {
   const rules: IgnoreRule[] = [];
 
-  for (const rawLine of content.split(/\r?\n/)) {
-    const rule = parseGitIgnoreRule(rawLine, basePath);
-    if (rule) {
-      rules.push(rule);
+  for (const [line, rawLine] of content.split(/\r?\n/).entries()) {
+    try {
+      const rule = parseGitIgnoreRule(rawLine, basePath, source, line + 1);
+      if (rule) rules.push(rule);
+      checkGlobRuleCount(rules.length);
+    } catch (error) {
+      throw new Error(
+        `Invalid ignore rule at ${source}:${line + 1}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
     }
   }
 
   return rules;
 }
 
-function parseGitIgnoreRule(line: string, basePath: string): IgnoreRule | null {
+function parseGitIgnoreRule(
+  line: string,
+  basePath: string,
+  source: string,
+  lineNumber: number,
+): IgnoreRule | null {
   let pattern = line.trim();
   if (pattern.length === 0 || pattern.startsWith("#")) {
     return null;
@@ -886,11 +1192,14 @@ function parseGitIgnoreRule(line: string, basePath: string): IgnoreRule | null {
   pattern = directoryOnly ? pattern.replace(/\/+$/, "") : pattern;
   const anchored = pattern.startsWith("/");
   pattern = anchored ? pattern.replace(/^\/+/, "") : pattern;
-  pattern = normalizePathPattern(pattern);
+  pattern = withGlobOverheadOnly(() => normalizePathPattern(pattern));
 
   if (pattern.length === 0) {
     return null;
   }
+
+  // Validate before scanning any files, preserving the source/line in errors.
+  if (hasPathGlob(pattern)) compileGlob(pattern, false);
 
   return {
     basePath,
@@ -899,20 +1208,36 @@ function parseGitIgnoreRule(line: string, basePath: string): IgnoreRule | null {
     directoryOnly,
     anchored,
     hasSlash: pattern.includes("/"),
+    source,
+    line: lineNumber,
   };
 }
 
-function matchIgnoreRules(
+async function matchIgnoreRules(
   relativePath: string,
   isDirectory: boolean,
   rules: readonly IgnoreRule[],
-): IgnoreMatch {
+  signal?: AbortSignal,
+): Promise<IgnoreMatch> {
+  checkGlobRuleCount(rules.length);
   let ignored = false;
   let matchedNegation = false;
   let matchedRule: IgnoreRule | undefined;
 
   for (const rule of rules) {
-    if (!ignoreRuleMatches(rule, relativePath, isDirectory)) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    let matches: boolean;
+    try {
+      matches = await ignoreRuleMatches(
+        rule,
+        relativePath,
+        isDirectory,
+        signal,
+      );
+    } catch (error) {
+      throw ignoreRuleError(rule, error);
+    }
+    if (!matches) {
       continue;
     }
 
@@ -920,6 +1245,7 @@ function matchIgnoreRules(
     matchedNegation = rule.negated;
     matchedRule = rule;
   }
+  await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
 
   return {
     ignored,
@@ -928,22 +1254,37 @@ function matchIgnoreRules(
   };
 }
 
-function ignoredPathExplicitlyIncluded(
+function ignoreRuleError(rule: IgnoreRule, cause: unknown): Error {
+  const origin = rule.line > 0 ? `${rule.source}:${rule.line}` : rule.source;
+  return labeledGlobError(`ignore rule ${origin}`, rule.pattern, cause);
+}
+
+async function ignoredPathExplicitlyIncluded(
   relativePath: string,
   rootPath: RootPath,
   ignoreMatch: IgnoreMatch,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!ignoreMatch.ignored || !ignoreMatch.matchedRule || !rootPath.include) {
     return false;
   }
 
-  return rootPath.include.some((pattern) =>
-    includePatternNamesIgnoredPath(
-      pattern,
-      relativePath,
-      ignoreMatch.matchedRule!.pattern,
-    ),
-  );
+  for (const [includeIndex, pattern] of rootPath.include.entries()) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    try {
+      if (
+        includePatternNamesIgnoredPath(
+          pattern,
+          relativePath,
+          ignoreMatch.matchedRule!.pattern,
+        )
+      )
+        return true;
+    } catch (error) {
+      throw labeledGlobError(`root include[${includeIndex}]`, pattern, error);
+    }
+  }
+  return false;
 }
 
 function includePatternNamesIgnoredPath(
@@ -988,11 +1329,12 @@ function includeSegmentNamesIgnoredPath(
   );
 }
 
-function ignoreRuleMatches(
+async function ignoreRuleMatches(
   rule: IgnoreRule,
   relativePath: string,
   isDirectory: boolean,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   const path = relativeToIgnoreRuleBase(relativePath, rule.basePath);
   if (path === null || path.length === 0) {
     return false;
@@ -1000,17 +1342,20 @@ function ignoreRuleMatches(
 
   if (rule.directoryOnly) {
     if (rule.anchored || rule.hasSlash) {
-      return pathPatternMatches(rule.pattern, path);
+      return pathPatternMatchesPrepared(rule.pattern, path);
     }
 
-    return pathContainsMatchingSegment(path, rule.pattern);
+    return pathContainsMatchingSegment(path, rule.pattern, signal);
   }
 
   if (rule.anchored || rule.hasSlash) {
-    return pathPatternMatches(rule.pattern, path);
+    return pathPatternMatchesPrepared(rule.pattern, path);
   }
 
-  if (isDirectory && pathContainsMatchingSegment(path, rule.pattern)) {
+  if (
+    isDirectory &&
+    (await pathContainsMatchingSegment(path, rule.pattern, signal))
+  ) {
     return true;
   }
 
@@ -1035,35 +1380,74 @@ function relativeToIgnoreRuleBase(
     : null;
 }
 
-function pathContainsMatchingSegment(path: string, pattern: string): boolean {
-  return path.split("/").some((segment) => segmentMatches(pattern, segment));
+async function pathContainsMatchingSegment(
+  path: string,
+  pattern: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  for (const segment of path.split("/")) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    if (segmentMatches(pattern, segment)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function segmentMatches(pattern: string, segment: string): boolean {
-  return pathPatternMatches(pattern, segment);
+  // Equivalent fast paths, proven against the compiled matcher's semantics:
+  // - a pattern without glob syntax (including braces, which the matcher
+  //   treats as alternation) matches a path segment — which never contains
+  //   "/" — only by exact equality;
+  // - "*<literal>" with a brace-free, metacharacter-free suffix matches a
+  //   segment iff it ends with that literal suffix, because a single "*"
+  //   spans only non-separator characters.
+  // Every other pattern keeps the compiled matcher.
+  if (isLiteralGlobText(pattern)) {
+    return pattern === segment;
+  }
+  if (pattern.startsWith("*") && isLiteralGlobText(pattern.slice(1))) {
+    return segment.endsWith(pattern.slice(1));
+  }
+  return pathPatternMatchesPrepared(pattern, segment);
 }
 
-function shouldSkipHiddenDirectory(
+function isLiteralGlobText(value: string): boolean {
+  return (
+    !value.includes("*") &&
+    !value.includes("?") &&
+    !value.includes("[") &&
+    !value.includes("{")
+  );
+}
+
+async function shouldSkipHiddenDirectory(
   name: string,
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!isHiddenName(name) || rootPath.hidden) {
     return false;
   }
 
-  return !hasIncludeDescendant(relativePath, rootPath.include);
+  return !(await hasIncludeDescendant(relativePath, rootPath.include, signal));
 }
 
-function shouldSkipHiddenFile(
+async function shouldSkipHiddenFile(
   name: string,
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   return (
     isHiddenName(name) &&
     !rootPath.hidden &&
-    !hasExplicitHiddenFileInclude(relativePath, rootPath.include)
+    !(await hasExplicitHiddenFileInclude(
+      relativePath,
+      rootPath.include,
+      signal,
+    ))
   );
 }
 
@@ -1074,52 +1458,73 @@ async function isNestedGitRepositoryDirectory(
   return marker !== null && (marker.isFile() || marker.isDirectory());
 }
 
-function nestedGitRepositoryExplicitlyIncluded(
+async function nestedGitRepositoryExplicitlyIncluded(
   relativePath: string,
   rootPath: RootPath,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!rootPath.include || rootPath.include.length === 0) {
     return false;
   }
 
   const normalizedRelativePath = normalizePathPattern(relativePath);
-  return rootPath.include.some((pattern) => {
+  for (const [includeIndex, pattern] of rootPath.include.entries()) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
     const normalizedPattern = normalizePathPattern(pattern);
-    return (
-      pathPatternMatches(normalizedPattern, normalizedRelativePath) ||
-      normalizedPattern.startsWith(`${normalizedRelativePath}/`)
-    );
-  });
+    try {
+      if (
+        pathPatternMatches(normalizedPattern, normalizedRelativePath) ||
+        normalizedPattern.startsWith(`${normalizedRelativePath}/`)
+      ) {
+        return true;
+      }
+    } catch (error) {
+      throw labeledGlobError(`root include[${includeIndex}]`, pattern, error);
+    }
+  }
+  return false;
 }
 
-function hasIncludeDescendant(
+async function hasIncludeDescendant(
   relativePath: string,
   includePatterns: readonly string[] | undefined,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!includePatterns || includePatterns.length === 0) {
     return false;
   }
 
-  return includePatterns.some(
-    (pattern) =>
+  for (const pattern of includePatterns) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    if (
       includePatternDeclaresHiddenDirectory(pattern, relativePath) &&
-      pathPatternMightMatchDescendant(pattern, relativePath),
-  );
+      pathPatternMightMatchDescendant(pattern, relativePath)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
-function hasExplicitHiddenFileInclude(
+async function hasExplicitHiddenFileInclude(
   relativePath: string,
   includePatterns: readonly string[] | undefined,
-): boolean {
+  signal?: AbortSignal,
+): Promise<boolean> {
   if (!includePatterns || includePatterns.length === 0) {
     return false;
   }
 
-  return includePatterns.some(
-    (pattern) =>
+  for (const pattern of includePatterns) {
+    await yieldGlobWorkIfNeeded(yieldToEventLoop, signal);
+    if (
       includePatternDeclaresHiddenDirectory(pattern, relativePath) &&
-      pathPatternMatches(pattern, relativePath),
-  );
+      pathPatternMatches(pattern, relativePath)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function includePatternDeclaresHiddenDirectory(
