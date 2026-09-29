@@ -775,3 +775,87 @@ test("charged sibling scopes recover after child error and cancellation", async 
     await assert.rejects(charge60M(), /work limit/);
   });
 });
+
+test("charged scopes resume correctly after a child work-limit error", async () => {
+  const { withGlobBudget, withGlobPathBudget, chargeGlobWork } =
+    await import("../../dist/engine/utils/glob-budget.js");
+  const dimensions = [3_800, 200_000];
+  const failingChild = () =>
+    withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(60_000_000);
+    });
+  // Parent resume: charge 20M, run a failing child, then 25M more (45M total,
+  // within the 50M allowance) must succeed and 31M more must reject.
+  await withGlobBudget(async () => {
+    const result = await withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(20_000_000);
+      await assert.rejects(failingChild(), /work limit/);
+      chargeGlobWork(25_000_000);
+      return "parent-resumed";
+    });
+    assert.equal(result, "parent-resumed");
+    await assert.rejects(
+      withGlobPathBudget(...dimensions, async () => {
+        chargeGlobWork(51_000_000);
+      }),
+      /work limit/,
+    );
+  });
+  // Sibling resume: sibling B charges 20M, a child of B fails, B resumes.
+  await withGlobBudget(async () => {
+    let releaseFirst;
+    const firstEntered = new Promise((resolve) => (releaseFirst = resolve));
+    const first = withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(10_000_000);
+      releaseFirst();
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+    await firstEntered;
+    const sibling = await withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(20_000_000);
+      await assert.rejects(failingChild(), /work limit/);
+      chargeGlobWork(25_000_000);
+      return "sibling-resumed";
+    });
+    assert.equal(sibling, "sibling-resumed");
+    await first;
+  });
+});
+
+test("charged scopes resume correctly after a child cancellation", async () => {
+  const { withGlobBudget, withGlobPathBudget, chargeGlobWork } =
+    await import("../../dist/engine/utils/glob-budget.js");
+  const dimensions = [3_800, 200_000];
+  const cancelledChild = (controller) =>
+    withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(10_000_000);
+      const { yieldGlobWorkIfNeeded } =
+        await import("../../dist/engine/utils/glob-budget.js");
+      await yieldGlobWorkIfNeeded(
+        () => new Promise((resolve) => setImmediate(resolve)),
+        controller.signal,
+      );
+      chargeGlobWork(10_000_000);
+    });
+  await withGlobBudget(async () => {
+    const controller = new AbortController();
+    const reason = new Error("stop-resume");
+    const result = await withGlobPathBudget(...dimensions, async () => {
+      chargeGlobWork(20_000_000);
+      controller.abort(reason);
+      await assert.rejects(
+        cancelledChild(controller),
+        (error) => error === reason,
+      );
+      chargeGlobWork(25_000_000);
+      return "resumed-after-cancel";
+    });
+    assert.equal(result, "resumed-after-cancel");
+    await assert.rejects(
+      withGlobPathBudget(...dimensions, async () => {
+        chargeGlobWork(51_000_000);
+      }),
+      /work limit/,
+    );
+  });
+});
