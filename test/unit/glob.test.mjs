@@ -688,28 +688,43 @@ test("adversarial 400-rule fixture rejects at the labeled candidate ceiling", as
     const rules = Array.from({ length: 400 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
     const { GlobWorkLimitError } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
-    const started = Date.now();
-    await assert.rejects(
-      () => scanRootPaths('ceiling', [{ absolutePath: workerData, recursive: true }]),
-      (error) => {
-        const rejectionMs = Date.now() - started;
-        assert.match(error.message, /work limit/);
-        assert.match(error.message, /\\.gitignore:\\d+/);
-        let cause = error;
-        while (cause instanceof Error && cause.cause instanceof Error) {
-          cause = cause.cause;
-        }
-        assert.ok(
-          cause instanceof GlobWorkLimitError,
-          'expected the candidate-ceiling cause, got ' + cause.constructor.name,
-        );
-        // Gate-environment calibration: rejection measured 5,178ms under
-        // coverage instrumentation inside the namespace; the withdrawn heads
-        // complete the whole scan without rejecting (~11s), well above this.
-        assert.ok(rejectionMs < 15_000, 'rejection took ' + rejectionMs + 'ms');
-        return true;
-      },
-    );
+    // Responsiveness is measured as maximum event-loop delay during the
+    // rejection, separate from total completion time.
+    let maxGap = 0;
+    let last = Date.now();
+    let timer;
+    const tick = () => {
+      const now = Date.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+    };
+    timer = setInterval(tick, 5);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    last = Date.now();
+    let rejectionGapMs = 0;
+    try {
+      await assert.rejects(
+        scanRootPaths('ceiling', [{ absolutePath: workerData, recursive: true }]),
+        (error) => {
+          rejectionGapMs = Math.max(maxGap, Date.now() - last);
+          assert.match(error.message, /work limit/);
+          assert.match(error.message, /\\.gitignore:\\d+/);
+          let cause = error;
+          while (cause instanceof Error && cause.cause instanceof Error) {
+            cause = cause.cause;
+          }
+          assert.ok(
+            cause instanceof GlobWorkLimitError,
+            'expected the candidate-ceiling cause, got ' + cause.constructor.name,
+          );
+          return true;
+        },
+      );
+    } finally {
+      clearInterval(timer);
+      rejectionGapMs = Math.max(rejectionGapMs, Date.now() - last);
+    }
+    assert.ok(rejectionGapMs < 250, 'max event-loop block during rejection was ' + rejectionGapMs + 'ms');
   `,
     root,
     120_000,
