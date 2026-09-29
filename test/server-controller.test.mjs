@@ -8,13 +8,13 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import test from "node:test";
 import {
-import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
   DaemonInstanceLock,
   readInstanceRecord,
   serverStatus,
   startServer,
   stopServer,
 } from "../dist/daemon/server-controller.js";
+import { useIsolatedZvecGrepHome } from "./helpers/isolated-home.mjs";
 
 useIsolatedZvecGrepHome();
 
