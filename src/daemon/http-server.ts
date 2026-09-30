@@ -89,7 +89,6 @@ export class DaemonHttpServer {
     if (this.server) {
       return this.address();
     }
-    this.eventLoopMonitor ??= startEventLoopMonitor();
     this.server = createServer((request, response) => {
       const id = requestId();
       const startedAt = Date.now();
@@ -145,6 +144,9 @@ export class DaemonHttpServer {
       this.server = undefined;
       throw error;
     }
+    // Start only after the listener is up: a failed start must never leave a
+    // monitor running, and close() stops it before any early return.
+    this.eventLoopMonitor ??= startEventLoopMonitor();
     return this.address();
   }
 
@@ -156,14 +158,23 @@ export class DaemonHttpServer {
     return address;
   }
 
+  /**
+   * Whether the event-loop monitor is running. Test- and diagnostics-visible
+   * so lifecycle leaks (a monitor left running after a failed start, or not
+   * stopped by close) are observable from outside the instance.
+   */
+  eventLoopMonitorActive(): boolean {
+    return this.eventLoopMonitor !== undefined;
+  }
+
   async close(): Promise<void> {
+    this.eventLoopMonitor?.stop();
+    this.eventLoopMonitor = undefined;
     const server = this.server;
     this.server = undefined;
     if (!server) {
       return;
     }
-    this.eventLoopMonitor?.stop();
-    this.eventLoopMonitor = undefined;
     await Promise.all([
       this.mcpEndpoint.close(),
       this.adminMcpEndpoint.close(),

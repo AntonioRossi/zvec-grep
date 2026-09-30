@@ -26,7 +26,7 @@ test("event-loop monitor reports synthetic blocks and stays quiet at rest", asyn
   monitor.stop();
 });
 
-test("event-loop monitor reset clears the reported maximum", async () => {
+test("event-loop monitor reset clears a reported maximum", async () => {
   const monitor = startEventLoopMonitor();
   const blockStart = performance.now();
   while (performance.now() - blockStart < 250) {
@@ -41,6 +41,25 @@ test("event-loop monitor reset clears the reported maximum", async () => {
   assert.ok(
     afterReset <= 60,
     `expected the reset maximum to stay small at rest, got ${afterReset}ms`,
+  );
+
+  monitor.stop();
+});
+
+test("event-loop monitor reset discards a straddling overdue tick", async () => {
+  const monitor = startEventLoopMonitor();
+  const blockStart = performance.now();
+  while (performance.now() - blockStart < 250) {
+    // busy-wait: the sampler tick is now overdue
+  }
+  // Reset lands before the overdue tick can fire; the epoch must advance so
+  // the new window does not inherit the pre-reset delay.
+  monitor.resetMax();
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const afterReset = monitor.maxGapMs();
+  assert.ok(
+    afterReset <= 60,
+    `reset must discard the overdue pre-reset tick, got ${afterReset}ms`,
   );
 
   monitor.stop();

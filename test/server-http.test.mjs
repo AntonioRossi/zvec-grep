@@ -40,19 +40,50 @@ test("HTTP server rolls back state after a listen failure", async () => {
     version: "1.0.0",
     backend,
   });
-  const firstAddress = await first.start();
-  const second = new DaemonHttpServer({
-    host: "127.0.0.1",
-    port: firstAddress.port,
-    token,
-    version: "1.0.0",
-    backend,
-  });
-  await assert.rejects(second.start(), /EADDRINUSE|address already in use/i);
-  await first.close();
-  const secondAddress = await second.start();
-  assert.equal(secondAddress.port, firstAddress.port);
-  await second.close();
+  let contender;
+  let successor;
+  try {
+    const firstAddress = await first.start();
+    assert.equal(first.eventLoopMonitorActive(), true);
+    contender = new DaemonHttpServer({
+      host: "127.0.0.1",
+      port: firstAddress.port,
+      token,
+      version: "1.0.0",
+      backend,
+    });
+    await assert.rejects(
+      contender.start(),
+      /EADDRINUSE|address already in use/i,
+    );
+    assert.equal(
+      contender.eventLoopMonitorActive(),
+      false,
+      "a failed start must not leave an event-loop monitor running",
+    );
+    await first.close();
+    assert.equal(first.eventLoopMonitorActive(), false);
+    successor = new DaemonHttpServer({
+      host: "127.0.0.1",
+      port: firstAddress.port,
+      token,
+      version: "1.0.0",
+      backend,
+    });
+    const successorAddress = await successor.start();
+    assert.equal(successorAddress.port, firstAddress.port);
+    assert.equal(successor.eventLoopMonitorActive(), true);
+    await successor.close();
+    assert.equal(
+      successor.eventLoopMonitorActive(),
+      false,
+      "close() must stop the started event-loop monitor",
+    );
+  } finally {
+    await first.close().catch(() => undefined);
+    await contender?.close().catch(() => undefined);
+    await successor?.close().catch(() => undefined);
+  }
 });
 
 test("Streamable HTTP serves health, MCP contracts and a real cached index search", async (t) => {

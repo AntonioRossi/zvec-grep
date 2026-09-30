@@ -38,6 +38,9 @@ export function startEventLoopMonitor(): EventLoopMonitor {
     maxGapMs: () => Math.max(0, Math.round(maxGap)),
     resetMax: () => {
       maxGap = 0;
+      // Advance the sampling epoch too: a tick that is already overdue when
+      // the reset lands must not import pre-reset delay into the new window.
+      lastTick = performance.now();
     },
     stop: () => clearInterval(timer),
   };
