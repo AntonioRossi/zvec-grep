@@ -4,6 +4,7 @@ import { EngineError } from "../../errors.js";
 import type { WorkspaceManifestRootPath } from "../../manifest.js";
 import type { RootPath } from "../../types.js";
 import {
+  canonicalRelativePath,
   tryRealpathSync,
   workspaceRootCrp,
   type CanonicalPathResolver,
@@ -66,12 +67,9 @@ export function canonicalizeRootPaths(
   resolver: CanonicalPathResolver,
 ): RootPath[] {
   return paths.map((root) => {
-    const canonicalPath =
-      root.canonicalPath ??
-      (normalizePath(root.absolutePath) === resolver.workspaceRoot
-        ? workspaceRootCrp()
-        : resolver.toCanonical(root.absolutePath));
     const realRoot = tryRealpathSync(root.absolutePath);
+    const canonicalPath =
+      root.canonicalPath ?? canonicalRootPath(root, resolver, realRoot);
     const escapes =
       realRoot !== undefined &&
       !isPathInside(resolver.workspaceRealRoot, realRoot);
@@ -86,6 +84,34 @@ export function canonicalizeRootPaths(
     }
     return { ...root, canonicalPath };
   });
+}
+
+/**
+ * The CRP of a runtime root. Textual spelling decides first; when it does
+ * not match, resolver-comparable physical roots decide: a workspace may be
+ * addressed through an equivalent symlinked spelling of the same physical
+ * tree (macOS /var vs /private/var). A root that resolves outside the
+ * workspace yields null here and is rejected by the caller's escape check.
+ */
+function canonicalRootPath(
+  root: RootPath,
+  resolver: CanonicalPathResolver,
+  realRoot: string | undefined,
+): string | null {
+  if (normalizePath(root.absolutePath) === resolver.workspaceRoot) {
+    return workspaceRootCrp();
+  }
+  const textual = resolver.toCanonical(root.absolutePath);
+  if (textual !== null) {
+    return textual;
+  }
+  if (realRoot === undefined) {
+    return null;
+  }
+  if (realRoot === resolver.workspaceRealRoot) {
+    return workspaceRootCrp();
+  }
+  return canonicalRelativePath(resolver.workspaceRealRoot, realRoot);
 }
 
 export function validateRootPaths(
