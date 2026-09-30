@@ -1,0 +1,33 @@
+name: Portability matrix (macos-latest)
+
+# Added on a review branch only (owner authorization, round 28): the
+# default branch is untouched. Push-triggered so the branch's own workflow
+# file fires on its push — no default-branch registration.
+on:
+  push:
+    branches: ["review/portability-matrix-**"]
+
+permissions:
+  contents: read
+
+jobs:
+  portability-matrix:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Filename normalization coverage note
+        run: |
+          echo "Filename scenarios (NFC/NFD, collisions, case sensitivity) are covered by this revision's own unit tests (test/unit/canonical-path.test.mjs, test/unit/portable-scanner.test.mjs); the dedicated mac workflow runs relocation and transfer probes."
+      - name: Relocation probe
+        run: node scripts/portability-relocation.mjs
+      - name: Transfer probe
+        run: node scripts/portability-transfer.mjs
