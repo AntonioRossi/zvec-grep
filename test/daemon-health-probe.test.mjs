@@ -29,46 +29,34 @@ export function inLoadWindow(requestStartMs, loadStartedAtMs) {
 }
 
 /**
- * Retains the correlated load observations attribution actually needs. A
- * bounded buffer of ordinary qualifying samples may drop entries, but the
- * decisive observations can never disappear: the worst external request and
- * every new daemon-gap maximum are kept separately, each with its timestamp.
- * A late outlier — the worst external arriving after the buffer has filled —
- * is therefore always examinable alongside its daemon gap.
+ * Retains the external-latency observations the probe's diagnostics need.
+ * A bounded buffer of ordinary qualifying samples may drop entries, but the
+ * decisive observation can never disappear: the worst external request is
+ * kept separately with its timestamp, so a late outlier — arriving after
+ * the buffer has filled — is always examinable. (The daemon-gap-aware
+ * variant of this collector lives on the diagnostic branch.)
  */
 export function createLoadSampleCollector(ordinaryLimit = 40) {
   let worstExternal;
   let worstExternalMs = -1;
-  let gapMaximumMs = -1;
-  const gapMaximums = [];
   const ordinary = [];
-  const add = (entry) => {
-    const { ext, gap } = entry;
-    if (ext > worstExternalMs) {
-      worstExternalMs = ext;
-      worstExternal = entry;
-    }
-    if (typeof gap === "number" && gap > gapMaximumMs) {
-      gapMaximumMs = gap;
-      gapMaximums.push(entry);
-    }
-    if (ordinary.length < ordinaryLimit) {
-      ordinary.push(entry);
-    }
-  };
-  const qualifies = (entry) =>
-    entry.ext > 50 || (typeof entry.gap === "number" && entry.gap > 50);
   return {
-    observe(t, ext, gap) {
-      const entry = { t, ext, gap };
-      if (qualifies(entry)) add(entry);
+    observe(t, ext) {
+      if (ext <= 50) return;
+      if (ext > worstExternalMs) {
+        worstExternalMs = ext;
+        worstExternal = { t, ext };
+      }
+      if (ordinary.length < ordinaryLimit) {
+        ordinary.push({ t, ext });
+      }
     },
     entries() {
       const seen = new Set();
       const merged = [];
-      for (const entry of [worstExternal, ...gapMaximums, ...ordinary]) {
+      for (const entry of [worstExternal, ...ordinary]) {
         if (!entry) continue;
-        const key = `${entry.t}:${entry.ext}:${entry.gap}`;
+        const key = `${entry.t}:${entry.ext}`;
         if (seen.has(key)) continue;
         seen.add(key);
         merged.push(entry);
@@ -190,7 +178,7 @@ async function runHealthProbe(options) {
             loadOkPolls++;
             loadLatencies.push(elapsed);
             worstHealthMs = Math.max(worstHealthMs, elapsed);
-            samples.observe(requestStart - loadStartedAt, elapsed, undefined);
+            samples.observe(requestStart - loadStartedAt, elapsed);
           }
         }
       } catch (error) {
@@ -478,9 +466,7 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     `health-probe timings ms: ${JSON.stringify(timings)}; external ${latencyDistribution}`,
   );
   for (const entry of samples.entries()) {
-    t.diagnostic(
-      `load-sample t=${entry.t}ms ext=${entry.ext} gap=${entry.gap ?? "n/a"}`,
-    );
+    t.diagnostic(`load-sample t=${entry.t}ms ext=${entry.ext}`);
   }
   assert.deepEqual(problems, []);
   assert.ok(okPolls >= 50, `expected sustained polling, got ${okPolls}`);
@@ -797,35 +783,40 @@ test("load window classification uses request start time", () => {
   );
 });
 
-test("load sample collector preserves late outliers beyond the buffer", () => {
+test("load sample collector preserves late external outliers beyond the buffer", () => {
   const collector = createLoadSampleCollector(40);
-  // Fill the ordinary buffer with qualifying samples.
+  // Fill the ordinary buffer with qualifying external samples.
   for (let i = 0; i < 40; i++) {
-    collector.observe(i * 10, 55, 60);
+    collector.observe(i * 10, 55);
   }
   // More ordinary samples after the buffer is full — droppable.
   for (let i = 0; i < 40; i++) {
-    collector.observe(10_000 + i * 10, 52, 61);
+    collector.observe(10_000 + i * 10, 52);
   }
-  // The decisive outlier arrives LAST: the worst external observation, and a
-  // new daemon-gap maximum, long after the buffer filled.
-  collector.observe(50_000, 150, 90);
+  // The decisive outlier arrives LAST and only its external latency is
+  // notable: with the buffer full, only external-maximum retention can
+  // preserve it.
+  collector.observe(50_000, 150);
 
   const entries = collector.entries();
   const worst = entries.find((entry) => entry.t === 50_000);
   assert.ok(
-    worst && worst.ext === 150 && worst.gap === 90,
+    worst && worst.ext === 150,
     `the late worst-external observation must be retained, got ${JSON.stringify(worst)}`,
   );
-  const firstGapMax = entries.find((entry) => entry.t === 0);
+  const firstOrdinary = entries.find((entry) => entry.t === 0);
   assert.ok(
-    firstGapMax && firstGapMax.gap === 60,
-    "each new daemon-gap maximum is retained with its timestamp",
+    firstOrdinary && firstOrdinary.ext === 55,
+    "buffered ordinary samples are retained with their timestamps",
   );
-  const lastOrdinaryBeforeOutlier = entries.some((entry) => entry.t === 10_390);
   assert.equal(
-    lastOrdinaryBeforeOutlier,
+    entries.some((entry) => entry.t === 10_390),
     false,
-    "ordinary samples past the buffer are droppable — only decisive ones are not",
+    "ordinary samples past the buffer are droppable — only the worst external is not",
+  );
+  assert.equal(
+    entries.filter((entry) => entry.ext === 150).length,
+    1,
+    "the worst external appears exactly once",
   );
 });
