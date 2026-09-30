@@ -6,6 +6,7 @@
 // removed source must be gone entirely. Fault-injection controls
 // (PORT_PROBE_INJECT) demonstrate each assertion bites.
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import {
   cp,
   mkdir,
@@ -91,9 +92,14 @@ if (INJECT === "reembed") {
   await serviceB.index();
 }
 await serviceB.close();
+// Item paths may carry the resolved spelling of the relocated root
+// (macOS /var vs /private/var); containment is physical.
+const realB = realpathSync(B);
 assert.ok(contextB.items?.length > 0, "relocated query must hit");
 assert.ok(
-  contextB.items.every((item) => item.file.absolutePath.startsWith(B + "/")),
+  contextB.items.every((item) =>
+    item.file.absolutePath.startsWith(realB + "/"),
+  ),
   "hits must come from the relocated root only",
 );
 assert.equal(
