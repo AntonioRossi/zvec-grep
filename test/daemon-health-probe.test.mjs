@@ -192,6 +192,7 @@ async function runHealthProbe(options) {
   let okPolls = 0;
   let loadOkPolls = 0;
   let daemonGapMs;
+  let daemonTraceSummary;
   const loadLatencies = [];
   const samples = createLoadSampleCollector();
   const failures = [];
@@ -264,7 +265,12 @@ async function runHealthProbe(options) {
     // the MEASURED target: a first index of the target repo opens its store
     // and prepares its model. Warmup failures propagate — a cold store must
     // never be measured as load.
-    const timings = { warmupIndexMs: 0, measuredIndexMs: 0, queryMs: 0 };
+    const timings = {
+      warmupIndexMs: 0,
+      measuredIndexMs: 0,
+      queryMs: 0,
+      loadStart: 0,
+    };
     const warmupStartedAt = Date.now();
     const warmupIndex = await runCli(
       ["--index", "--mode", "server", "--allow-remote", root],
@@ -313,6 +319,7 @@ async function runHealthProbe(options) {
     }
 
     loadStartedAt = Date.now();
+    timings.loadStart = performance.now();
     const [indexed, queried] = await Promise.all([
       (async () => {
         const startedAt = Date.now();
@@ -353,6 +360,40 @@ async function runHealthProbe(options) {
       const finalGap = await readGap(false);
       if (typeof finalGap === "number") {
         daemonGapMs = Math.max(daemonGapMs ?? 0, finalGap);
+      }
+      // Diagnostic-branch evidence capture (§10): the event trace — tick
+      // overshoots, handler spans, dropped count — plus before/after clock
+      // probes for observer/daemon clock alignment with uncertainty.
+      try {
+        const pre = await fetch(healthUrl_);
+        const preBody = await pre.json();
+        const preAfter = performance.now();
+        const traceBody = await (await fetch(`${healthUrl_}?trace=1`)).json();
+        const post = await fetch(healthUrl_);
+        const postBody = await post.json();
+        const postAfter = performance.now();
+        const trace = traceBody?.trace;
+        if (trace) {
+          const ticks = trace.events.filter((e) => e.kind === "tick");
+          const handlers = trace.events.filter((e) => e.kind === "handler");
+          const offsetA = preBody?.clock - (timings.loadStart + preAfter) / 2;
+          const offsetB = postBody?.clock - (timings.loadStart + postAfter) / 2;
+          daemonTraceSummary = {
+            dropped: trace.dropped,
+            tickCount: ticks.length,
+            maxTickOvershootMs: Math.max(0, ...ticks.map((e) => e.overshootMs)),
+            slowTicks: ticks
+              .filter((e) => e.overshootMs > 50)
+              .map((e) => Math.round(e.overshootMs)),
+            handlerCount: handlers.length,
+            maxHandlerMs: Math.max(0, ...handlers.map((h) => h.end - h.start)),
+            clockOffsetsMs: [offsetA, offsetB].map((o) =>
+              Number.isFinite(o) ? Math.round(o) : null,
+            ),
+          };
+        }
+      } catch {
+        // Trace capture failure does not fail the probe; recorded as absent.
       }
     }
     const timingsNote = ` (timings ms: warmup=${timings.warmupIndexMs} index=${timings.measuredIndexMs} query=${timings.queryMs})`;
@@ -547,6 +588,7 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     timings,
     daemonGapMs,
     startupGapMs,
+    daemonTraceSummary,
     samples,
     latencyDistribution,
   } = await runHealthProbe({
@@ -564,6 +606,9 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
   t.diagnostic(
     `health-probe timings ms: ${JSON.stringify(timings)}; daemon gap startup=${startupGapMs} load=${daemonGapMs} (${typeof daemonGapMs === "number" ? "reported" : "unknown"}); external ${latencyDistribution}`,
   );
+  if (daemonTraceSummary) {
+    t.diagnostic(`daemon-trace ${JSON.stringify(daemonTraceSummary)}`);
+  }
   for (const entry of samples.entries()) {
     t.diagnostic(
       `load-sample t=${entry.t}ms ext=${entry.ext} gap=${entry.gap ?? "n/a"}`,
@@ -1044,5 +1089,122 @@ test("health gap parsing rejects invalid envelopes and malformed values", () => 
   assert.throws(
     () => parseHealthGap({ status: "ok", eventLoop: { maxGapMs: "87" } }),
     /malformed/,
+  );
+});
+
+test("calibration: known daemon block and observer delay are distinguishable", async (t) => {
+  const temporaryDirectory = await createTemporaryDirectory(
+    t,
+    "zvec-grep-calibration-",
+    { cleanup: false },
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "a.ts"), "export const Calib = 1;\n");
+  const home = join(temporaryDirectory, "home");
+  const port = await availablePort();
+  const env = {
+    HOME: home,
+    USERPROFILE: home,
+    NO_COLOR: "1",
+    ZVEC_GREP_API_KEY: "test-key",
+    ZVEC_GREP_HOME: home,
+  };
+  t.after(async () => {
+    await ownedTeardown({ home, root, env, port });
+    await removeTemporaryDirectory(temporaryDirectory);
+  });
+  await mkdir(join(home, ".zvec-grep"), { recursive: true });
+  const started = await runCli(
+    ["--server", "on", "--listen", `127.0.0.1:${port}`, "--home", home],
+    { cwd: root, env },
+  );
+  assert.match(started.stdout, /Server: ready/);
+  const base = `http://127.0.0.1:${port}`;
+
+  // Clock-alignment probes: offset between poller and daemon clocks with
+  // uncertainty from repeated paired readings.
+  const probes = [];
+  for (let i = 0; i < 5; i++) {
+    const before = performance.now();
+    const body = await (await fetch(base + "/healthz")).json();
+    const after = performance.now();
+    probes.push({ before, after, daemon: body.clock });
+  }
+  const offsets = probes.map((p) => p.daemon - (p.before + p.after) / 2);
+  const offset = offsets.reduce((a, b) => a + b, 0) / offsets.length;
+  const spread = Math.max(...offsets) - Math.min(...offsets);
+
+  // Control A — known daemon block (300ms) in a calibration handler:
+  // concurrently polling observer must see its requests delayed while the
+  // daemon trace records a matching sampler overshoot.
+  await fetch(base + "/healthz?resetLoopGap=1");
+  let blockDone = false;
+  const pollA = [];
+  const pollLoopA = (async () => {
+    while (!blockDone) {
+      const s = performance.now();
+      await fetch(base + "/healthz");
+      pollA.push(performance.now() - s);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  })();
+  const blockStart = performance.now();
+  const blockPromise = (async () => {
+    try {
+      return await fetch(base + "/healthz?calibrateBlock=300");
+    } finally {
+      blockDone = true;
+    }
+  })();
+  await blockPromise;
+  const blockElapsed = performance.now() - blockStart;
+  await pollLoopA;
+  const traceBody = await (await fetch(base + "/healthz?trace=1")).json();
+  const maxOvershoot = Math.max(
+    0,
+    ...traceBody.trace.events
+      .filter((e) => e.kind === "tick")
+      .map((e) => e.overshootMs),
+  );
+  assert.ok(
+    blockElapsed >= 290,
+    `calibration block executed (elapsed ${blockElapsed}ms)`,
+  );
+  assert.ok(
+    maxOvershoot >= 150,
+    `daemon block visible as sampler overshoot (${maxOvershoot}ms)`,
+  );
+  assert.ok(traceBody.trace.dropped === 0, "no dropped events in control A");
+
+  // Control B — known observer delay: poller busy-spins 300ms after send
+  // registration; daemon-side must show NO new overshoot. Scope to events
+  // appended after this point (the trace is append-only since daemon start).
+  const traceBefore = await (await fetch(base + "/healthz?trace=1")).json();
+  const tickCountBefore = traceBefore.trace.events.filter(
+    (e) => e.kind === "tick",
+  ).length;
+  const s = performance.now();
+  await fetch(base + "/healthz");
+  const spinUntil = performance.now() + 300;
+  while (performance.now() < spinUntil) {}
+  const observerElapsed = performance.now() - s;
+  const traceB = await (await fetch(base + "/healthz?trace=1")).json();
+  const ticksB = traceB.trace.events
+    .filter((e) => e.kind === "tick")
+    .slice(tickCountBefore);
+  const maxOvershootB = Math.max(0, ...ticksB.map((e) => e.overshootMs));
+  assert.ok(
+    observerElapsed >= 300,
+    `observer delay inflated observer time (${observerElapsed}ms)`,
+  );
+  assert.ok(
+    maxOvershootB < 150,
+    `no daemon-side signal for observer delay (${maxOvershootB}ms)`,
+  );
+
+  t.diagnostic(
+    `calibration: clock offset ${offset.toFixed(1)}ms (spread ${spread.toFixed(1)}ms); ` +
+      `daemon-block overshoot ${maxOvershoot}ms; observer-delay overshoot ${maxOvershootB}ms`,
   );
 });

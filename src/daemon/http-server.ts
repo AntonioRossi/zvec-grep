@@ -24,6 +24,7 @@ import {
   startEventLoopMonitor,
   type EventLoopMonitor,
 } from "./event-loop-monitor.js";
+import { createDiagnosticTrace } from "./diagnostic-trace.js";
 import { requestId, type DaemonLogger } from "./logger.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -47,6 +48,9 @@ export class DaemonHttpServer {
   private readonly mcpEndpoint: McpHttpEndpoint;
   private readonly adminMcpEndpoint: McpHttpEndpoint;
   private eventLoopMonitor?: EventLoopMonitor;
+  private readonly diagnosticTrace = createDiagnosticTrace();
+  private traceSampler?: ReturnType<typeof setInterval>;
+  private nextRequestId = 1;
 
   constructor(private readonly options: DaemonHttpServerOptions) {
     if (!isLoopbackHost(options.host)) {
@@ -147,6 +151,19 @@ export class DaemonHttpServer {
     // Start only after the listener is up: a failed start must never leave a
     // monitor running, and close() stops it before any early return.
     this.eventLoopMonitor ??= startEventLoopMonitor();
+    const trace = this.diagnosticTrace;
+    const sampler = setInterval(() => {
+      const now = performance.now();
+      const overshoot = now - trace.lastTick() - 100;
+      trace.record({
+        kind: "tick",
+        t: now,
+        overshootMs: Math.max(0, overshoot),
+      });
+      trace.setLastTick(now);
+    }, 100);
+    sampler.unref();
+    this.traceSampler = sampler;
     return this.address();
   }
 
@@ -170,6 +187,10 @@ export class DaemonHttpServer {
   async close(): Promise<void> {
     this.eventLoopMonitor?.stop();
     this.eventLoopMonitor = undefined;
+    if (this.traceSampler) {
+      clearInterval(this.traceSampler);
+      this.traceSampler = undefined;
+    }
     const server = this.server;
     this.server = undefined;
     if (!server) {
@@ -189,6 +210,21 @@ export class DaemonHttpServer {
     response: ServerResponse,
     id: string,
   ): Promise<void> {
+    const traceId = this.nextRequestId++;
+    this.diagnosticTrace.requestStarted(traceId, request.url ?? "/");
+    try {
+      return await this.handleRequestTraced(request, response, id, traceId);
+    } finally {
+      this.diagnosticTrace.requestFinished(traceId);
+    }
+  }
+
+  private async handleRequestTraced(
+    request: IncomingMessage,
+    response: ServerResponse,
+    id: string,
+    traceId: number,
+  ): Promise<void> {
     // Route independently of Host so malformed authorities are rejected below.
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname === "/healthz") {
@@ -202,9 +238,30 @@ export class DaemonHttpServer {
       if (url.searchParams.get("resetLoopGap") === "1") {
         this.eventLoopMonitor?.resetMax();
       }
+      // Calibration control (diagnostic branch only): a known bounded
+      // synchronous block executed inside this handler.
+      const blockMs = Number(url.searchParams.get("calibrateBlock") ?? 0);
+      if (blockMs > 0 && blockMs <= 2_000) {
+        const blockStart = performance.now();
+        while (performance.now() - blockStart < blockMs) {}
+      }
+      // Clock-alignment probe: returns the daemon's monotonic clock so an
+      // observer can compute offset/uncertainty from paired readings.
+      const traceParam = url.searchParams.get("trace");
       writeJson(response, 200, {
         status: "ok",
+        clock: performance.now(),
         eventLoop: { maxGapMs: this.eventLoopMonitor?.maxGapMs() ?? null },
+        ...(traceParam === "1"
+          ? {
+              trace: {
+                start: this.diagnosticTrace.start(),
+                dropped: this.diagnosticTrace.dropped(),
+                inFlight: this.diagnosticTrace.inFlightSnapshot(),
+                events: this.diagnosticTrace.events(),
+              },
+            }
+          : {}),
       });
       return;
     }
