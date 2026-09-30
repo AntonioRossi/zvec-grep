@@ -1,10 +1,10 @@
 import { realpathSync, statSync, type BigIntStats } from "node:fs";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { EngineError } from "../../errors.js";
 import type { WorkspaceManifestRootPath } from "../../manifest.js";
 import type { RootPath } from "../../types.js";
 import {
-  canonicalRelativePath,
+  canonicalFromRelative,
   tryRealpathSync,
   workspaceRootCrp,
   type CanonicalPathResolver,
@@ -69,7 +69,7 @@ export function canonicalizeRootPaths(
   return paths.map((root) => {
     const realRoot = tryRealpathSync(root.absolutePath);
     const canonicalPath =
-      root.canonicalPath ?? canonicalRootPath(root, resolver, realRoot);
+      root.canonicalPath ?? canonicalRootPath(root, resolver);
     const escapes =
       realRoot !== undefined &&
       !isPathInside(resolver.workspaceRealRoot, realRoot);
@@ -88,15 +88,17 @@ export function canonicalizeRootPaths(
 
 /**
  * The CRP of a runtime root. Textual spelling decides first; when it does
- * not match, resolver-comparable physical roots decide: a workspace may be
- * addressed through an equivalent symlinked spelling of the same physical
- * tree (macOS /var vs /private/var). A root that resolves outside the
- * workspace yields null here and is rejected by the caller's escape check.
+ * not match, an equivalent spelling of the workspace decides: a workspace
+ * may be addressed through a symlinked alias (macOS /var vs /private/var),
+ * but only the alias prefix is normalized — the segments below the
+ * workspace root keep their logical spelling so an internal symlink does
+ * not rename the selection. Selections with no prefix physically equal to
+ * the workspace root yield null; resolved-root containment stays with the
+ * caller's escape check.
  */
 function canonicalRootPath(
   root: RootPath,
   resolver: CanonicalPathResolver,
-  realRoot: string | undefined,
 ): string | null {
   if (normalizePath(root.absolutePath) === resolver.workspaceRoot) {
     return workspaceRootCrp();
@@ -105,13 +107,37 @@ function canonicalRootPath(
   if (textual !== null) {
     return textual;
   }
-  if (realRoot === undefined) {
+  const aliasSuffix = workspaceAliasSuffix(root.absolutePath, resolver);
+  if (aliasSuffix === null) {
     return null;
   }
-  if (realRoot === resolver.workspaceRealRoot) {
-    return workspaceRootCrp();
+  return aliasSuffix.length === 0
+    ? workspaceRootCrp()
+    : canonicalFromRelative(aliasSuffix.join("/"));
+}
+
+/**
+ * The workspace-relative suffix of a path addressed through an equivalent
+ * spelling of the workspace: the first prefix walking upward that
+ * physically resolves to the workspace root marks the alias boundary.
+ */
+function workspaceAliasSuffix(
+  absolutePath: string,
+  resolver: CanonicalPathResolver,
+): string[] | null {
+  const suffix: string[] = [];
+  let current = normalizePath(absolutePath);
+  while (true) {
+    if (tryRealpathSync(current) === resolver.workspaceRealRoot) {
+      return suffix.reverse();
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    suffix.push(basename(current));
+    current = parent;
   }
-  return canonicalRelativePath(resolver.workspaceRealRoot, realRoot);
 }
 
 export function validateRootPaths(

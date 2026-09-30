@@ -4,6 +4,7 @@ import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { createCanonicalPathResolver } from "../../dist/engine/utils/canonical-path.js";
+import { scanRootPaths } from "../../dist/engine/pipeline/indexing/scanner/index.js";
 import {
   manifestRootPathsFromRuntime,
   validateRootPaths,
@@ -102,4 +103,44 @@ test("a missing leaf beneath an escaping intermediate stays an explicit error", 
     () => validateRootPaths([join(symlinkedRoot, "escape", "missing.md")]),
     { code: "ZVEC_GREP.ENGINE.SCANNER.ROOT_PATH_MISSING" },
   );
+});
+
+test("equivalent root spellings persist the logical name and identical file identities", async (t) => {
+  const { physicalRoot, symlinkedRoot } = await prepareSymlinkedWorkspace(t);
+  await mkdir(join(physicalRoot, "target"));
+  await writeFile(join(physicalRoot, "target", "file.md"), "# Portable\n");
+  await symlink(
+    join(physicalRoot, "target"),
+    join(physicalRoot, "link"),
+    "dir",
+  );
+
+  const resolver = createCanonicalPathResolver(physicalRoot);
+  const fileIds = [];
+  for (const spelling of [physicalRoot, symlinkedRoot]) {
+    const manifestRoot = manifestRootPathsFromRuntime(
+      validateRootPaths([join(spelling, "link")]),
+      resolver,
+    )[0];
+    assert.equal(manifestRoot.path, "link");
+
+    const resolution = resolver.resolveDetailedSync(manifestRoot.path);
+    assert.equal(resolution.status, "ok");
+
+    const scan = await scanRootPaths(
+      "same-index-id",
+      [
+        {
+          absolutePath: resolution.path,
+          canonicalPath: manifestRoot.path,
+          recursive: true,
+        },
+      ],
+      { workspaceRoot: physicalRoot },
+    );
+    assert.equal(scan.files.length, 1);
+    assert.equal(scan.files[0].canonicalPath, "link/file.md");
+    fileIds.push(scan.files[0].id);
+  }
+  assert.equal(fileIds[0], fileIds[1]);
 });
