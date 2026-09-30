@@ -223,7 +223,7 @@ export class DaemonHttpServer {
     request: IncomingMessage,
     response: ServerResponse,
     id: string,
-    traceId: number,
+    _traceId: number,
   ): Promise<void> {
     // Route independently of Host so malformed authorities are rejected below.
     const url = new URL(request.url ?? "/", "http://localhost");
@@ -243,7 +243,9 @@ export class DaemonHttpServer {
       const blockMs = Number(url.searchParams.get("calibrateBlock") ?? 0);
       if (blockMs > 0 && blockMs <= 2_000) {
         const blockStart = performance.now();
-        while (performance.now() - blockStart < blockMs) {}
+        while (performance.now() - blockStart < blockMs) {
+          void blockStart;
+        }
       }
       // Clock-alignment probe: returns the daemon's monotonic clock so an
       // observer can compute offset/uncertainty from paired readings.

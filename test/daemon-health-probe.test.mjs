@@ -457,6 +457,7 @@ async function runHealthProbe(options) {
       timings,
       daemonGapMs,
       startupGapMs,
+      daemonTraceSummary,
       samples,
       latencyDistribution,
     };
@@ -1187,7 +1188,9 @@ test("calibration: known daemon block and observer delay are distinguishable", a
   const s = performance.now();
   await fetch(base + "/healthz");
   const spinUntil = performance.now() + 300;
-  while (performance.now() < spinUntil) {}
+  while (performance.now() < spinUntil) {
+    void spinUntil;
+  }
   const observerElapsed = performance.now() - s;
   const traceB = await (await fetch(base + "/healthz?trace=1")).json();
   const ticksB = traceB.trace.events
