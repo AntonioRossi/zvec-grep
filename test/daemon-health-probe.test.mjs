@@ -20,6 +20,65 @@ const PROBE_FILE_NAME = `f${"g".repeat(160)}.ts`;
 const PORTABLE_PATH_BUDGET = 1000;
 
 /**
+ * The load window is defined by request START time: a request begun before
+ * load and completed during it belongs to the pre-load window, not the
+ * measured one.
+ */
+export function inLoadWindow(requestStartMs, loadStartedAtMs) {
+  return loadStartedAtMs !== 0 && requestStartMs >= loadStartedAtMs;
+}
+
+/**
+ * Retains the correlated load observations attribution actually needs. A
+ * bounded buffer of ordinary qualifying samples may drop entries, but the
+ * decisive observations can never disappear: the worst external request and
+ * every new daemon-gap maximum are kept separately, each with its timestamp.
+ * A late outlier — the worst external arriving after the buffer has filled —
+ * is therefore always examinable alongside its daemon gap.
+ */
+export function createLoadSampleCollector(ordinaryLimit = 40) {
+  let worstExternal;
+  let worstExternalMs = -1;
+  let gapMaximumMs = -1;
+  const gapMaximums = [];
+  const ordinary = [];
+  const add = (entry) => {
+    const { ext, gap } = entry;
+    if (ext > worstExternalMs) {
+      worstExternalMs = ext;
+      worstExternal = entry;
+    }
+    if (typeof gap === "number" && gap > gapMaximumMs) {
+      gapMaximumMs = gap;
+      gapMaximums.push(entry);
+    }
+    if (ordinary.length < ordinaryLimit) {
+      ordinary.push(entry);
+    }
+  };
+  const qualifies = (entry) =>
+    entry.ext > 50 || (typeof entry.gap === "number" && entry.gap > 50);
+  return {
+    observe(t, ext, gap) {
+      const entry = { t, ext, gap };
+      if (qualifies(entry)) add(entry);
+    },
+    entries() {
+      const seen = new Set();
+      const merged = [];
+      for (const entry of [worstExternal, ...gapMaximums, ...ordinary]) {
+        if (!entry) continue;
+        const key = `${entry.t}:${entry.ext}:${entry.gap}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(entry);
+      }
+      return merged.sort((a, b) => a.t - b.t);
+    },
+  };
+}
+
+/**
  * CLI success timeouts must tolerate slow or coverage-instrumented runners.
  * CI run 36587089439 (coverage job, 2026-09-29) showed the measured index
  * exceeding a 180s cap under c8 on a 2-core runner while the same tree
@@ -59,8 +118,13 @@ async function prepareHeavyFixture(parent, name) {
     join(dir, PROBE_FILE_NAME),
     "export const HealthProbeSymbol = 42;\n",
   );
+  // 300 heavy rules against the deep paths (~35M units): the corrected head
+  // admits and chunks the work while the withdrawn head evaluates it as one
+  // monolithic block past the probe's 400ms bound (the scanner stall test
+  // calibrated this same admitted geometry at 485ms on 2630dca; admission
+  // holds to ~425 rules at this path length).
   const rules = Array.from(
-    { length: 100 },
+    { length: 300 },
     (_, i) => "*a".repeat(100) + "*Z" + i,
   );
   await writeFile(join(root, ".gitignore"), `${rules.join("\n")}\n`);
@@ -104,6 +168,8 @@ async function runHealthProbe(options) {
   let worstHealthMs = 0;
   let okPolls = 0;
   let loadOkPolls = 0;
+  const loadLatencies = [];
+  const samples = createLoadSampleCollector();
   const failures = [];
   const healthUrl_ = healthUrl ?? `http://127.0.0.1:${port}/healthz`;
   const pollLoop = (async () => {
@@ -118,9 +184,13 @@ async function runHealthProbe(options) {
           failures.push(`status ${response.status}`);
         } else {
           okPolls++;
-          if (loadStartedAt && Date.now() >= loadStartedAt) {
+          // The window is defined by request START: a request begun before
+          // load and completed during it must not be counted as in-load.
+          if (inLoadWindow(requestStart, loadStartedAt)) {
             loadOkPolls++;
+            loadLatencies.push(elapsed);
             worstHealthMs = Math.max(worstHealthMs, elapsed);
+            samples.observe(requestStart - loadStartedAt, elapsed, undefined);
           }
         }
       } catch (error) {
@@ -178,28 +248,40 @@ async function runHealthProbe(options) {
     );
 
     loadStartedAt = Date.now();
-    const indexStartedAt = Date.now();
-    let queryStartedAt = 0;
     const [indexed, queried] = await Promise.all([
-      runCli(["--index", "--mode", "server", "--allow-remote", root], {
-        cwd: root,
-        env,
-        timeout: probeCliTimeoutMs(180_000),
-      }).catch((error) => error),
+      (async () => {
+        const startedAt = Date.now();
+        try {
+          return await runCli(
+            ["--index", "--mode", "server", "--allow-remote", root],
+            {
+              cwd: root,
+              env,
+              timeout: probeCliTimeoutMs(180_000),
+            },
+          );
+        } finally {
+          // Each CLI's duration is its own completion time, including
+          // rejection — not a shared endpoint after polling drains.
+          timings.measuredIndexMs = Date.now() - startedAt;
+        }
+      })().catch((error) => error),
       (async () => {
         await new Promise((resolveSleep) => setTimeout(resolveSleep, 200));
-        queryStartedAt = Date.now();
-        return runCli([...queryArgs, "--mode", "server"], {
-          cwd: root,
-          env,
-          timeout: probeCliTimeoutMs(120_000),
-        }).catch((error) => error);
-      })(),
+        const startedAt = Date.now();
+        try {
+          return await runCli([...queryArgs, "--mode", "server"], {
+            cwd: root,
+            env,
+            timeout: probeCliTimeoutMs(120_000),
+          });
+        } finally {
+          timings.queryMs = Date.now() - startedAt;
+        }
+      })().catch((error) => error),
     ]);
     polling = false;
     await pollLoop;
-    timings.measuredIndexMs = Date.now() - indexStartedAt;
-    timings.queryMs = queryStartedAt ? Date.now() - queryStartedAt : 0;
     const timingsNote = ` (timings ms: warmup=${timings.warmupIndexMs} index=${timings.measuredIndexMs} query=${timings.queryMs})`;
 
     const problems = [];
@@ -219,6 +301,15 @@ async function runHealthProbe(options) {
     if (worstHealthMs >= maxMs) {
       problems.push(`worst steady-state health latency ${worstHealthMs}ms`);
     }
+    const latencyDistribution = (() => {
+      if (loadLatencies.length === 0) return "n=0";
+      const sorted = [...loadLatencies].sort((a, b) => a - b);
+      const at = (quantile) =>
+        sorted[
+          Math.min(sorted.length - 1, Math.floor(quantile * sorted.length))
+        ];
+      return `n=${sorted.length} p50=${at(0.5)}ms p95=${at(0.95)}ms max=${sorted[sorted.length - 1]}ms`;
+    })();
     const indexedOk =
       !indexed?.code &&
       /Workspace index: succeeded/.test(String(indexed.stdout ?? ""));
@@ -240,7 +331,15 @@ async function runHealthProbe(options) {
           `query result timings${timingsNote}`,
         );
     }
-    return { problems, worstHealthMs, okPolls, loadOkPolls, timings };
+    return {
+      problems,
+      worstHealthMs,
+      okPolls,
+      loadOkPolls,
+      timings,
+      samples,
+      latencyDistribution,
+    };
   } finally {
     polling = false;
     await pollLoop;
@@ -362,13 +461,27 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     await removeTemporaryDirectory(temporaryDirectory);
   });
 
-  const { problems, worstHealthMs, okPolls, timings } = await runHealthProbe({
+  const {
+    problems,
+    worstHealthMs,
+    okPolls,
+    timings,
+    samples,
+    latencyDistribution,
+  } = await runHealthProbe({
     root,
     home,
     env,
     port,
   });
-  t.diagnostic(`health-probe timings ms: ${JSON.stringify(timings)}`);
+  t.diagnostic(
+    `health-probe timings ms: ${JSON.stringify(timings)}; external ${latencyDistribution}`,
+  );
+  for (const entry of samples.entries()) {
+    t.diagnostic(
+      `load-sample t=${entry.t}ms ext=${entry.ext} gap=${entry.gap ?? "n/a"}`,
+    );
+  }
   assert.deepEqual(problems, []);
   assert.ok(okPolls >= 50, `expected sustained polling, got ${okPolls}`);
   assert.ok(
@@ -657,5 +770,62 @@ test("probe CLI timeouts scale for slow and instrumented runners", () => {
     probeCliTimeoutMs(base, {}),
     probeCliTimeoutMs(base, { OTHER: "1" }),
     "only NODE_V8_COVERAGE triggers instrumented scaling",
+  );
+});
+
+test("load window classification uses request start time", () => {
+  const loadStartedAt = 1_000;
+  assert.equal(
+    inLoadWindow(1_000, loadStartedAt),
+    true,
+    "a request starting exactly at load start is in the window",
+  );
+  assert.equal(
+    inLoadWindow(999, loadStartedAt),
+    false,
+    "a request starting before load stays outside the window even if it completes during it",
+  );
+  assert.equal(
+    inLoadWindow(5_000, loadStartedAt),
+    true,
+    "later requests are in the window",
+  );
+  assert.equal(
+    inLoadWindow(5_000, 0),
+    false,
+    "before load starts there is no window",
+  );
+});
+
+test("load sample collector preserves late outliers beyond the buffer", () => {
+  const collector = createLoadSampleCollector(40);
+  // Fill the ordinary buffer with qualifying samples.
+  for (let i = 0; i < 40; i++) {
+    collector.observe(i * 10, 55, 60);
+  }
+  // More ordinary samples after the buffer is full — droppable.
+  for (let i = 0; i < 40; i++) {
+    collector.observe(10_000 + i * 10, 52, 61);
+  }
+  // The decisive outlier arrives LAST: the worst external observation, and a
+  // new daemon-gap maximum, long after the buffer filled.
+  collector.observe(50_000, 150, 90);
+
+  const entries = collector.entries();
+  const worst = entries.find((entry) => entry.t === 50_000);
+  assert.ok(
+    worst && worst.ext === 150 && worst.gap === 90,
+    `the late worst-external observation must be retained, got ${JSON.stringify(worst)}`,
+  );
+  const firstGapMax = entries.find((entry) => entry.t === 0);
+  assert.ok(
+    firstGapMax && firstGapMax.gap === 60,
+    "each new daemon-gap maximum is retained with its timestamp",
+  );
+  const lastOrdinaryBeforeOutlier = entries.some((entry) => entry.t === 10_390);
+  assert.equal(
+    lastOrdinaryBeforeOutlier,
+    false,
+    "ordinary samples past the buffer are droppable — only decisive ones are not",
   );
 });
