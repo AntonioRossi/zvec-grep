@@ -144,3 +144,80 @@ test("equivalent root spellings persist the logical name and identical file iden
   }
   assert.equal(fileIds[0], fileIds[1]);
 });
+
+test("internal workspace-root link selected under both spellings persists the link name", async (t) => {
+  const { physicalRoot, symlinkedRoot } = await prepareSymlinkedWorkspace(t);
+  await mkdir(join(physicalRoot, "docs"), { recursive: true });
+  await writeFile(join(physicalRoot, "docs", "file.md"), "# Portable\n");
+  await symlink(physicalRoot, join(physicalRoot, "self"), "dir");
+
+  const resolver = createCanonicalPathResolver(physicalRoot);
+  const fileIds = [];
+  for (const spelling of [physicalRoot, symlinkedRoot]) {
+    const manifestRoot = manifestRootPathsFromRuntime(
+      validateRootPaths([join(spelling, "self")]),
+      resolver,
+    )[0];
+    assert.equal(manifestRoot.path, "self");
+
+    const resolution = resolver.resolveDetailedSync(manifestRoot.path);
+    assert.equal(resolution.status, "ok");
+
+    const scan = await scanRootPaths(
+      "same-index-id",
+      [
+        {
+          absolutePath: resolution.path,
+          canonicalPath: manifestRoot.path,
+          recursive: true,
+        },
+      ],
+      { workspaceRoot: physicalRoot },
+    );
+    const files = scan.files
+      .map((file) => ({ path: file.canonicalPath, id: file.id }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    assert.deepEqual(
+      files.map((file) => file.path),
+      ["self/docs/file.md"],
+    );
+    fileIds.push(files[0].id);
+  }
+  assert.equal(fileIds[0], fileIds[1]);
+});
+
+test("directory below the internal workspace-root link preserves the full logical path", async (t) => {
+  const { physicalRoot, symlinkedRoot } = await prepareSymlinkedWorkspace(t);
+  await mkdir(join(physicalRoot, "docs"), { recursive: true });
+  await writeFile(join(physicalRoot, "docs", "file.md"), "# Portable\n");
+  await symlink(physicalRoot, join(physicalRoot, "self"), "dir");
+
+  const resolver = createCanonicalPathResolver(physicalRoot);
+  const fileIds = [];
+  for (const spelling of [physicalRoot, symlinkedRoot]) {
+    const manifestRoot = manifestRootPathsFromRuntime(
+      validateRootPaths([join(spelling, "self", "docs")]),
+      resolver,
+    )[0];
+    assert.equal(manifestRoot.path, "self/docs");
+
+    const resolution = resolver.resolveDetailedSync(manifestRoot.path);
+    assert.equal(resolution.status, "ok");
+
+    const scan = await scanRootPaths(
+      "same-index-id",
+      [
+        {
+          absolutePath: resolution.path,
+          canonicalPath: manifestRoot.path,
+          recursive: true,
+        },
+      ],
+      { workspaceRoot: physicalRoot },
+    );
+    assert.equal(scan.files.length, 1);
+    assert.equal(scan.files[0].canonicalPath, "self/docs/file.md");
+    fileIds.push(scan.files[0].id);
+  }
+  assert.equal(fileIds[0], fileIds[1]);
+});

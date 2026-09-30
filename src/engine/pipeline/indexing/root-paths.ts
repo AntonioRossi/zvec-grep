@@ -118,8 +118,10 @@ function canonicalRootPath(
 
 /**
  * The workspace-relative suffix of a path addressed through an equivalent
- * spelling of the workspace: the first prefix walking upward that
- * physically resolves to the workspace root marks the alias boundary.
+ * spelling of the workspace: the outermost prefix that physically resolves
+ * to the workspace root marks the alias boundary. Nearer matches are
+ * internal links back to the workspace root and belong to the logical
+ * suffix, not to the boundary.
  */
 function workspaceAliasSuffix(
   absolutePath: string,
@@ -127,13 +129,14 @@ function workspaceAliasSuffix(
 ): string[] | null {
   const suffix: string[] = [];
   let current = normalizePath(absolutePath);
+  let outermost: string[] | null = null;
   while (true) {
     if (tryRealpathSync(current) === resolver.workspaceRealRoot) {
-      return suffix.reverse();
+      outermost = [...suffix].reverse();
     }
     const parent = dirname(current);
     if (parent === current) {
-      return null;
+      return outermost;
     }
     suffix.push(basename(current));
     current = parent;
