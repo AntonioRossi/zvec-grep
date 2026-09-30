@@ -7,6 +7,7 @@
 // row/vector equality plus source removal stay asserted. Fault-injection
 // controls (PORT_PROBE_INJECT) demonstrate each assertion bites.
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -167,10 +168,13 @@ if (INJECT === "reembed") {
   await reopened.index();
 }
 await reopened.close();
+// Item paths may carry the resolved spelling of the destination root
+// (macOS /var vs /private/var); containment is physical.
+const realDestination = realpathSync(destination);
 assert.ok(contextT.items?.length > 0, "destination query must hit");
 assert.ok(
   contextT.items.every((item) =>
-    item.file.absolutePath.startsWith(destination + "/"),
+    item.file.absolutePath.startsWith(realDestination + "/"),
   ),
   "hits must come from the destination root only",
 );
