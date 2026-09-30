@@ -137,7 +137,12 @@ test("glob complexity limits reject expensive inputs without hanging", async () 
     assert.equal(withGlobBudget(() => glob.ripgrepGlobMatches('**', 'a')), true);
   `,
     undefined,
-    10_000,
+    // The parent-thread external watchdog budget: coverage instrumentation
+    // on slower hosted runners stretches this suite past the 10s reference
+    // cap (8138ms locally under c8; fork CI run 36733381202 exceeded it).
+    // Scaled finitely for that environment; the watchdog itself, every
+    // assertion and the 3000-match workload are unchanged.
+    process.env.NODE_V8_COVERAGE ? 30_000 : 20_000,
   );
 });
 
