@@ -19,6 +19,20 @@ const DEEP_COMPONENT = "a".repeat(90);
 const PROBE_FILE_NAME = `f${"g".repeat(160)}.ts`;
 const PORTABLE_PATH_BUDGET = 1000;
 
+/**
+ * CLI success timeouts must tolerate slow or coverage-instrumented runners.
+ * CI run 36587089439 (coverage job, 2026-09-29) showed the measured index
+ * exceeding a 180s cap under c8 on a 2-core runner while the same tree
+ * passed without instrumentation: the cap, not the workload, failed the
+ * probe. Slow-runner baseline doubles every cap; active V8 coverage
+ * (NODE_V8_COVERAGE is inherited by every spawned process) triples it. The
+ * probe's latency bound is unaffected — a longer cap only stops the success
+ * predicate from manufacturing failures on slow environments.
+ */
+export function probeCliTimeoutMs(baseMs, env = process.env) {
+  return env.NODE_V8_COVERAGE ? baseMs * 3 : baseMs * 2;
+}
+
 async function availablePort() {
   const { createServer } = await import("node:net");
   return new Promise((resolvePort) => {
@@ -144,10 +158,13 @@ async function runHealthProbe(options) {
     // the MEASURED target: a first index of the target repo opens its store
     // and prepares its model. Warmup failures propagate — a cold store must
     // never be measured as load.
+    const timings = { warmupIndexMs: 0, measuredIndexMs: 0, queryMs: 0 };
+    const warmupStartedAt = Date.now();
     const warmupIndex = await runCli(
       ["--index", "--mode", "server", "--allow-remote", root],
-      { cwd: root, env, timeout: 120_000 },
+      { cwd: root, env, timeout: probeCliTimeoutMs(120_000) },
     );
+    timings.warmupIndexMs = Date.now() - warmupStartedAt;
     assert.match(
       String(warmupIndex.stdout),
       /Workspace index: succeeded/,
@@ -161,23 +178,29 @@ async function runHealthProbe(options) {
     );
 
     loadStartedAt = Date.now();
+    const indexStartedAt = Date.now();
+    let queryStartedAt = 0;
     const [indexed, queried] = await Promise.all([
       runCli(["--index", "--mode", "server", "--allow-remote", root], {
         cwd: root,
         env,
-        timeout: 180_000,
+        timeout: probeCliTimeoutMs(180_000),
       }).catch((error) => error),
       (async () => {
         await new Promise((resolveSleep) => setTimeout(resolveSleep, 200));
+        queryStartedAt = Date.now();
         return runCli([...queryArgs, "--mode", "server"], {
           cwd: root,
           env,
-          timeout: 120_000,
+          timeout: probeCliTimeoutMs(120_000),
         }).catch((error) => error);
       })(),
     ]);
     polling = false;
     await pollLoop;
+    timings.measuredIndexMs = Date.now() - indexStartedAt;
+    timings.queryMs = queryStartedAt ? Date.now() - queryStartedAt : 0;
+    const timingsNote = ` (timings ms: warmup=${timings.warmupIndexMs} index=${timings.measuredIndexMs} query=${timings.queryMs})`;
 
     const problems = [];
     if (failures.length > 0) {
@@ -207,16 +230,17 @@ async function runHealthProbe(options) {
           `indexing did not succeed: ${String(indexed?.stderr ?? indexed)}`.slice(
             0,
             200,
-          ),
+          ) + timingsNote,
         );
       if (!queriedOk)
         problems.push(
           ...queryResultProblems(queried, PROBE_FILE_NAME).map(
             (problem) => `query result: ${problem}`,
           ),
+          `query result timings${timingsNote}`,
         );
     }
-    return { problems, worstHealthMs, okPolls, loadOkPolls };
+    return { problems, worstHealthMs, okPolls, loadOkPolls, timings };
   } finally {
     polling = false;
     await pollLoop;
@@ -338,12 +362,13 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     await removeTemporaryDirectory(temporaryDirectory);
   });
 
-  const { problems, worstHealthMs, okPolls } = await runHealthProbe({
+  const { problems, worstHealthMs, okPolls, timings } = await runHealthProbe({
     root,
     home,
     env,
     port,
   });
+  t.diagnostic(`health-probe timings ms: ${JSON.stringify(timings)}`);
   assert.deepEqual(problems, []);
   assert.ok(okPolls >= 50, `expected sustained polling, got ${okPolls}`);
   assert.ok(
@@ -611,4 +636,26 @@ test("query result assertion rejects zero-hit and wrong-file outputs", async () 
     stdout: `query groups (1):\nhits: 1\n#1 matchedBy=fts some/dir/${expected}:1-2\nexport const HealthProbeSymbol = 42;\n`,
   };
   assert.deepEqual(queryResultProblems(good, expected), []);
+});
+
+test("probe CLI timeouts scale for slow and instrumented runners", () => {
+  const base = 120_000;
+  assert.ok(
+    probeCliTimeoutMs(base, {}) > base,
+    "baseline must give slow runners headroom beyond the reference cap",
+  );
+  assert.ok(
+    probeCliTimeoutMs(base, {}) <= base * 2,
+    "baseline scaling stays bounded",
+  );
+  assert.equal(
+    probeCliTimeoutMs(base, { NODE_V8_COVERAGE: "/tmp/coverage" }),
+    base * 3,
+    "active V8 coverage must triple the cap (c8 run 36587089439)",
+  );
+  assert.equal(
+    probeCliTimeoutMs(base, {}),
+    probeCliTimeoutMs(base, { OTHER: "1" }),
+    "only NODE_V8_COVERAGE triggers instrumented scaling",
+  );
 });
