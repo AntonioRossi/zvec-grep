@@ -116,7 +116,13 @@ test("Streamable HTTP serves health, MCP contracts and a real cached index searc
 
   const health = await fetch(`http://127.0.0.1:${address.port}/healthz`);
   assert.equal(health.status, 200);
-  assert.deepEqual(await health.json(), { status: "ok" });
+  const healthBody = await health.json();
+  assert.equal(healthBody.status, "ok");
+  assert.equal(
+    typeof healthBody.eventLoop?.maxGapMs,
+    "number",
+    "health must expose the daemon event-loop gap",
+  );
   const cliStatus = await new DaemonClient({
     serverUrl: mcpUrl.href,
     home: temporaryDirectory,

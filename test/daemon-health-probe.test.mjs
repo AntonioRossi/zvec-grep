@@ -104,6 +104,8 @@ async function runHealthProbe(options) {
   let worstHealthMs = 0;
   let okPolls = 0;
   let loadOkPolls = 0;
+  let daemonGapMs;
+  const loadLatencies = [];
   const failures = [];
   const healthUrl_ = healthUrl ?? `http://127.0.0.1:${port}/healthz`;
   const pollLoop = (async () => {
@@ -120,7 +122,22 @@ async function runHealthProbe(options) {
           okPolls++;
           if (loadStartedAt && Date.now() >= loadStartedAt) {
             loadOkPolls++;
+            loadLatencies.push(elapsed);
             worstHealthMs = Math.max(worstHealthMs, elapsed);
+            // The daemon reports its own cumulative event-loop gap; after
+            // the pre-load reset this covers the load window only, which
+            // distinguishes daemon-side blocking from observer-side
+            // scheduling noise (CI Class B). Reading it here (after
+            // measuring elapsed) keeps pre-load readings out of the record.
+            try {
+              const body = await response.json();
+              const gap = body?.eventLoop?.maxGapMs;
+              if (typeof gap === "number") {
+                daemonGapMs = Math.max(daemonGapMs ?? 0, gap);
+              }
+            } catch {
+              // A body read failure does not fail the poll itself.
+            }
           }
         }
       } catch (error) {
@@ -176,6 +193,17 @@ async function runHealthProbe(options) {
       join(root, "mutation.ts"),
       "export const HealthProbeMutation = 7;\n",
     );
+    // Attribute daemon-side gaps to the load window: capture the
+    // cumulative startup maximum, then reset the monitor so every gap
+    // reported from here on belongs to the measured load phase.
+    let startupGapMs;
+    try {
+      const preLoad = await fetch(healthUrl_);
+      startupGapMs = (await preLoad.json())?.eventLoop?.maxGapMs;
+      await fetch(`${healthUrl_}?resetLoopGap=1`);
+    } catch {
+      // A failed gap query does not fail the probe's health assertions.
+    }
 
     loadStartedAt = Date.now();
     const indexStartedAt = Date.now();
@@ -219,6 +247,25 @@ async function runHealthProbe(options) {
     if (worstHealthMs >= maxMs) {
       problems.push(`worst steady-state health latency ${worstHealthMs}ms`);
     }
+    // Daemon-side discrimination (CI Class B): the daemon reports its own
+    // cumulative event-loop gap; after the pre-load reset this value covers
+    // the load window only. Presence is asserted; a numeric bound is
+    // deliberately deferred until load-phase observations exist on every
+    // supported runner (the Windows 599ms case remains unattributed).
+    if (expectWorkloadSuccess && daemonGapMs === undefined) {
+      problems.push(
+        "daemon did not report eventLoop.maxGapMs (build predates the monitor)",
+      );
+    }
+    const latencyDistribution = (() => {
+      if (loadLatencies.length === 0) return "n=0";
+      const sorted = [...loadLatencies].sort((a, b) => a - b);
+      const at = (quantile) =>
+        sorted[
+          Math.min(sorted.length - 1, Math.floor(quantile * sorted.length))
+        ];
+      return `n=${sorted.length} p50=${at(0.5)}ms p95=${at(0.95)}ms max=${sorted[sorted.length - 1]}ms`;
+    })();
     const indexedOk =
       !indexed?.code &&
       /Workspace index: succeeded/.test(String(indexed.stdout ?? ""));
@@ -240,7 +287,16 @@ async function runHealthProbe(options) {
           `query result timings${timingsNote}`,
         );
     }
-    return { problems, worstHealthMs, okPolls, loadOkPolls, timings };
+    return {
+      problems,
+      worstHealthMs,
+      okPolls,
+      loadOkPolls,
+      timings,
+      daemonGapMs,
+      startupGapMs,
+      latencyDistribution,
+    };
   } finally {
     polling = false;
     await pollLoop;
@@ -362,13 +418,23 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     await removeTemporaryDirectory(temporaryDirectory);
   });
 
-  const { problems, worstHealthMs, okPolls, timings } = await runHealthProbe({
+  const {
+    problems,
+    worstHealthMs,
+    okPolls,
+    timings,
+    daemonGapMs,
+    startupGapMs,
+    latencyDistribution,
+  } = await runHealthProbe({
     root,
     home,
     env,
     port,
   });
-  t.diagnostic(`health-probe timings ms: ${JSON.stringify(timings)}`);
+  t.diagnostic(
+    `health-probe timings ms: ${JSON.stringify(timings)}; daemon gap startup=${startupGapMs} load=${daemonGapMs}; external ${latencyDistribution}`,
+  );
   assert.deepEqual(problems, []);
   assert.ok(okPolls >= 50, `expected sustained polling, got ${okPolls}`);
   assert.ok(

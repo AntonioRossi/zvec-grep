@@ -20,6 +20,10 @@ import {
   traceContextFromMcpBody,
 } from "../observability/trace-context.js";
 import { isLoopbackHost, type ServerListenAddress } from "./config.js";
+import {
+  startEventLoopMonitor,
+  type EventLoopMonitor,
+} from "./event-loop-monitor.js";
 import { requestId, type DaemonLogger } from "./logger.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -42,6 +46,7 @@ export class DaemonHttpServer {
   private readonly requestTraceIds = new Map<string, string>();
   private readonly mcpEndpoint: McpHttpEndpoint;
   private readonly adminMcpEndpoint: McpHttpEndpoint;
+  private eventLoopMonitor?: EventLoopMonitor;
 
   constructor(private readonly options: DaemonHttpServerOptions) {
     if (!isLoopbackHost(options.host)) {
@@ -84,6 +89,7 @@ export class DaemonHttpServer {
     if (this.server) {
       return this.address();
     }
+    this.eventLoopMonitor ??= startEventLoopMonitor();
     this.server = createServer((request, response) => {
       const id = requestId();
       const startedAt = Date.now();
@@ -156,6 +162,8 @@ export class DaemonHttpServer {
     if (!server) {
       return;
     }
+    this.eventLoopMonitor?.stop();
+    this.eventLoopMonitor = undefined;
     await Promise.all([
       this.mcpEndpoint.close(),
       this.adminMcpEndpoint.close(),
@@ -177,7 +185,16 @@ export class DaemonHttpServer {
         writeJson(response, 405, { error: "method_not_allowed" });
         return;
       }
-      writeJson(response, 200, { status: "ok" });
+      // `resetLoopGap=1` zeroes the reported maximum so an observer can
+      // attribute gaps to a specific measurement window (a probe resets
+      // before applying load). Read-the-gap requests stay side-effect free.
+      if (url.searchParams.get("resetLoopGap") === "1") {
+        this.eventLoopMonitor?.resetMax();
+      }
+      writeJson(response, 200, {
+        status: "ok",
+        eventLoop: { maxGapMs: this.eventLoopMonitor?.maxGapMs() ?? null },
+      });
       return;
     }
 
