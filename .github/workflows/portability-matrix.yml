@@ -26,6 +26,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm run build
       - name: Filename normalization coverage (real unit run on APFS)
         run: >
           node --test --test-concurrency=1
