@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -95,11 +102,27 @@ test("resolver rejects ambiguous NFC collisions", async (t) => {
   await mkdir(join(root, "docs"));
   await writeFile(join(root, "docs", `caf${NFC_E}.md`), "nfc");
   await writeFile(join(root, "docs", `caf${NFD_E}.md`), "nfd");
+  // Record the filesystem's actual entries: normalization-folding
+  // filesystems (macOS APFS) collapse the two spellings into one, and
+  // ambiguity is only observable where both entries coexist.
+  const entries = await readdir(join(root, "docs"));
   const resolver = createCanonicalPathResolver(root);
-  assert.throws(
-    () => resolver.resolveDetailedSync(`docs/caf${NFC_E}.md`),
-    /ambiguous/,
+  if (entries.length === 2) {
+    assert.throws(
+      () => resolver.resolveDetailedSync(`docs/caf${NFC_E}.md`),
+      /ambiguous/,
+    );
+    return;
+  }
+  assert.equal(entries.length, 1);
+  assert.ok(
+    [`caf${NFC_E}.md`, `caf${NFD_E}.md`].includes(entries[0]),
+    `unexpected folded entry ${entries[0]}`,
   );
+  assert.deepEqual(resolver.resolveDetailedSync(`docs/caf${NFC_E}.md`), {
+    status: "ok",
+    path: join(root, "docs", entries[0]),
+  });
 });
 
 test("resolver forbids symlinks escaping the workspace", async (t) => {
@@ -167,33 +190,58 @@ test("permission and I/O failures are explicit errors, never missing paths", asy
   await mkdir(join(root, "docs"));
   await writeFile(join(root, "docs", "one.md"), "x");
   const { chmod } = await import("node:fs/promises");
-  const resolver = createCanonicalPathResolver(root);
   await chmod(join(root, "docs"), 0o000);
 
   try {
-    assert.throws(
-      () => resolver.resolveDetailedSync("docs/one.md"),
-      /Filesystem error/,
-      "an unreadable directory is an error, not a missing file",
-    );
-    assert.throws(
-      () => resolver.resolveDetailedSync("docs/absent.md"),
-      /Filesystem error/,
-      "even a would-be-absent leaf reports the access failure",
-    );
-    await assert.rejects(
-      resolver.resolveDetailed("docs/one.md"),
-      /Filesystem error/,
-    );
+    // Record the platform's actual capability: Windows mode bits are
+    // advisory for the owner, so the directory may remain readable.
+    let denied = false;
+    try {
+      createCanonicalPathResolver(root).resolveDetailedSync("docs/one.md");
+    } catch (error) {
+      assert.match(
+        String(error),
+        /Filesystem error/,
+        "probe failure must be the explicit access error",
+      );
+      denied = true;
+    }
+
+    if (denied) {
+      const resolver = createCanonicalPathResolver(root);
+      assert.throws(
+        () => resolver.resolveDetailedSync("docs/one.md"),
+        /Filesystem error/,
+        "an unreadable directory is an error, not a missing file",
+      );
+      assert.throws(
+        () => resolver.resolveDetailedSync("docs/absent.md"),
+        /Filesystem error/,
+        "even a would-be-absent leaf reports the access failure",
+      );
+      await assert.rejects(
+        resolver.resolveDetailed("docs/one.md"),
+        /Filesystem error/,
+      );
+    } else {
+      assert.deepEqual(
+        createCanonicalPathResolver(root).resolveDetailedSync("docs/one.md"),
+        { status: "ok", path: join(root, "docs", "one.md") },
+        "advisory mode bits must leave resolution working",
+      );
+    }
   } finally {
     await chmod(join(root, "docs"), 0o700);
   }
 
   // Restored access resolves normally again.
-  assert.deepEqual(resolver.resolveDetailedSync("docs/one.md"), {
-    status: "ok",
-    path: join(root, "docs", "one.md"),
-  });
+  assert.deepEqual(
+    createCanonicalPathResolver(root).resolveDetailedSync("docs/one.md"),
+    {
+      status: "ok",
+      path: join(root, "docs", "one.md"),
+    },
+  );
 });
 
 test("contained symlink entries resolve through their link path", async (t) => {

@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -61,15 +68,30 @@ test("scanner rejects canonical name collisions", async (t) => {
   await mkdir(join(root, "docs"));
   await writeFile(join(root, "docs", `caf${NFC_E}.md`), "nfc");
   await writeFile(join(root, "docs", `caf${NFD_E}.md`), "nfd");
-
-  await assert.rejects(
-    () =>
-      scanRootPaths("index-id", [{ absolutePath: root, recursive: true }], {
-        workspaceRoot: root,
-      }),
-    (error) =>
-      error.code === "ZVEC_GREP.ENGINE.SCANNER.CANONICAL_NAME_COLLISION",
+  // Record the filesystem's actual entries: on normalization-folding
+  // filesystems (macOS APFS) the two spellings collapse into one entry
+  // and no collision exists to reject; the scan must then succeed with
+  // the single NFC-canonical file.
+  const entries = await readdir(join(root, "docs"));
+  if (entries.length === 2) {
+    await assert.rejects(
+      () =>
+        scanRootPaths("index-id", [{ absolutePath: root, recursive: true }], {
+          workspaceRoot: root,
+        }),
+      (error) =>
+        error.code === "ZVEC_GREP.ENGINE.SCANNER.CANONICAL_NAME_COLLISION",
+    );
+    return;
+  }
+  assert.equal(entries.length, 1);
+  const folded = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: root, recursive: true }],
+    { workspaceRoot: root },
   );
+  assert.equal(folded.files.length, 1);
+  assert.equal(folded.files[0].canonicalPath, `docs/caf${NFC_E}.md`);
 });
 
 test("followed symlinks escaping the workspace are excluded with diagnostics", async (t) => {
