@@ -65,7 +65,7 @@ export function createLoadSampleCollector(ordinaryLimit = 40) {
   const gapMaximums = [];
   const ordinary = [];
   const add = (entry) => {
-    const { t, ext, gap } = entry;
+    const { ext, gap } = entry;
     if (ext > worstExternalMs) {
       worstExternalMs = ext;
       worstExternal = entry;
@@ -302,6 +302,7 @@ async function runHealthProbe(options) {
       } catch (error) {
         throw new Error(
           `daemon gap ${reset ? "reset" : "read"}: ${error?.message ?? error}`,
+          { cause: error },
         );
       }
     };
