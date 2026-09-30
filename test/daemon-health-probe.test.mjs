@@ -29,6 +29,56 @@ export function inLoadWindow(requestStartMs, loadStartedAtMs) {
 }
 
 /**
+ * Retains the correlated load observations attribution actually needs. A
+ * bounded buffer of ordinary qualifying samples may drop entries, but the
+ * decisive observations can never disappear: the worst external request and
+ * every new daemon-gap maximum are kept separately, each with its timestamp.
+ * A late outlier — the worst external arriving after the buffer has filled —
+ * is therefore always examinable alongside its daemon gap.
+ */
+export function createLoadSampleCollector(ordinaryLimit = 40) {
+  let worstExternal;
+  let worstExternalMs = -1;
+  let gapMaximumMs = -1;
+  const gapMaximums = [];
+  const ordinary = [];
+  const add = (entry) => {
+    const { t, ext, gap } = entry;
+    if (ext > worstExternalMs) {
+      worstExternalMs = ext;
+      worstExternal = entry;
+    }
+    if (typeof gap === "number" && gap > gapMaximumMs) {
+      gapMaximumMs = gap;
+      gapMaximums.push(entry);
+    }
+    if (ordinary.length < ordinaryLimit) {
+      ordinary.push(entry);
+    }
+  };
+  const qualifies = (entry) =>
+    entry.ext > 50 || (typeof entry.gap === "number" && entry.gap > 50);
+  return {
+    observe(t, ext, gap) {
+      const entry = { t, ext, gap };
+      if (qualifies(entry)) add(entry);
+    },
+    entries() {
+      const seen = new Set();
+      const merged = [];
+      for (const entry of [worstExternal, ...gapMaximums, ...ordinary]) {
+        if (!entry) continue;
+        const key = `${entry.t}:${entry.ext}:${entry.gap}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(entry);
+      }
+      return merged.sort((a, b) => a.t - b.t);
+    },
+  };
+}
+
+/**
  * CLI success timeouts must tolerate slow or coverage-instrumented runners.
  * CI run 36587089439 (coverage job, 2026-09-29) showed the measured index
  * exceeding a 180s cap under c8 on a 2-core runner while the same tree
@@ -121,7 +171,7 @@ async function runHealthProbe(options) {
   let loadOkPolls = 0;
   let daemonGapMs;
   const loadLatencies = [];
-  const notable = [];
+  const samples = createLoadSampleCollector();
   const failures = [];
   const healthUrl_ = healthUrl ?? `http://127.0.0.1:${port}/healthz`;
   const pollLoop = (async () => {
@@ -154,14 +204,7 @@ async function runHealthProbe(options) {
             if (typeof gap === "number") {
               daemonGapMs = Math.max(daemonGapMs ?? 0, gap);
             }
-            if (
-              notable.length < 40 &&
-              (elapsed > 50 || (typeof gap === "number" && gap > 50))
-            ) {
-              notable.push(
-                `t=${requestStart - loadStartedAt}ms ext=${elapsed} gap=${gap ?? "n/a"}`,
-              );
-            }
+            samples.observe(requestStart - loadStartedAt, elapsed, gap);
           }
         }
       } catch (error) {
@@ -351,7 +394,7 @@ async function runHealthProbe(options) {
       timings,
       daemonGapMs,
       startupGapMs,
-      notable,
+      samples,
       latencyDistribution,
     };
   } finally {
@@ -482,7 +525,7 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     timings,
     daemonGapMs,
     startupGapMs,
-    notable,
+    samples,
     latencyDistribution,
   } = await runHealthProbe({
     root,
@@ -499,8 +542,10 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
   t.diagnostic(
     `health-probe timings ms: ${JSON.stringify(timings)}; daemon gap startup=${startupGapMs} load=${daemonGapMs} (${typeof daemonGapMs === "number" ? "reported" : "unknown"}); external ${latencyDistribution}`,
   );
-  for (const entry of notable) {
-    t.diagnostic(`load-sample ${entry}`);
+  for (const entry of samples.entries()) {
+    t.diagnostic(
+      `load-sample t=${entry.t}ms ext=${entry.ext} gap=${entry.gap ?? "n/a"}`,
+    );
   }
   assert.deepEqual(problems, []);
   assert.ok(okPolls >= 50, `expected sustained polling, got ${okPolls}`);
@@ -880,5 +925,38 @@ test("health telemetry contract reports and resets the daemon event-loop gap", a
   assert.ok(
     idle < 100,
     `an idle daemon keeps its reported gap small, got ${idle}`,
+  );
+});
+
+test("load sample collector preserves late outliers beyond the buffer", () => {
+  const collector = createLoadSampleCollector(40);
+  // Fill the ordinary buffer with qualifying samples.
+  for (let i = 0; i < 40; i++) {
+    collector.observe(i * 10, 55, 60);
+  }
+  // More ordinary samples after the buffer is full — droppable.
+  for (let i = 0; i < 40; i++) {
+    collector.observe(10_000 + i * 10, 52, 61);
+  }
+  // The decisive outlier arrives LAST: the worst external observation, and a
+  // new daemon-gap maximum, long after the buffer filled.
+  collector.observe(50_000, 150, 90);
+
+  const entries = collector.entries();
+  const worst = entries.find((entry) => entry.t === 50_000);
+  assert.ok(
+    worst && worst.ext === 150 && worst.gap === 90,
+    `the late worst-external observation must be retained, got ${JSON.stringify(worst)}`,
+  );
+  const firstGapMax = entries.find((entry) => entry.t === 0);
+  assert.ok(
+    firstGapMax && firstGapMax.gap === 60,
+    "each new daemon-gap maximum is retained with its timestamp",
+  );
+  const lastOrdinaryBeforeOutlier = entries.some((entry) => entry.t === 10_390);
+  assert.equal(
+    lastOrdinaryBeforeOutlier,
+    false,
+    "ordinary samples past the buffer are droppable — only decisive ones are not",
   );
 });
