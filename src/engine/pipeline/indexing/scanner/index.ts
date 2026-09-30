@@ -210,6 +210,12 @@ export async function scanRootPaths(
   const files: FileInfo[] = [];
   const diagnostics = createScanDiagnostics();
   const knownFiles = knownFilesByPath(options.knownFiles);
+  const workspaceRealRoot =
+    options.workspaceRoot === undefined
+      ? undefined
+      : await realpath(options.workspaceRoot).catch(
+          () => options.workspaceRoot,
+        );
 
   for (const rootPath of validatedRootPaths) {
     throwIfAborted(options.signal);
@@ -221,6 +227,7 @@ export async function scanRootPaths(
       options.signal,
       knownFiles,
       options.workspaceRoot,
+      workspaceRealRoot,
     );
   }
 
@@ -373,6 +380,12 @@ export async function scanDirectoryPath(
   const files: FileInfo[] = [];
   const diagnostics = createScanDiagnostics();
   const knownFiles = knownFilesByPath(options.knownFiles);
+  const workspaceRealRoot =
+    options.workspaceRoot === undefined
+      ? undefined
+      : await realpath(options.workspaceRoot).catch(
+          () => options.workspaceRoot,
+        );
   for (const rootPath of matchingRootPaths(rootPaths, absolutePath)) {
     throwIfAborted(options.signal);
     const root = normalizeRootPath(rootPath);
@@ -431,6 +444,7 @@ export async function scanDirectoryPath(
       options.signal,
       knownFiles,
       options.workspaceRoot,
+      workspaceRealRoot,
     );
   }
   return { files: dedupeFiles(files), diagnostics };
@@ -552,6 +566,7 @@ async function scanRootPath(
   signal?: AbortSignal,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
   workspaceRoot?: string,
+  workspaceRealRoot?: string,
 ): Promise<void> {
   throwIfAborted(signal);
   const root = normalizeRootPath(rootPath);
@@ -610,6 +625,7 @@ async function scanRootPath(
     signal,
     knownFiles,
     workspaceRoot,
+    workspaceRealRoot,
   );
 }
 
@@ -626,6 +642,7 @@ async function walk(
   signal?: AbortSignal,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
   workspaceRoot?: string,
+  workspaceRealRoot?: string,
 ): Promise<void> {
   throwIfAborted(signal);
   let entries;
@@ -712,9 +729,12 @@ async function walk(
       if (!realDirectory || visitedDirectories.has(realDirectory)) {
         continue;
       }
+      // Containment compares resolved paths on both sides: the workspace
+      // root may be spelled through an alias (macOS /var, Windows short
+      // names) while realDirectory is always resolved.
       if (
-        workspaceRoot !== undefined &&
-        !isPathInside(workspaceRoot, realDirectory)
+        workspaceRealRoot !== undefined &&
+        !isPathInside(workspaceRealRoot, realDirectory)
       ) {
         continue;
       }
@@ -732,6 +752,7 @@ async function walk(
         signal,
         knownFiles,
         workspaceRoot,
+        workspaceRealRoot,
       );
       continue;
     }
@@ -769,12 +790,12 @@ async function walk(
     }
 
     if (
-      workspaceRoot !== undefined &&
+      workspaceRealRoot !== undefined &&
       entry.isSymbolicLink() &&
       rootPath.follow
     ) {
       const realFile = await realpath(absolutePath).catch(() => null);
-      if (realFile !== null && !isPathInside(workspaceRoot, realFile)) {
+      if (realFile !== null && !isPathInside(workspaceRealRoot, realFile)) {
         recordSkippedFile(diagnostics, {
           absolutePath,
           relativePath,

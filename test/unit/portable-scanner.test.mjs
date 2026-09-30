@@ -114,3 +114,48 @@ test("NFD filenames receive NFC canonical identities and resolve for reading", a
     makeFileId("index-id", `docs/caf${NFC_E}.md`),
   );
 });
+
+test("scan descends into directories under an alias-spelled workspace root", async (t) => {
+  // Hosted regression (macOS /var vs /private/var, Windows short names):
+  // the caller spells root and workspaceRoot consistently through a parent
+  // alias, and the scanner must not compare resolved directories against
+  // the unresolved spelling.
+  const base = await mkdtemp(join(tmpdir(), "zg-scan-alias-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const physical = join(base, "real", "A");
+  await mkdir(join(physical, "docs"), { recursive: true });
+  await writeFile(join(physical, "docs", "one.md"), "# One\n");
+  await symlink(join(base, "real"), join(base, "var"), "dir");
+  const aliasRoot = join(base, "var", "A");
+
+  const result = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: aliasRoot, recursive: true }],
+    { workspaceRoot: aliasRoot },
+  );
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].canonicalPath, "docs/one.md");
+  assert.equal(result.files[0].id, makeFileId("index-id", "docs/one.md"));
+});
+
+test("followed contained symlinks are scanned under an alias-spelled workspace root", async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "zg-scan-alias-follow-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const physical = join(base, "real", "A");
+  await mkdir(physical, { recursive: true });
+  await writeFile(join(physical, "target.md"), "# Target\n");
+  await symlink(join(physical, "target.md"), join(physical, "link.md"));
+  await symlink(join(base, "real"), join(base, "var"), "dir");
+  const aliasRoot = join(base, "var", "A");
+
+  const result = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: aliasRoot, recursive: true, follow: true }],
+    { workspaceRoot: aliasRoot },
+  );
+  const followed = result.files.find((file) =>
+    file.relativePath.endsWith("link.md"),
+  );
+  assert.ok(followed, "contained followed symlink must not be skipped");
+  assert.equal(followed.canonicalPath, "link.md");
+});
