@@ -25,6 +25,7 @@ import { detectFileType } from "../../../file-type.js";
 import { resolveMaxFileSizeBytes } from "../../../file-size-policy.js";
 import { EngineError } from "../../../errors.js";
 import {
+  canonicalFromRelative,
   canonicalRelativePath,
   createCanonicalPathResolver,
   findCanonicalNameCollisions,
@@ -1191,6 +1192,32 @@ function escapeRegExp(value: string): string {
   return value.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
 }
 
+/**
+ * Canonical path of a scanned file derived from its root's canonical
+ * path and the file's logical position within the root, used when the
+ * caller's workspace spelling differs from the root's (alias) spelling
+ * and the textual comparison fails. The root's CRP already carries the
+ * alias normalization; the file keeps its logical spelling. A file at
+ * the workspace root itself is not a canonical file (unchanged).
+ */
+function canonicalPathFromRootCrp(
+  rootPath: RootPath,
+  absolutePath: string,
+): string | null {
+  const rootCrp = rootPath.canonicalPath;
+  if (rootCrp === undefined) {
+    return null;
+  }
+  const within = toDisplayPath(relative(rootPath.absolutePath, absolutePath));
+  if (within === "") {
+    return rootCrp === "." ? null : canonicalFromRelative(rootCrp);
+  }
+  if (isAbsolute(within) || within === ".." || within.startsWith("../")) {
+    return null;
+  }
+  return canonicalFromRelative(`${rootCrp}/${within}`);
+}
+
 async function readFileInfo(
   workspaceIndexId: string,
   rootPath: RootPath,
@@ -1214,7 +1241,9 @@ async function readFileInfo(
   let id: string;
   let canonicalFields: { canonicalPath?: string } = {};
   if (workspaceRoot !== undefined) {
-    const canonicalPath = canonicalRelativePath(workspaceRoot, absolutePath);
+    const canonicalPath =
+      canonicalRelativePath(workspaceRoot, absolutePath) ??
+      canonicalPathFromRootCrp(rootPath, absolutePath);
     if (canonicalPath === null) {
       recordSkippedFile(diagnostics, {
         absolutePath,

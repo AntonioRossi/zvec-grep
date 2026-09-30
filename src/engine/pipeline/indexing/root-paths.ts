@@ -46,7 +46,9 @@ function portableIgnoreFiles(
     const absolutePath = normalizePath(
       isAbsolute(entry) ? entry : join(root.absolutePath, entry),
     );
-    const canonicalPath = resolver.toCanonical(absolutePath);
+    const canonicalPath =
+      resolver.toCanonical(absolutePath) ??
+      canonicalFilePathWithAlias(absolutePath, resolver);
     if (canonicalPath === null) {
       throw new EngineError("Configured ignore file is outside the workspace", {
         code: "ZVEC_GREP.ENGINE.SCANNER.IGNORE_FILE_OUTSIDE_WORKSPACE",
@@ -55,6 +57,22 @@ function portableIgnoreFiles(
     }
     return canonicalPath;
   });
+}
+
+/**
+ * CRP of a workspace file addressed through an equivalent alias spelling
+ * of the workspace. Unlike a root, a file is never the workspace root
+ * itself, so an empty alias suffix is outside the file namespace.
+ */
+function canonicalFilePathWithAlias(
+  absolutePath: string,
+  resolver: CanonicalPathResolver,
+): string | null {
+  const aliasSuffix = workspaceAliasSuffix(absolutePath, resolver);
+  if (aliasSuffix === null || aliasSuffix.length === 0) {
+    return null;
+  }
+  return canonicalFromRelative(aliasSuffix.join("/"));
 }
 /**
  * Assign each root its canonical workspace-relative path, the identity

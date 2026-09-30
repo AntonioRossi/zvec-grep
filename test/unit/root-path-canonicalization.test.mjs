@@ -221,3 +221,35 @@ test("directory below the internal workspace-root link preserves the full logica
   }
   assert.equal(fileIds[0], fileIds[1]);
 });
+
+test("ignore-file entries resolve through workspace alias spellings", async (t) => {
+  const { physicalRoot, symlinkedRoot } = await prepareSymlinkedWorkspace(t);
+  await mkdir(join(physicalRoot, "docs"));
+  await writeFile(join(physicalRoot, "docs", ".ignore"), "ignored\n");
+
+  const resolver = createCanonicalPathResolver(physicalRoot);
+  const manifestRoot = manifestRootPathsFromRuntime(
+    validateRootPaths([
+      {
+        absolutePath: physicalRoot,
+        recursive: true,
+        ignoreFiles: [join(symlinkedRoot, "docs", ".ignore")],
+      },
+    ]),
+    resolver,
+  )[0];
+  assert.deepEqual(manifestRoot.ignoreFiles, ["docs/.ignore"]);
+
+  // Relative entries joined onto an alias-spelled root behave the same.
+  const relativeEntry = manifestRootPathsFromRuntime(
+    validateRootPaths([
+      {
+        absolutePath: symlinkedRoot,
+        recursive: true,
+        ignoreFiles: ["docs/.ignore"],
+      },
+    ]),
+    resolver,
+  )[0];
+  assert.deepEqual(relativeEntry.ignoreFiles, ["docs/.ignore"]);
+});

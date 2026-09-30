@@ -159,3 +159,35 @@ test("followed contained symlinks are scanned under an alias-spelled workspace r
   assert.ok(followed, "contained followed symlink must not be skipped");
   assert.equal(followed.canonicalPath, "link.md");
 });
+
+test("mixed-spelling scans keep canonical identities in both directions", async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "zg-scan-mixed-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const physical = join(base, "real", "A");
+  await mkdir(join(physical, "docs"), { recursive: true });
+  await writeFile(join(physical, "docs", "one.md"), "# One\n");
+  await symlink(join(base, "real"), join(base, "var"), "dir");
+  const alias = join(base, "var", "A");
+
+  const rootViaAlias = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: join(alias, "docs"), recursive: true }],
+    { workspaceRoot: physical },
+  );
+  assert.equal(rootViaAlias.files.length, 1);
+  assert.equal(rootViaAlias.files[0].canonicalPath, "docs/one.md");
+  assert.equal(rootViaAlias.files[0].id, makeFileId("index-id", "docs/one.md"));
+
+  const workspaceViaAlias = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: join(physical, "docs"), recursive: true }],
+    { workspaceRoot: alias },
+  );
+  assert.equal(workspaceViaAlias.files.length, 1);
+  assert.equal(workspaceViaAlias.files[0].canonicalPath, "docs/one.md");
+  assert.equal(
+    workspaceViaAlias.files[0].id,
+    rootViaAlias.files[0].id,
+    "identity must not depend on which side carries the alias spelling",
+  );
+});
