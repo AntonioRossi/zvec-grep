@@ -20,6 +20,28 @@ const PROBE_FILE_NAME = `f${"g".repeat(160)}.ts`;
 const PORTABLE_PATH_BUDGET = 1000;
 
 /**
+ * Parses a health response body into a daemon gap value. A valid health
+ * envelope (`status: "ok"`) is required; inside it, absent telemetry means
+ * a pre-monitor build (undefined = unknown), while a present value must be
+ * a finite non-negative number. Anything else fails loudly.
+ */
+export function parseHealthGap(body) {
+  if (body?.status !== "ok") {
+    throw new Error(
+      `health response is not a valid envelope: ${JSON.stringify(body)?.slice(0, 80)}`,
+    );
+  }
+  const gap = body?.eventLoop?.maxGapMs;
+  if (gap === undefined || gap === null) {
+    return undefined;
+  }
+  if (typeof gap !== "number" || !Number.isFinite(gap) || gap < 0) {
+    throw new Error(`malformed eventLoop.maxGapMs: ${gap}`);
+  }
+  return gap;
+}
+
+/**
  * The load window is defined by request START time: a request begun before
  * load and completed during it belongs to the pre-load window, not the
  * measured one.
@@ -275,14 +297,13 @@ async function runHealthProbe(options) {
         `daemon gap ${reset ? "reset" : "read"} status ${response.status}`,
       );
       const body = await response.json();
-      const gap = body?.eventLoop?.maxGapMs;
-      assert.ok(
-        typeof gap === "number" || gap === undefined || gap === null,
-        `daemon gap ${reset ? "reset" : "read"} returned a malformed eventLoop.maxGapMs (${typeof gap})`,
-      );
-      // Absent on an otherwise-valid response: a build predating the
-      // monitor. The gap stays unknown; behavioral assertions still run.
-      return typeof gap === "number" ? gap : undefined;
+      try {
+        return parseHealthGap(body);
+      } catch (error) {
+        throw new Error(
+          `daemon gap ${reset ? "reset" : "read"}: ${error?.message ?? error}`,
+        );
+      }
     };
     let startupGapMs;
     if (measureDaemonGap) {
@@ -881,19 +902,29 @@ test("health telemetry contract reports and resets the daemon event-loop gap", a
   await mkdir(root, { recursive: true });
   await writeFile(join(root, "a.ts"), "export const TelemetrySymbol = 1;\n");
   const home = join(temporaryDirectory, "home");
+  const endpoint = await createFakeEmbeddingServer(t);
   const port = await availablePort();
   const env = {
     HOME: home,
     USERPROFILE: home,
     NO_COLOR: "1",
     ZVEC_GREP_API_KEY: "test-key",
+    ZVEC_GREP_ENDPOINT: endpoint,
     ZVEC_GREP_HOME: home,
+    ZVEC_GREP_SERVER_URL: `http://127.0.0.1:${port}/mcp`,
   };
   t.after(async () => {
     await ownedTeardown({ home, root, env, port });
     await removeTemporaryDirectory(temporaryDirectory);
   });
   await mkdir(join(home, ".zvec-grep"), { recursive: true });
+  await writeFile(
+    join(home, ".zvec-grep", "config.json"),
+    `${JSON.stringify({
+      version: 1,
+      defaults: { embedding: "qwen/text-embedding-v4" },
+    })}\n`,
+  );
   const started = await runCli(
     ["--server", "on", "--listen", `127.0.0.1:${port}`, "--home", home],
     { cwd: root, env },
@@ -908,23 +939,44 @@ test("health telemetry contract reports and resets the daemon event-loop gap", a
       { signal: AbortSignal.timeout(2_000) },
     );
     assert.equal(response.status, 200);
-    return (await response.json())?.eventLoop?.maxGapMs;
+    return parseHealthGap(await response.json());
   };
   const initial = await read(false);
-  assert.ok(
-    typeof initial === "number" && initial >= 0,
-    `health must report eventLoop.maxGapMs as a non-negative number, got ${initial}`,
+  assert.ok(initial >= 0, "the reported gap starts non-negative");
+
+  // Establish a NONZERO maximum first, so a reset that does nothing cannot
+  // satisfy the assertions below: the first index of the target store blocks
+  // the daemon's loop (store open plus model preparation — reproducibly
+  // several hundred milliseconds on the reference hardware).
+  const indexed = await runCli(
+    ["--index", "--mode", "server", "--allow-remote", root],
+    { cwd: root, env, timeout: probeCliTimeoutMs(120_000) },
   );
+  assert.match(
+    String(indexed.stdout),
+    /Workspace index: succeeded/,
+    "the contract workload (first index) must succeed",
+  );
+  const worked = await read(false);
+  assert.ok(
+    worked > 50,
+    `the first-index workload must produce a measurable daemon gap, got ${worked}ms`,
+  );
+
   const afterReset = await read(true);
   assert.ok(
-    typeof afterReset === "number" && afterReset < 100,
-    `a reset on an idle daemon reports a small gap, got ${afterReset}`,
+    afterReset < worked,
+    `reset must strictly reduce the reported maximum (${afterReset}ms after reset vs ${worked}ms before)`,
+  );
+  assert.ok(
+    afterReset < 100,
+    `a reset following real work reports a small gap, got ${afterReset}ms`,
   );
   await new Promise((resolve) => setTimeout(resolve, 350));
   const idle = await read(false);
   assert.ok(
     idle < 100,
-    `an idle daemon keeps its reported gap small, got ${idle}`,
+    `an idle daemon keeps its reported gap small, got ${idle}ms`,
   );
 });
 
@@ -958,5 +1010,38 @@ test("load sample collector preserves late outliers beyond the buffer", () => {
     lastOrdinaryBeforeOutlier,
     false,
     "ordinary samples past the buffer are droppable — only decisive ones are not",
+  );
+});
+
+test("health gap parsing rejects invalid envelopes and malformed values", () => {
+  assert.equal(
+    parseHealthGap({ status: "ok" }),
+    undefined,
+    "a valid legacy envelope without telemetry means unknown",
+  );
+  assert.equal(
+    parseHealthGap({ status: "ok", eventLoop: { maxGapMs: null } }),
+    undefined,
+  );
+  assert.equal(
+    parseHealthGap({ status: "ok", eventLoop: { maxGapMs: 42 } }),
+    42,
+  );
+  assert.throws(() => parseHealthGap([]), /not a valid envelope/);
+  assert.throws(
+    () => parseHealthGap({ status: "error" }),
+    /not a valid envelope/,
+  );
+  assert.throws(
+    () => parseHealthGap({ status: "ok", eventLoop: { maxGapMs: -1 } }),
+    /malformed/,
+  );
+  assert.throws(
+    () => parseHealthGap({ status: "ok", eventLoop: { maxGapMs: Number.NaN } }),
+    /malformed/,
+  );
+  assert.throws(
+    () => parseHealthGap({ status: "ok", eventLoop: { maxGapMs: "87" } }),
+    /malformed/,
   );
 });
