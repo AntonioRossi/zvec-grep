@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import {
   cp,
   mkdir,
@@ -9,7 +10,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test from "node:test";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
 import { createZvecGrep } from "../../dist/index.js";
@@ -52,6 +53,15 @@ function hitPaths(result) {
   return result.items.map((item) => item.file?.absolutePath ?? "");
 }
 
+// Hit paths and workspace roots may carry equivalent spellings of the
+// same physical tree (macOS /var, Windows short names); containment is
+// physical, so compare resolved forms on both sides.
+function physicallyUnder(file, root) {
+  const realFile = realpathSync(file);
+  const realRoot = realpathSync(root);
+  return realFile === realRoot || realFile.startsWith(realRoot + sep);
+}
+
 test("copied workspace resolves destinations at the new location", async (t) => {
   const parent = await createTemporaryDirectory(t, "zg-portable-");
   const A = join(parent, "A");
@@ -77,7 +87,7 @@ test("copied workspace resolves destinations at the new location", async (t) => 
   assert.ok(whileAExists.items.length > 0);
   for (const file of hitPaths(whileAExists)) {
     assert.ok(
-      file.startsWith(`${B}/`),
+      physicallyUnder(file, B),
       `destination must resolve under B: ${file}`,
     );
   }
@@ -91,7 +101,7 @@ test("copied workspace resolves destinations at the new location", async (t) => 
   });
   assert.ok(afterAGone.items.length > 0);
   for (const file of hitPaths(afterAGone)) {
-    assert.ok(file.startsWith(`${B}/`), `destination under B: ${file}`);
+    assert.ok(physicallyUnder(file, B), `destination under B: ${file}`);
   }
   await rename(`${A}-away`, A);
   await serviceB.close();
@@ -133,7 +143,7 @@ test("refresh after relocation reuses vectors with zero document embeddings", as
     `expected at most 1 document embedding, got ${modelB.counts.document}`,
   );
   for (const file of hitPaths(result)) {
-    assert.ok(file.startsWith(`${B}/`), `destination under B: ${file}`);
+    assert.ok(physicallyUnder(file, B), `destination under B: ${file}`);
   }
   await serviceB.close();
 });
@@ -178,7 +188,7 @@ test("coexisting copies are isolated: operations on B never touch A", async (t) 
     "A's manifest must not be modified by operations on B",
   );
   for (const file of hitPaths(bSearch)) {
-    assert.ok(!file.startsWith(`${A}/`), `B must not read A: ${file}`);
+    assert.ok(!physicallyUnder(file, A), `B must not read A: ${file}`);
   }
 
   // A still serves its own original content.
@@ -192,7 +202,7 @@ test("coexisting copies are isolated: operations on B never touch A", async (t) 
   });
   await serviceA2.close();
   for (const file of hitPaths(aSearch)) {
-    assert.ok(file.startsWith(`${A}/`), `A must serve A: ${file}`);
+    assert.ok(physicallyUnder(file, A), `A must serve A: ${file}`);
   }
 });
 
