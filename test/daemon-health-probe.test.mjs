@@ -20,6 +20,15 @@ const PROBE_FILE_NAME = `f${"g".repeat(160)}.ts`;
 const PORTABLE_PATH_BUDGET = 1000;
 
 /**
+ * The load window is defined by request START time: a request begun before
+ * load and completed during it belongs to the pre-load window, not the
+ * measured one.
+ */
+export function inLoadWindow(requestStartMs, loadStartedAtMs) {
+  return loadStartedAtMs !== 0 && requestStartMs >= loadStartedAtMs;
+}
+
+/**
  * CLI success timeouts must tolerate slow or coverage-instrumented runners.
  * CI run 36587089439 (coverage job, 2026-09-29) showed the measured index
  * exceeding a 180s cap under c8 on a 2-core runner while the same tree
@@ -59,8 +68,13 @@ async function prepareHeavyFixture(parent, name) {
     join(dir, PROBE_FILE_NAME),
     "export const HealthProbeSymbol = 42;\n",
   );
+  // 300 heavy rules against the deep paths (~35M units): the corrected head
+  // admits and chunks the work while the withdrawn head evaluates it as one
+  // monolithic block past the probe's 400ms bound (the scanner stall test
+  // calibrated this same admitted geometry at 485ms on 2630dca; admission
+  // holds to ~425 rules at this path length).
   const rules = Array.from(
-    { length: 100 },
+    { length: 300 },
     (_, i) => "*a".repeat(100) + "*Z" + i,
   );
   await writeFile(join(root, ".gitignore"), `${rules.join("\n")}\n`);
@@ -84,6 +98,7 @@ async function runHealthProbe(options) {
     minOkPolls = 50,
     maxMs = 400,
     expectWorkloadSuccess = true,
+    measureDaemonGap = true,
   } = options;
   await mkdir(join(home, ".zvec-grep"), { recursive: true });
   await writeFile(
@@ -106,6 +121,7 @@ async function runHealthProbe(options) {
   let loadOkPolls = 0;
   let daemonGapMs;
   const loadLatencies = [];
+  const notable = [];
   const failures = [];
   const healthUrl_ = healthUrl ?? `http://127.0.0.1:${port}/healthz`;
   const pollLoop = (async () => {
@@ -120,23 +136,31 @@ async function runHealthProbe(options) {
           failures.push(`status ${response.status}`);
         } else {
           okPolls++;
-          if (loadStartedAt && Date.now() >= loadStartedAt) {
+          let gap;
+          try {
+            gap = (await response.json())?.eventLoop?.maxGapMs;
+          } catch {
+            // A body read failure does not fail the poll itself.
+          }
+          // The window is defined by request START: a request begun before
+          // load and completed during it must not be counted as in-load.
+          if (inLoadWindow(requestStart, loadStartedAt)) {
             loadOkPolls++;
             loadLatencies.push(elapsed);
             worstHealthMs = Math.max(worstHealthMs, elapsed);
-            // The daemon reports its own cumulative event-loop gap; after
-            // the pre-load reset this covers the load window only, which
-            // distinguishes daemon-side blocking from observer-side
-            // scheduling noise (CI Class B). Reading it here (after
-            // measuring elapsed) keeps pre-load readings out of the record.
-            try {
-              const body = await response.json();
-              const gap = body?.eventLoop?.maxGapMs;
-              if (typeof gap === "number") {
-                daemonGapMs = Math.max(daemonGapMs ?? 0, gap);
-              }
-            } catch {
-              // A body read failure does not fail the poll itself.
+            // After the pre-load reset the cumulative value covers the load
+            // window only. An absent field stays *unknown* — telemetry
+            // presence is a separate contract, not a behavioral assertion.
+            if (typeof gap === "number") {
+              daemonGapMs = Math.max(daemonGapMs ?? 0, gap);
+            }
+            if (
+              notable.length < 40 &&
+              (elapsed > 50 || (typeof gap === "number" && gap > 50))
+            ) {
+              notable.push(
+                `t=${requestStart - loadStartedAt}ms ext=${elapsed} gap=${gap ?? "n/a"}`,
+              );
             }
           }
         }
@@ -193,41 +217,79 @@ async function runHealthProbe(options) {
       join(root, "mutation.ts"),
       "export const HealthProbeMutation = 7;\n",
     );
-    // Attribute daemon-side gaps to the load window: capture the
-    // cumulative startup maximum, then reset the monitor so every gap
-    // reported from here on belongs to the measured load phase.
+    // Attribute daemon-side gaps to the load window: read the cumulative
+    // startup maximum, then reset the sampling epoch. Both requests are
+    // bounded and validated — a measurement-setup failure fails the probe
+    // loudly instead of silently measuring the wrong window.
+    const readGap = async (reset) => {
+      const response = await fetch(
+        reset ? `${healthUrl_}?resetLoopGap=1` : healthUrl_,
+        { signal: AbortSignal.timeout(2_000) },
+      );
+      assert.equal(
+        response.status,
+        200,
+        `daemon gap ${reset ? "reset" : "read"} status ${response.status}`,
+      );
+      const body = await response.json();
+      const gap = body?.eventLoop?.maxGapMs;
+      assert.ok(
+        typeof gap === "number" || gap === undefined || gap === null,
+        `daemon gap ${reset ? "reset" : "read"} returned a malformed eventLoop.maxGapMs (${typeof gap})`,
+      );
+      // Absent on an otherwise-valid response: a build predating the
+      // monitor. The gap stays unknown; behavioral assertions still run.
+      return typeof gap === "number" ? gap : undefined;
+    };
     let startupGapMs;
-    try {
-      const preLoad = await fetch(healthUrl_);
-      startupGapMs = (await preLoad.json())?.eventLoop?.maxGapMs;
-      await fetch(`${healthUrl_}?resetLoopGap=1`);
-    } catch {
-      // A failed gap query does not fail the probe's health assertions.
+    if (measureDaemonGap) {
+      startupGapMs = await readGap(false);
+      await readGap(true);
     }
 
     loadStartedAt = Date.now();
-    const indexStartedAt = Date.now();
-    let queryStartedAt = 0;
     const [indexed, queried] = await Promise.all([
-      runCli(["--index", "--mode", "server", "--allow-remote", root], {
-        cwd: root,
-        env,
-        timeout: probeCliTimeoutMs(180_000),
-      }).catch((error) => error),
+      (async () => {
+        const startedAt = Date.now();
+        try {
+          return await runCli(
+            ["--index", "--mode", "server", "--allow-remote", root],
+            {
+              cwd: root,
+              env,
+              timeout: probeCliTimeoutMs(180_000),
+            },
+          );
+        } finally {
+          // Each CLI's duration is its own completion time, including
+          // rejection — not a shared endpoint after polling drains.
+          timings.measuredIndexMs = Date.now() - startedAt;
+        }
+      })().catch((error) => error),
       (async () => {
         await new Promise((resolveSleep) => setTimeout(resolveSleep, 200));
-        queryStartedAt = Date.now();
-        return runCli([...queryArgs, "--mode", "server"], {
-          cwd: root,
-          env,
-          timeout: probeCliTimeoutMs(120_000),
-        }).catch((error) => error);
-      })(),
+        const startedAt = Date.now();
+        try {
+          return await runCli([...queryArgs, "--mode", "server"], {
+            cwd: root,
+            env,
+            timeout: probeCliTimeoutMs(120_000),
+          });
+        } finally {
+          timings.queryMs = Date.now() - startedAt;
+        }
+      })().catch((error) => error),
     ]);
     polling = false;
     await pollLoop;
-    timings.measuredIndexMs = Date.now() - indexStartedAt;
-    timings.queryMs = queryStartedAt ? Date.now() - queryStartedAt : 0;
+    // A block landing after the last poll must still be counted: capture a
+    // final cumulative sample once polling has drained.
+    if (measureDaemonGap) {
+      const finalGap = await readGap(false);
+      if (typeof finalGap === "number") {
+        daemonGapMs = Math.max(daemonGapMs ?? 0, finalGap);
+      }
+    }
     const timingsNote = ` (timings ms: warmup=${timings.warmupIndexMs} index=${timings.measuredIndexMs} query=${timings.queryMs})`;
 
     const problems = [];
@@ -247,16 +309,10 @@ async function runHealthProbe(options) {
     if (worstHealthMs >= maxMs) {
       problems.push(`worst steady-state health latency ${worstHealthMs}ms`);
     }
-    // Daemon-side discrimination (CI Class B): the daemon reports its own
-    // cumulative event-loop gap; after the pre-load reset this value covers
-    // the load window only. Presence is asserted; a numeric bound is
-    // deliberately deferred until load-phase observations exist on every
-    // supported runner (the Windows 599ms case remains unattributed).
-    if (expectWorkloadSuccess && daemonGapMs === undefined) {
-      problems.push(
-        "daemon did not report eventLoop.maxGapMs (build predates the monitor)",
-      );
-    }
+    // Telemetry presence is asserted by the separate telemetry-contract
+    // test; here an absent eventLoop.maxGapMs means the daemon-side gap is
+    // *unknown*, not a behavioral failure — the latency assertions above
+    // stand on their own.
     const latencyDistribution = (() => {
       if (loadLatencies.length === 0) return "n=0";
       const sorted = [...loadLatencies].sort((a, b) => a - b);
@@ -295,6 +351,7 @@ async function runHealthProbe(options) {
       timings,
       daemonGapMs,
       startupGapMs,
+      notable,
       latencyDistribution,
     };
   } finally {
@@ -425,6 +482,7 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     timings,
     daemonGapMs,
     startupGapMs,
+    notable,
     latencyDistribution,
   } = await runHealthProbe({
     root,
@@ -432,9 +490,18 @@ test("daemon /healthz stays responsive under overlapping load", async (t) => {
     env,
     port,
   });
+  // Attribution is evidence-constrained: a large daemon-side gap means the
+  // daemon blocked or was descheduled (the sampler cannot separate the two);
+  // a large external latency with a small daemon gap points at the observer
+  // or runner scheduling; anything else stays unresolved. The correlated
+  // samples below are the record for that analysis — no bound is chosen
+  // from a single observation.
   t.diagnostic(
-    `health-probe timings ms: ${JSON.stringify(timings)}; daemon gap startup=${startupGapMs} load=${daemonGapMs}; external ${latencyDistribution}`,
+    `health-probe timings ms: ${JSON.stringify(timings)}; daemon gap startup=${startupGapMs} load=${daemonGapMs} (${typeof daemonGapMs === "number" ? "reported" : "unknown"}); external ${latencyDistribution}`,
   );
+  for (const entry of notable) {
+    t.diagnostic(`load-sample ${entry}`);
+  }
   assert.deepEqual(problems, []);
   assert.ok(okPolls >= 50, `expected sustained polling, got ${okPolls}`);
   assert.ok(
@@ -485,6 +552,7 @@ test("health probe negative control: unavailable health fails the probe", async 
       env,
       port,
       healthUrl: `http://127.0.0.1:${deadPort}/healthz`,
+      measureDaemonGap: false,
     }));
   } catch (error) {
     warmupThrew = error;
@@ -535,7 +603,13 @@ test("health probe negative control: failed workload fails the probe", async (t)
   let problems = null;
   let warmupThrew = null;
   try {
-    ({ problems } = await runHealthProbe({ root, home, env, port }));
+    ({ problems } = await runHealthProbe({
+      root,
+      home,
+      env,
+      port,
+      measureDaemonGap: false,
+    }));
   } catch (error) {
     warmupThrew = error;
   }
@@ -723,5 +797,88 @@ test("probe CLI timeouts scale for slow and instrumented runners", () => {
     probeCliTimeoutMs(base, {}),
     probeCliTimeoutMs(base, { OTHER: "1" }),
     "only NODE_V8_COVERAGE triggers instrumented scaling",
+  );
+});
+
+test("load window classification uses request start time", () => {
+  const loadStartedAt = 1_000;
+  assert.equal(
+    inLoadWindow(1_000, loadStartedAt),
+    true,
+    "a request starting exactly at load start is in the window",
+  );
+  assert.equal(
+    inLoadWindow(999, loadStartedAt),
+    false,
+    "a request starting before load stays outside the window even if it completes during it",
+  );
+  assert.equal(
+    inLoadWindow(5_000, loadStartedAt),
+    true,
+    "later requests are in the window",
+  );
+  assert.equal(
+    inLoadWindow(5_000, 0),
+    false,
+    "before load starts there is no window",
+  );
+});
+
+test("health telemetry contract reports and resets the daemon event-loop gap", async (t) => {
+  const temporaryDirectory = await createTemporaryDirectory(
+    t,
+    "zvec-grep-health-telemetry-",
+    {
+      cleanup: false,
+    },
+  );
+  const root = join(temporaryDirectory, "repo");
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "a.ts"), "export const TelemetrySymbol = 1;\n");
+  const home = join(temporaryDirectory, "home");
+  const port = await availablePort();
+  const env = {
+    HOME: home,
+    USERPROFILE: home,
+    NO_COLOR: "1",
+    ZVEC_GREP_API_KEY: "test-key",
+    ZVEC_GREP_HOME: home,
+  };
+  t.after(async () => {
+    await ownedTeardown({ home, root, env, port });
+    await removeTemporaryDirectory(temporaryDirectory);
+  });
+  await mkdir(join(home, ".zvec-grep"), { recursive: true });
+  const started = await runCli(
+    ["--server", "on", "--listen", `127.0.0.1:${port}`, "--home", home],
+    { cwd: root, env },
+  );
+  assert.match(started.stdout, /Server: ready/);
+
+  const read = async (reset) => {
+    const response = await fetch(
+      reset
+        ? `http://127.0.0.1:${port}/healthz?resetLoopGap=1`
+        : `http://127.0.0.1:${port}/healthz`,
+      { signal: AbortSignal.timeout(2_000) },
+    );
+    assert.equal(response.status, 200);
+    return (await response.json())?.eventLoop?.maxGapMs;
+  };
+  const initial = await read(false);
+  assert.ok(
+    typeof initial === "number" && initial >= 0,
+    `health must report eventLoop.maxGapMs as a non-negative number, got ${initial}`,
+  );
+  const afterReset = await read(true);
+  assert.ok(
+    typeof afterReset === "number" && afterReset < 100,
+    `a reset on an idle daemon reports a small gap, got ${afterReset}`,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const idle = await read(false);
+  assert.ok(
+    idle < 100,
+    `an idle daemon keeps its reported gap small, got ${idle}`,
   );
 });
