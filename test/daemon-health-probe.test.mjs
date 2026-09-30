@@ -9,6 +9,16 @@ import {
 } from "./helpers/fixtures.mjs";
 import { createFakeEmbeddingServer } from "./helpers/fake-embedding.mjs";
 
+// Portable heavy-fixture geometry, matching test/unit/glob.test.mjs: deep
+// nesting with 90-character components keeps glob matching expensive while
+// every created path stays inside a budget every supported platform accepts
+// (macOS PATH_MAX is 1024 bytes including its /var/folders/.../T temp
+// prefix; 200-character components overflow it — the 2026-09-29 macOS CI
+// failures).
+const DEEP_COMPONENT = "a".repeat(90);
+const PROBE_FILE_NAME = `f${"g".repeat(160)}.ts`;
+const PORTABLE_PATH_BUDGET = 1000;
+
 async function availablePort() {
   const { createServer } = await import("node:net");
   return new Promise((resolvePort) => {
@@ -24,11 +34,15 @@ async function prepareHeavyFixture(parent, name) {
   const root = join(parent, name, "repo");
   let dir = root;
   for (let depth = 0; depth < 8; depth++) {
-    dir = join(dir, "a".repeat(200));
+    dir = join(dir, DEEP_COMPONENT);
+    assert.ok(
+      dir.length + PROBE_FILE_NAME.length + 1 <= PORTABLE_PATH_BUDGET,
+      `fixture path exceeds the portable budget: ${dir.length + PROBE_FILE_NAME.length + 1}`,
+    );
     await mkdir(dir, { recursive: true });
   }
   await writeFile(
-    join(dir, `f${"g".repeat(201)}.ts`),
+    join(dir, PROBE_FILE_NAME),
     "export const HealthProbeSymbol = 42;\n",
   );
   const rules = Array.from(
@@ -186,7 +200,7 @@ async function runHealthProbe(options) {
       !indexed?.code &&
       /Workspace index: succeeded/.test(String(indexed.stdout ?? ""));
     const queriedOk =
-      queryResultProblems(queried, `f${"g".repeat(201)}.ts`).length === 0;
+      queryResultProblems(queried, PROBE_FILE_NAME).length === 0;
     if (expectWorkloadSuccess) {
       if (!indexedOk)
         problems.push(
@@ -197,7 +211,7 @@ async function runHealthProbe(options) {
         );
       if (!queriedOk)
         problems.push(
-          ...queryResultProblems(queried, `f${"g".repeat(201)}.ts`).map(
+          ...queryResultProblems(queried, PROBE_FILE_NAME).map(
             (problem) => `query result: ${problem}`,
           ),
         );
@@ -563,7 +577,7 @@ test("teardown failure path preserves evidence with a live daemon", async (t) =>
 });
 
 test("query result assertion rejects zero-hit and wrong-file outputs", async () => {
-  const expected = `f${"g".repeat(201)}.ts`;
+  const expected = PROBE_FILE_NAME;
   const zeroHit = {
     code: 0,
     stdout:
