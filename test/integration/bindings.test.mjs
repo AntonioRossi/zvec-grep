@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  readdir,
   cp,
   mkdir,
   readFile,
@@ -206,13 +207,26 @@ test("invalidation propagates access failures and never silently keeps trust", a
 
   // With the workspace unreadable, invalidation must fail loudly instead of
   // reporting a revocation that never happened. Whether mode bits deny the
-  // owner's read is a platform capability, measured independently here.
-  const { chmod, readdir } = await import("node:fs/promises");
+  // owner's read is a platform capability, measured independently here;
+  // unexpected probe errors propagate rather than passing as advisory.
+  const { chmod } = await import("node:fs/promises");
+  const { probeDenial, assertDenialInducible } =
+    await import("../helpers/permission-probe.mjs");
   await chmod(parent, 0o000);
   try {
-    const denied = await readdir(parent).then(
-      () => false,
-      (error) => error.code === "EACCES",
+    const denied =
+      (await probeDenial(t, "bindings.invalidate:readdir-parent", () =>
+        readdir(parent),
+      )) === "denied";
+    t.diagnostic(
+      `permission-branch operation=bindings.invalidate branch=${
+        denied ? "strict" : "advisory"
+      }`,
+    );
+    assertDenialInducible(
+      t,
+      "bindings.invalidate",
+      denied ? "denied" : "allowed",
     );
     if (denied) {
       assert.throws(

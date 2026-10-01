@@ -6,6 +6,10 @@ import { createZvecGrep } from "../../dist/index.js";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import {
+  assertDenialInducible,
+  probeDenial,
+} from "../helpers/permission-probe.mjs";
 
 useIsolatedZvecGrepHome();
 
@@ -129,9 +133,19 @@ test("storage and search fail loudly under permission errors, then recover", asy
   try {
     // Whether mode bits deny the owner's read is a platform capability,
     // measured independently of the code under test.
-    const denied = await readdir(join(root, "docs")).then(
-      () => false,
-      (error) => error.code === "EACCES",
+    const denied =
+      (await probeDenial(t, "containment.query:readdir-docs", () =>
+        readdir(join(root, "docs")),
+      )) === "denied";
+    t.diagnostic(
+      `permission-branch operation=containment.query branch=${
+        denied ? "strict" : "advisory"
+      }`,
+    );
+    assertDenialInducible(
+      t,
+      "containment.query",
+      denied ? "denied" : "allowed",
     );
     const service2 = await createZvecGrep({ root, embeddingModel: model });
     if (denied) {

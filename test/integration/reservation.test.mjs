@@ -27,6 +27,11 @@ import { createZvecGrep } from "../../dist/index.js";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import {
+  assertDenialInducible,
+  probeDenial,
+  probeDenialSync,
+} from "../helpers/permission-probe.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
 useIsolatedZvecGrepHome();
@@ -839,8 +844,15 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o555);
         try {
-          writeFileSync(join(destinationHome, ".write-probe"), "");
-          rmSync(join(destinationHome, ".write-probe"), { force: true });
+          const outcome = probeDenialSync(
+            t,
+            "reservation.retainlock:write-home",
+            () => writeFileSync(join(destinationHome, ".write-probe"), ""),
+          );
+          if (outcome === "allowed") {
+            rmSync(join(destinationHome, ".write-probe"), { force: true });
+          }
+          homeUnwritable = outcome === "denied";
         } catch (error) {
           homeUnwritable = error.code === "EACCES";
         }
@@ -1167,9 +1179,19 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     "owned recoverable payload",
   );
   chmodSync(protectedDir, 0o500);
-  const unlinkControl = await import("node:fs/promises").then((fs) =>
-    fs.unlink(join(protectedDir, "payload.txt")).catch((error) => error.code),
+  const fs = await import("node:fs/promises");
+  const unlinkOutcome = await probeDenial(
+    t,
+    "reservation.abort-cleanup:unlink-payload",
+    () => fs.unlink(join(protectedDir, "payload.txt")),
   );
+  const unlinkControl = unlinkOutcome === "denied" ? "EACCES" : undefined;
+  t.diagnostic(
+    `permission-branch operation=reservation.abort-cleanup branch=${
+      unlinkOutcome === "denied" ? "strict" : "advisory"
+    }`,
+  );
+  assertDenialInducible(t, "reservation.abort-cleanup", unlinkOutcome);
 
   const cleanup = reservation.abort();
   // Restore normal access before any discovery check: permission failure
@@ -1260,7 +1282,12 @@ test("a permission failure retains the write lock and operator recovery restores
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o000);
         try {
-          readdirSync(destinationHome);
+          homeUnreadable =
+            probeDenialSync(
+              t,
+              "reservation.permission-recovery:readdir-home",
+              () => readdirSync(destinationHome),
+            ) === "denied";
         } catch (error) {
           homeUnreadable = error.code === "EACCES";
         }
