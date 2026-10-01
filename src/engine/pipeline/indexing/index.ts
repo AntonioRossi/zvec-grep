@@ -37,6 +37,8 @@ import {
   scanFilePath,
   scanRootPaths,
 } from "./scanner/index.js";
+import { createCanonicalPathResolver } from "../../utils/canonical-path.js";
+import { resolveWorkspaceFilePath } from "./root-paths.js";
 import { indexChunkOptions } from "./input-budget.js";
 
 export type IndexContext = {
@@ -303,7 +305,24 @@ async function indexWorkspacePathsUnchecked(
   const start = Date.now();
   const report = ctx.onProgress ?? (() => undefined);
   const timings = new TimingCollector();
-  const normalizedPaths = [...new Set(changedPaths.map(normalizePath))];
+  // Changed paths may address the workspace through an equivalent
+  // spelling (macOS /var, Windows short names); remap them to the
+  // resolver's spelling so scan roots, stored paths and canonical
+  // identities all agree. Paths genuinely outside stay as given.
+  const pathResolver =
+    ctx.workspaceRoot === undefined
+      ? undefined
+      : createCanonicalPathResolver(ctx.workspaceRoot);
+  const normalizedPaths = [
+    ...new Set(
+      changedPaths.map((path) => {
+        const normalized = normalizePath(path);
+        return pathResolver === undefined
+          ? normalized
+          : resolveWorkspaceFilePath(normalized, pathResolver);
+      }),
+    ),
+  ];
   throwIfIndexCancelled(ctx);
   const firstPass = await runPathIndexPass(
     ctx,

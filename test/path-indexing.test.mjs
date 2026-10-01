@@ -366,3 +366,45 @@ class InputLimitedEmbeddingModel extends CountingEmbeddingModel {
     };
   }
 }
+
+test("changedPaths addressed through a workspace alias are indexed", async () => {
+  // Hosted macOS stall (CI runs 36770541712 and 36778689252): changed
+  // paths carrying an equivalent spelling of the workspace (macOS /var,
+  // Windows short names) matched no scan root and no stored path, so
+  // watch jobs completed without touching the changed file and their
+  // barriers never released.
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-path-alias-"),
+  );
+  const physicalRoot = join(temporaryDirectory, "real", "repo");
+  const aliasRoot = join(temporaryDirectory, "var", "repo");
+  await mkdir(physicalRoot, { recursive: true });
+  await symlink(
+    join(temporaryDirectory, "real"),
+    join(temporaryDirectory, "var"),
+  );
+  const changedFile = join(physicalRoot, "changed.ts");
+  const untouchedFile = join(physicalRoot, "untouched.ts");
+  await writeFile(changedFile, "export const value = 1;\n");
+  await writeFile(untouchedFile, "export const untouched = true;\n");
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({
+    root: physicalRoot,
+    embeddingModel: model,
+  });
+  try {
+    await service.index();
+    model.embeddedTexts.length = 0;
+    await writeFile(changedFile, "export const value = 2;\n");
+    const changed = await service.index({
+      changedPaths: [join(aliasRoot, "changed.ts")],
+    });
+    assert.equal(changed.filesScanned, 1);
+    assert.equal(changed.filesModified, 1);
+    assert.ok(model.embeddedTexts.some((text) => text.includes("value = 2")));
+    assert.ok(model.embeddedTexts.every((text) => !text.includes("untouched")));
+  } finally {
+    await service.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});

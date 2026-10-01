@@ -74,6 +74,29 @@ function canonicalFilePathWithAlias(
   }
   return canonicalFromRelative(aliasSuffix.join("/"));
 }
+
+/**
+ * A changed path's spelling inside the workspace: unchanged when it
+ * already matches the resolver's workspace root, remapped through the
+ * workspace alias boundary when it addresses the same physical tree
+ * through an equivalent spelling (macOS /var, Windows short names), and
+ * left as given when it is genuinely outside — downstream handling
+ * decides that case. Watcher events and caller-supplied changed paths
+ * may carry either spelling.
+ */
+export function resolveWorkspaceFilePath(
+  absolutePath: string,
+  resolver: CanonicalPathResolver,
+): string {
+  if (resolver.toCanonical(absolutePath) !== null) {
+    return absolutePath;
+  }
+  const canonicalPath = canonicalFilePathWithAlias(absolutePath, resolver);
+  if (canonicalPath === null) {
+    return absolutePath;
+  }
+  return resolver.requireContainedSync(canonicalPath);
+}
 /**
  * Assign each root its canonical workspace-relative path, the identity
  * reference point for scanned files. Roots must stay inside the workspace,
