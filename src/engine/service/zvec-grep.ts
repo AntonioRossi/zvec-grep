@@ -48,7 +48,10 @@ import {
   type WorkspaceManifestEmbeddingRuntime,
   writeWorkspaceManifest,
 } from "../manifest.js";
-import { createCanonicalPathResolver } from "../utils/canonical-path.js";
+import {
+  createCanonicalPathResolver,
+  tryRealpathSync,
+} from "../utils/canonical-path.js";
 import { WorkspaceBindingStore } from "../bindings.js";
 import {
   manifestRootPathsFromRuntime,
@@ -1428,9 +1431,21 @@ function inheritRequestedRootPathSettings(
     const absolutePath = normalizePath(
       typeof rootPath === "string" ? rootPath : rootPath.absolutePath,
     );
-    const inherited = existing.find(
-      (candidate) => normalizePath(candidate.absolutePath) === absolutePath,
-    );
+    const requestedReal = tryRealpathSync(absolutePath);
+    const inherited = existing.find((candidate) => {
+      if (normalizePath(candidate.absolutePath) === absolutePath) {
+        return true;
+      }
+      // The same physical root may be addressed through an equivalent
+      // spelling (macOS /var, Windows short names); inheritance must
+      // follow physical identity, not textual spelling.
+      const candidateReal = tryRealpathSync(candidate.absolutePath);
+      return (
+        requestedReal !== undefined &&
+        candidateReal !== undefined &&
+        candidateReal === requestedReal
+      );
+    });
     if (!inherited) {
       return rootPath;
     }

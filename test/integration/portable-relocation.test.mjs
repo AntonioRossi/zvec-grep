@@ -6,6 +6,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -414,3 +415,47 @@ test("indexing never persists credentials or device in the manifest", async (t) 
     "http://127.0.0.1:9/embeddings",
   );
 });
+
+test("explicit index roots inherit persisted scoping through workspace aliases", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-portable-scope-");
+  const physical = join(parent, "real", "repo");
+  await mkdir(join(physical, "src"), { recursive: true });
+  await writeFile(join(physical, "src", "inside.ts"), "export const I = 1;\n");
+  await symlink(join(parent, "real"), join(parent, "var"));
+
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({
+    root: physical,
+    embeddingModel: model,
+  });
+  await service.index({
+    rootPaths: [{ absolutePath: physical, recursive: true, globs: ["src/**"] }],
+  });
+
+  // A caller addresses the same workspace through the alias spelling with
+  // an unscoped explicit root: the persisted scoping must be inherited,
+  // not silently replaced (hosted macOS e2e regression, round 34).
+  await writeFile(join(physical, "outside.ts"), "export const O = 2;\n");
+  const result = await service.index({
+    rootPaths: [{ absolutePath: join(parent, "var", "repo"), recursive: true }],
+  });
+  assert.equal(
+    result.filesAdded,
+    0,
+    "an out-of-scope file must not be indexed through an alias-spelled root",
+  );
+  const search = await service.context({
+    query: "O = 2",
+    route: "fts",
+    autoUpdate: false,
+  });
+  assert.ok(
+    hitPaths(search).every((file) => !endsWithRelativeFix(file, "outside.ts")),
+    "the out-of-scope file must not be searchable",
+  );
+  await service.close();
+});
+
+function endsWithRelativeFix(file, suffix) {
+  return file.split(/[\\/]/).join("/").endsWith(suffix);
+}
