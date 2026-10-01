@@ -1,3 +1,5 @@
+import { chmodSync, existsSync } from "node:fs";
+
 // Tri-state permission-capability probe for capability-branched fixtures.
 //
 // A probe distinguishes three outcomes:
@@ -113,4 +115,20 @@ export function guardedSyncPermissionProbe(t, operation, attempt) {
   );
   assertDenialInducible(t, operation, outcome);
   return outcome;
+}
+
+/**
+ * Failure-safe permission restoration: registers test teardown that runs
+ * after probe, guard or assertion failures, and returns the restore
+ * function so controls can verify the restoration itself. The target's
+ * permissions are only touched when it still exists.
+ */
+export function registerPermissionRestore(t, target, mode = 0o755) {
+  const restore = () => {
+    if (existsSync(target)) {
+      chmodSync(target, mode);
+    }
+  };
+  t.after(restore);
+  return restore;
 }

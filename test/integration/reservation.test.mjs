@@ -32,6 +32,7 @@ import {
   guardedSyncPermissionProbe,
   isPosixNonRoot,
   probeDenial,
+  registerPermissionRestore,
 } from "../helpers/permission-probe.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
@@ -865,6 +866,9 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
     },
   });
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+  // Failure-safe restore: runs even when the probe, guard or an assertion
+  // fails before the inline restore below.
+  registerPermissionRestore(t, destinationHome, 0o755);
 
   try {
     reservation.publish(() => undefined);
@@ -1189,6 +1193,9 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     "owned recoverable payload",
   );
   chmodSync(protectedDir, 0o500);
+  // Failure-safe restore: runs even when the probe, guard or an assertion
+  // fails before the inline restore below.
+  registerPermissionRestore(t, protectedDir, 0o700);
   const fs = await import("node:fs/promises");
   const unlinkOutcome = await probeDenial(
     t,
@@ -1307,6 +1314,9 @@ test("a permission failure retains the write lock and operator recovery restores
     },
   });
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
+  // Failure-safe restore: runs even when the probe, guard or an assertion
+  // fails before the inline restore below.
+  registerPermissionRestore(t, destinationHome, 0o755);
 
   let publishError;
   try {
@@ -1632,4 +1642,24 @@ test("an allowed probe result fails the guard in required non-root environments"
       `permission-branch operation=control.allowed-in-non-root branch=capability-followed (uid 0 or unsupported platform)`,
     );
   }
+});
+
+test("permission restoration runs as fixture teardown", async (t) => {
+  // Control for the failure-safe restore wiring: the registered teardown
+  // actually restores permissions, so probe, guard or assertion failures
+  // cannot leave the fixture-owned paths unreadable.
+  const temporaryDirectory = await createTemporaryDirectory(
+    t,
+    "zg-restore-ctl-",
+  );
+  const target = join(temporaryDirectory, "locked");
+  await mkdir(target);
+  await writeFile(join(target, "payload.txt"), "x");
+  chmodSync(target, 0o500);
+  const restore = registerPermissionRestore(t, target, 0o700);
+  restore();
+  // The restored mode must allow the fixture owner to read and remove.
+  const entries = readdirSync(target);
+  assert.deepEqual(entries, ["payload.txt"]);
+  await rm(join(target, "payload.txt"));
 });
