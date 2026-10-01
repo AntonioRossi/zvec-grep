@@ -17,6 +17,7 @@ import {
   scanFilePath,
 } from "../dist/engine/pipeline/indexing/scanner/index.js";
 import { createZvecGrep } from "../dist/index.js";
+import { endsWithRelative } from "./helpers/native-path.mjs";
 
 test("path scanners rebuild gitignore rules and stay inside the requested subtree", async () => {
   const temporaryDirectory = await mkdtemp(
@@ -444,9 +445,10 @@ test("deleted files reported through a workspace alias remove their stored entry
       route: "fts",
       autoUpdate: false,
     });
+    const hitPaths = search.items.map((item) => item.file?.absolutePath ?? "");
     assert.ok(
-      search.items.length > 0,
-      "the unrelated stored file is preserved",
+      hitPaths.some((file) => endsWithRelative(file, "kept.ts")),
+      "the preserved stored file is kept.ts itself",
     );
   } finally {
     await service.close();
@@ -488,9 +490,10 @@ test("removed directories reported through a workspace alias remove their stored
       route: "fts",
       autoUpdate: false,
     });
+    const hitPaths = search.items.map((item) => item.file?.absolutePath ?? "");
     assert.ok(
-      search.items.length > 0,
-      "the unrelated stored file is preserved",
+      hitPaths.some((file) => endsWithRelative(file, "kept.ts")),
+      "the preserved stored file is kept.ts itself",
     );
   } finally {
     await service.close();
