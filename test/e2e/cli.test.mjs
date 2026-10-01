@@ -526,11 +526,18 @@ test("server-mode index reports Workspace progress", async (t) => {
     directGrouped.stdout,
     `server grouped output differs from direct; server stderr: ${serverGrouped.stderr}`,
   );
+  // The possibly-stale status block reports the daemon's live background
+  // state, which legitimately differs from the one-shot direct snapshot;
+  // compare it state-independently instead of byte-for-byte.
+  const backgroundRefresh = /^background_refresh: .*$/m;
   assert.equal(
-    serverGrouped.stderr,
-    directGrouped.stderr,
-    `server grouped stderr differs from direct; server stdout: ${serverGrouped.stdout}`,
+    serverGrouped.stderr.replace(backgroundRefresh, ""),
+    directGrouped.stderr.replace(backgroundRefresh, ""),
+    `server grouped stderr differs from direct beyond the live background_refresh state; server stdout: ${serverGrouped.stdout}`,
   );
+  if (/background_refresh/.test(directGrouped.stderr)) {
+    assert.match(serverGrouped.stderr, /^background_refresh: /m);
+  }
   assert.match(serverGrouped.stdout, /^query groups \(2\):/);
   assert.match(serverGrouped.stdout, /Q1 \[supplemental\]: missing-symbol/);
   assert.match(
