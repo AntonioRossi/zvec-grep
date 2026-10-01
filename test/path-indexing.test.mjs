@@ -408,3 +408,92 @@ test("changedPaths addressed through a workspace alias are indexed", async () =>
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("deleted files reported through a workspace alias remove their stored entry", async () => {
+  // Round-35 review probe: alias-spelled deletion notifications threw
+  // CANONICAL_RESOLUTION_FAILED before stored-entry removal.
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-alias-del-"),
+  );
+  const physical = join(temporaryDirectory, "real", "repo");
+  await mkdir(physical, { recursive: true });
+  await symlink(
+    join(temporaryDirectory, "real"),
+    join(temporaryDirectory, "var"),
+  );
+  const deletedFile = join(physical, "deleted.ts");
+  const keptFile = join(physical, "kept.ts");
+  await writeFile(deletedFile, "export const DeletedSymbol = 1;\n");
+  await writeFile(keptFile, "export const KeptSymbol = 1;\n");
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({
+    root: physical,
+    embeddingModel: model,
+  });
+  try {
+    await service.index();
+    await rm(deletedFile);
+    const result = await service.index({
+      changedPaths: [join(temporaryDirectory, "var", "repo", "deleted.ts")],
+    });
+    assert.equal(result.filesDeleted, 1);
+    const info = await service.info();
+    assert.equal(info.status.filesStored, 1);
+    const search = await service.context({
+      query: "KeptSymbol",
+      route: "fts",
+      autoUpdate: false,
+    });
+    assert.ok(
+      search.items.length > 0,
+      "the unrelated stored file is preserved",
+    );
+  } finally {
+    await service.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("removed directories reported through a workspace alias remove their stored subtree", async () => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-alias-rmdir-"),
+  );
+  const physical = join(temporaryDirectory, "real", "repo");
+  await mkdir(join(physical, "removed"), { recursive: true });
+  await symlink(
+    join(temporaryDirectory, "real"),
+    join(temporaryDirectory, "var"),
+  );
+  await writeFile(
+    join(physical, "removed", "nested.ts"),
+    "export const NestedSymbol = 1;\n",
+  );
+  await writeFile(join(physical, "kept.ts"), "export const KeptSymbol = 1;\n");
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({
+    root: physical,
+    embeddingModel: model,
+  });
+  try {
+    await service.index();
+    await rm(join(physical, "removed"), { recursive: true, force: true });
+    const result = await service.index({
+      changedPaths: [join(temporaryDirectory, "var", "repo", "removed")],
+    });
+    assert.equal(result.filesDeleted, 1);
+    const info = await service.info();
+    assert.equal(info.status.filesStored, 1);
+    const search = await service.context({
+      query: "KeptSymbol",
+      route: "fts",
+      autoUpdate: false,
+    });
+    assert.ok(
+      search.items.length > 0,
+      "the unrelated stored file is preserved",
+    );
+  } finally {
+    await service.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
