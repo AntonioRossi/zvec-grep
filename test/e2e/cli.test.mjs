@@ -526,18 +526,18 @@ test("server-mode index reports Workspace progress", async (t) => {
     directGrouped.stdout,
     `server grouped output differs from direct; server stderr: ${serverGrouped.stderr}`,
   );
-  // The possibly-stale status block reports the daemon's live background
-  // state, which legitimately differs from the one-shot direct snapshot;
-  // compare it state-independently instead of byte-for-byte.
-  const backgroundRefresh = /^background_refresh: .*$/m;
+  // The possibly-stale status block is timing-dependent reconciliation
+  // state: the daemon's watcher may already have caught up (fresh, block
+  // absent) while the one-shot direct snapshot still reports drift. The
+  // parity guarantee covers the grouped results and every other stderr
+  // line, not the freshness snapshot.
+  const freshnessStatusBlock =
+    /^(status: possibly_stale\nresults: [^\n]*\n)?(background_refresh: [^\n]*\n)?/m;
   assert.equal(
-    serverGrouped.stderr.replace(backgroundRefresh, ""),
-    directGrouped.stderr.replace(backgroundRefresh, ""),
-    `server grouped stderr differs from direct beyond the live background_refresh state; server stdout: ${serverGrouped.stdout}`,
+    serverGrouped.stderr.replace(freshnessStatusBlock, ""),
+    directGrouped.stderr.replace(freshnessStatusBlock, ""),
+    `server grouped stderr differs from direct beyond the timing-dependent freshness status block; server stdout: ${serverGrouped.stdout}`,
   );
-  if (/background_refresh/.test(directGrouped.stderr)) {
-    assert.match(serverGrouped.stderr, /^background_refresh: /m);
-  }
   assert.match(serverGrouped.stdout, /^query groups \(2\):/);
   assert.match(serverGrouped.stdout, /Q1 \[supplemental\]: missing-symbol/);
   assert.match(
