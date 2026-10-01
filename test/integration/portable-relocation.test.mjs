@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
 import {
   cp,
   mkdir,
@@ -10,7 +9,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, sep } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { readWorkspaceManifest } from "../../dist/engine/manifest.js";
 import { createZvecGrep } from "../../dist/index.js";
@@ -18,6 +17,7 @@ import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import { endsWithRelative, physicallyUnder } from "../helpers/native-path.mjs";
 
 useIsolatedZvecGrepHome();
 
@@ -51,15 +51,6 @@ async function writeFixtures(root, files = FIXTURES) {
 
 function hitPaths(result) {
   return result.items.map((item) => item.file?.absolutePath ?? "");
-}
-
-// Hit paths and workspace roots may carry equivalent spellings of the
-// same physical tree (macOS /var, Windows short names); containment is
-// physical, so compare resolved forms on both sides.
-function physicallyUnder(file, root) {
-  const realFile = realpathSync(file);
-  const realRoot = realpathSync(root);
-  return realFile === realRoot || realFile.startsWith(realRoot + sep);
 }
 
 test("copied workspace resolves destinations at the new location", async (t) => {
@@ -268,7 +259,7 @@ test("reconciliation detects changed content with unchanged size and mtime", asy
   const search = await serviceB.context({ query: "PORTABLE", limit: 3 });
   assert.ok(search.items.length > 0);
   assert.ok(
-    hitPaths(search).some((file) => file.endsWith("notes/plain.txt")),
+    hitPaths(search).some((file) => endsWithRelative(file, "notes/plain.txt")),
     "the same-stat edit must be searchable after reconciliation",
   );
   await serviceB.close();
@@ -309,7 +300,7 @@ test("edit, add, delete and rename behave incrementally without orphans", async 
     limit: 5,
   });
   assert.ok(
-    hitPaths(renamed).some((file) => file.endsWith("docs/renamed.md")),
+    hitPaths(renamed).some((file) => endsWithRelative(file, "docs/renamed.md")),
     "renamed file must be searchable",
   );
   const removed = await service.context({
@@ -317,7 +308,7 @@ test("edit, add, delete and rename behave incrementally without orphans", async 
     limit: 5,
   });
   assert.ok(
-    !hitPaths(removed).some((file) => file.endsWith("src/util.ts")),
+    !hitPaths(removed).some((file) => endsWithRelative(file, "src/util.ts")),
     "deleted file must not be searchable",
   );
   await service.close();

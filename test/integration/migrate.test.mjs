@@ -21,6 +21,7 @@ import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import { physicallyUnder } from "../helpers/native-path.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
 useIsolatedZvecGrepHome();
@@ -187,7 +188,8 @@ test("migration converts a legacy index preserving vectors and relationships", a
   assert.ok(search.items.length > 0);
   for (const item of search.items) {
     assert.ok(
-      (item.file?.absolutePath ?? "").startsWith(`${destinationRoot}/`),
+      item.file?.absolutePath !== undefined &&
+        physicallyUnder(item.file.absolutePath, destinationRoot),
       "destination must resolve under the migrated workspace",
     );
   }
