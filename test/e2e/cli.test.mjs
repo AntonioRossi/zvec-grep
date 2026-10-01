@@ -521,8 +521,16 @@ test("server-mode index reports Workspace progress", async (t) => {
     [...groupedQueryArgs, "--mode", "server"],
     { cwd: root, env },
   );
-  assert.equal(serverGrouped.stdout, directGrouped.stdout);
-  assert.equal(serverGrouped.stderr, directGrouped.stderr);
+  assert.equal(
+    serverGrouped.stdout,
+    directGrouped.stdout,
+    `server grouped output differs from direct; server stderr: ${serverGrouped.stderr}`,
+  );
+  assert.equal(
+    serverGrouped.stderr,
+    directGrouped.stderr,
+    `server grouped stderr differs from direct; server stdout: ${serverGrouped.stdout}`,
+  );
   assert.match(serverGrouped.stdout, /^query groups \(2\):/);
   assert.match(serverGrouped.stdout, /Q1 \[supplemental\]: missing-symbol/);
   assert.match(
