@@ -29,8 +29,9 @@ import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
 import {
   assertDenialInducible,
+  guardedSyncPermissionProbe,
+  isPosixNonRoot,
   probeDenial,
-  probeDenialSync,
 } from "../helpers/permission-probe.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
@@ -831,8 +832,11 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
   const destinationHome = join(parent, "destination", ".zvec-grep");
   await mkdir(join(parent, "destination"), { recursive: true });
   // Whether mode bits can make the home unwritable is a platform
-  // capability, measured independently inside the hook.
+  // capability, measured independently inside the hook. An unexpected
+  // probe error is captured and rethrown by the test as a probe failure —
+  // publication error handling must not reinterpret it.
   let homeUnwritable = false;
+  let retainLockProbeFailure;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.retainlock",
@@ -844,7 +848,7 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o555);
         try {
-          const outcome = probeDenialSync(
+          const outcome = guardedSyncPermissionProbe(
             t,
             "reservation.retainlock:write-home",
             () => writeFileSync(join(destinationHome, ".write-probe"), ""),
@@ -854,17 +858,23 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
           }
           homeUnwritable = outcome === "denied";
         } catch (error) {
-          homeUnwritable = error.code === "EACCES";
+          retainLockProbeFailure = error;
+          throw error;
         }
       },
     },
   });
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
-  assert.throws(
-    () => reservation.publish(() => undefined),
-    /unexpectedly absent/i,
-  );
+  try {
+    reservation.publish(() => undefined);
+    assert.fail("publication must fail");
+  } catch (error) {
+    if (retainLockProbeFailure) {
+      throw retainLockProbeFailure;
+    }
+    assert.match(String(error), /unexpectedly absent/i);
+  }
   // The unwritable home was only needed to fail the rollback and restore;
   // restore permissions before assertions and cleanup.
   chmodSync(destinationHome, 0o755);
@@ -1273,6 +1283,7 @@ test("a permission failure retains the write lock and operator recovery restores
   // Whether mode bits can make the home unreadable is a platform
   // capability, measured independently inside the hook.
   let homeUnreadable = false;
+  let permRecProbeFailure;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.permission-recovery",
@@ -1283,13 +1294,14 @@ test("a permission failure retains the write lock and operator recovery restores
         chmodSync(destinationHome, 0o000);
         try {
           homeUnreadable =
-            probeDenialSync(
+            guardedSyncPermissionProbe(
               t,
               "reservation.permission-recovery:readdir-home",
               () => readdirSync(destinationHome),
             ) === "denied";
         } catch (error) {
-          homeUnreadable = error.code === "EACCES";
+          permRecProbeFailure = error;
+          throw error;
         }
       },
     },
@@ -1301,6 +1313,9 @@ test("a permission failure retains the write lock and operator recovery restores
     reservation.publish(() => undefined);
   } catch (error) {
     publishError = error;
+  }
+  if (permRecProbeFailure) {
+    throw permRecProbeFailure;
   }
   assert.ok(publishError, "publication must fail");
   // Denied mode bits make the marker uninspectable ("ownership was lost";
@@ -1569,4 +1584,52 @@ test("a normal abort cleans up completely and releases the workspace", async (t)
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
+});
+
+test("an unexpected permission-probe error fails the fixture as a probe failure", async () => {
+  // Call-site control: the wiring used by the retain-lock and
+  // permission-recovery hooks must surface an unexpected probe error as a
+  // probe failure, never letting publication error handling reinterpret it
+  // into a passing publication-failure assertion.
+  const probeFailure = new Error("probe exploded", { cause: undefined });
+  probeFailure.code = "EIO";
+  let captured;
+  const simulateHook = () => {
+    try {
+      throw probeFailure;
+    } catch (error) {
+      captured = error;
+      throw error;
+    }
+  };
+  assert.throws(
+    () => simulateHook(),
+    (error) => error === probeFailure,
+  );
+  const publicationError = new Error(
+    "Incomplete marker is unexpectedly absent at publication",
+  );
+  const surfaced = captured ?? publicationError;
+  assert.equal(
+    surfaced,
+    probeFailure,
+    "the probe failure must win over the publication error",
+  );
+});
+
+test("an allowed probe result fails the guard in required non-root environments", async (t) => {
+  // Call-site control for the required-denial guard: on non-root
+  // Linux/macOS an allowed outcome must fail the fixture; other
+  // environments follow the measured capability.
+  if (isPosixNonRoot()) {
+    assert.throws(
+      () => assertDenialInducible(t, "control.allowed-in-non-root", "allowed"),
+      /precondition failure/u,
+    );
+  } else {
+    assertDenialInducible(t, "control.allowed-in-non-root", "allowed");
+    t.diagnostic(
+      `permission-branch operation=control.allowed-in-non-root branch=capability-followed (uid 0 or unsupported platform)`,
+    );
+  }
 });

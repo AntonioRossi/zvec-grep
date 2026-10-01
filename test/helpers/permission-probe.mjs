@@ -96,3 +96,21 @@ export function probeDenialSync(t, operation, attempt) {
   );
   return outcome;
 }
+
+/**
+ * Guarded synchronous probe for test hooks: tri-state classification,
+ * selected-branch diagnostic and the required-denial guard in one call.
+ * Unexpected probe errors propagate as probe failures; the caller must
+ * surface them as such instead of letting publication error handling
+ * reinterpret them.
+ */
+export function guardedSyncPermissionProbe(t, operation, attempt) {
+  const outcome = probeDenialSync(t, operation, attempt);
+  t.diagnostic(
+    `permission-branch operation=${operation} branch=${
+      outcome === "denied" ? "strict" : "advisory"
+    }`,
+  );
+  assertDenialInducible(t, operation, outcome);
+  return outcome;
+}
