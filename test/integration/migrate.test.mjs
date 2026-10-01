@@ -72,15 +72,19 @@ async function copySourceFiles(sourceRoot, destinationRoot) {
   });
 }
 
-// Handle accounting is Linux-only (/proc/self/fd). Where the filesystem
-// does not expose descriptors, the count is not asserted and the
-// close/reopen, cleanup and retry assertions below carry the guarantee
-// (recorded capability limitation; hosted Windows, CI run 36778689252).
+// Descriptor accounting reads /proc/self/fd. Only its absence (ENOENT —
+// the filesystem does not expose descriptors, e.g. Windows) makes this
+// Linux-only coverage unavailable; any other error propagates rather than
+// silently skipping the no-leak assertion. The close/reopen, cleanup and
+// retry assertions below carry the guarantee on every platform.
 function fdCount() {
   try {
     return readdirSync("/proc/self/fd").length;
-  } catch {
-    return null;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
   }
 }
 
