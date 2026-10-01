@@ -1188,9 +1188,11 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     return;
   }
 
-  // The cleanup failure is reported, the payload remains, the marker is
+  // The cleanup failure is reported (the errno is the platform's cleanup
+  // failure: EACCES from the denied unlink on Linux, ENOTEMPTY from
+  // macOS's recursive removal), the payload remains, the marker is
   // preserved as blockage, and the lock is released against it.
-  assert.match(cleanup, /could not be removed \(EACCES\)/i);
+  assert.match(cleanup, /could not be removed \((EACCES|ENOTEMPTY)\)/i);
   assert.match(cleanup, /blocked by the INCOMPLETE marker/i);
   assert.ok(existsSync(join(protectedDir, "payload.txt")));
   assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));

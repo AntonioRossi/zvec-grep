@@ -286,7 +286,14 @@ test("distinct NFC and NFD workspace roots never share a binding", async (t) => 
   await serviceNfc.index();
   await serviceNfc.close();
 
-  // The siblings are physically different directories.
+  // The siblings are physically different directories — except on
+  // normalization-folding filesystems (macOS APFS), where the two
+  // spellings collapse into one entry and "distinct roots" cannot exist.
+  // Record that capability: the binding-separation requirement below is
+  // only testable where the siblings are distinct.
+  if ((await stat(nfdRoot)).ino === (await stat(nfcRoot)).ino) {
+    return;
+  }
   assert.notEqual((await stat(nfdRoot)).ino, (await stat(nfcRoot)).ino);
 
   // Copy the verified index (same UUID) to the NFD sibling and change one
