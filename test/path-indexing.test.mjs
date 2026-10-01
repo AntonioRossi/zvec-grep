@@ -497,3 +497,52 @@ test("removed directories reported through a workspace alias remove their stored
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("workspace-root notifications through an alias process all changes", async () => {
+  // Round-36 review probe: changedPaths naming the workspace root through
+  // an equivalent spelling silently scanned nothing (0/0/0/0), while the
+  // physical spelling processed every pending change.
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "zvec-grep-alias-root-"),
+  );
+  const physical = join(temporaryDirectory, "real", "repo");
+  await mkdir(join(physical, "docs"), { recursive: true });
+  await symlink(
+    join(temporaryDirectory, "real"),
+    join(temporaryDirectory, "var"),
+  );
+  await writeFile(join(physical, "docs", "one.md"), "# One\n");
+  await writeFile(join(physical, "two.md"), "# Two\n");
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({
+    root: physical,
+    embeddingModel: model,
+  });
+  try {
+    await service.index();
+    await writeFile(join(physical, "docs", "one.md"), "# One edited\n");
+    await rm(join(physical, "two.md"));
+    await writeFile(join(physical, "three.md"), "# Three\n");
+
+    const notified = await service.index({
+      changedPaths: [join(temporaryDirectory, "var", "repo")],
+    });
+    assert.equal(notified.filesAdded, 1);
+    assert.equal(notified.filesModified, 1);
+    assert.equal(notified.filesDeleted, 1);
+    // The two surviving files are scanned; the deleted entry is removed
+    // through storage comparison rather than scanned.
+    assert.equal(notified.filesScanned, 2);
+
+    // Everything settled: the physical-spelling control finds no remaining
+    // change (a root rescan still scans the live files).
+    const control = await service.index({ changedPaths: [physical] });
+    assert.equal(
+      control.filesAdded + control.filesModified + control.filesDeleted,
+      0,
+    );
+  } finally {
+    await service.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});

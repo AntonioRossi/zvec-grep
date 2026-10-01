@@ -82,12 +82,16 @@ function canonicalFilePathWithAlias(
  * through an equivalent spelling (macOS /var, Windows short names), and
  * left as given when it is genuinely outside — downstream handling
  * decides that case. Watcher events and caller-supplied changed paths
- * may carry either spelling. Deleted targets are mapped through their
- * canonical identity without requiring the leaf or subtree to exist:
- * absence is the notification's point, and stored-entry comparison and
- * removal need the workspace spelling. Escaping symlinks surface as
- * forbidden and are left to containment; ambiguous canonical names and
- * filesystem errors still throw.
+ * may carry either spelling. An empty logical suffix is the workspace
+ * root itself — a notification to rescan the workspace directory — and
+ * maps to the resolver's workspace root; nonempty suffixes keep their
+ * logical identity even when an internal link resolves to the root.
+ * Deleted targets map through their canonical identity without
+ * requiring the leaf or subtree to exist: absence is the notification's
+ * point, and stored-entry comparison and removal need the workspace
+ * spelling. Escaping symlinks surface as forbidden and are left to
+ * containment; ambiguous canonical names and filesystem errors still
+ * throw.
  */
 export function resolveWorkspaceFilePath(
   absolutePath: string,
@@ -96,10 +100,14 @@ export function resolveWorkspaceFilePath(
   if (resolver.toCanonical(absolutePath) !== null) {
     return absolutePath;
   }
-  const canonicalPath = canonicalFilePathWithAlias(absolutePath, resolver);
-  if (canonicalPath === null) {
+  const aliasSuffix = workspaceAliasSuffix(absolutePath, resolver);
+  if (aliasSuffix === null) {
     return absolutePath;
   }
+  if (aliasSuffix.length === 0) {
+    return resolver.workspaceRoot;
+  }
+  const canonicalPath = canonicalFromRelative(aliasSuffix.join("/"));
   const resolution = resolver.resolveDetailedSync(canonicalPath);
   if (resolution.status === "ok") {
     return resolution.path;
