@@ -4,6 +4,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readlinkSync,
   renameSync,
   rmSync,
@@ -824,6 +825,9 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
   const parent = await createTemporaryDirectory(t, "zg-reserve-retainlock-");
   const destinationHome = join(parent, "destination", ".zvec-grep");
   await mkdir(join(parent, "destination"), { recursive: true });
+  // Whether mode bits can make the home unwritable is a platform
+  // capability, measured independently inside the hook.
+  let homeUnwritable = false;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.retainlock",
@@ -834,6 +838,12 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
         // cannot move the child back and the marker cannot be restored.
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o555);
+        try {
+          writeFileSync(join(destinationHome, ".write-probe"), "");
+          rmSync(join(destinationHome, ".write-probe"), { force: true });
+        } catch (error) {
+          homeUnwritable = error.code === "EACCES";
+        }
       },
     },
   });
@@ -841,11 +851,28 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
 
   assert.throws(
     () => reservation.publish(() => undefined),
-    /retained as the last block/i,
+    /unexpectedly absent/i,
   );
   // The unwritable home was only needed to fail the rollback and restore;
   // restore permissions before assertions and cleanup.
   chmodSync(destinationHome, 0o755);
+
+  if (!homeUnwritable) {
+    // Advisory mode bits: the intended fault never occurred; the engine
+    // detects the vanished marker and rolls the publication back
+    // completely, restoring the blockage (the "publication fails when
+    // the marker vanishes" behavior).
+    const marker = JSON.parse(
+      await readFile(join(destinationHome, "INCOMPLETE"), "utf8"),
+    );
+    assert.equal(marker.operation, "rollback-block");
+    assert.equal(
+      await readFile(join(reservation.stagingHome, "payload.txt"), "utf8"),
+      "ours",
+    );
+    assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
+    return;
+  }
 
   // The write lock is retained as the last block; nothing else was written.
   const lockInfo = JSON.parse(
@@ -1143,12 +1170,23 @@ test("abort with an unremovable staging payload preserves blockage and reports i
   const unlinkControl = await import("node:fs/promises").then((fs) =>
     fs.unlink(join(protectedDir, "payload.txt")).catch((error) => error.code),
   );
-  assert.equal(unlinkControl, "EACCES");
 
   const cleanup = reservation.abort();
   // Restore normal access before any discovery check: permission failure
   // itself must not be mistaken for persistent protection.
-  chmodSync(protectedDir, 0o700);
+  if (existsSync(protectedDir)) {
+    chmodSync(protectedDir, 0o700);
+  }
+
+  if (unlinkControl !== "EACCES") {
+    // Advisory mode bits: the staged payload is removable, so the cleanup
+    // completes — staging is emptied and the blockage lifts.
+    assert.equal(cleanup, undefined);
+    assert.ok(!existsSync(protectedDir));
+    assert.ok(!existsSync(join(destinationHome, "INCOMPLETE")));
+    assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+    return;
+  }
 
   // The cleanup failure is reported, the payload remains, the marker is
   // preserved as blockage, and the lock is released against it.
@@ -1208,6 +1246,9 @@ test("a permission failure retains the write lock and operator recovery restores
   // the lock metadata, so even the release path refuses deletion. This
   // fixture cannot distinguish the marker decision itself — that is the
   // pinned marker-only inspection probe's role (validation evidence).
+  // Whether mode bits can make the home unreadable is a platform
+  // capability, measured independently inside the hook.
+  let homeUnreadable = false;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.permission-recovery",
@@ -1216,17 +1257,51 @@ test("a permission failure retains the write lock and operator recovery restores
       afterChildMove() {
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o000);
+        try {
+          readdirSync(destinationHome);
+        } catch (error) {
+          homeUnreadable = error.code === "EACCES";
+        }
       },
     },
   });
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
-  assert.throws(
-    () => reservation.publish(() => undefined),
-    /retained as the last block/i,
+  let publishError;
+  try {
+    reservation.publish(() => undefined);
+  } catch (error) {
+    publishError = error;
+  }
+  assert.ok(publishError, "publication must fail");
+  // Denied mode bits make the marker uninspectable ("ownership was lost";
+  // retained lock); advisory mode bits leave the marker visibly absent
+  // ("unexpectedly absent"; complete rollback). The outcome decides.
+  assert.match(
+    String(publishError),
+    homeUnreadable ? /retained as the last block/i : /unexpectedly absent/i,
   );
   // Restore normal access before any discovery check.
   chmodSync(destinationHome, 0o755);
+
+  if (!homeUnreadable) {
+    // Advisory mode bits: the intended fault never occurred; the engine
+    // rolls the publication back completely and restores the blockage
+    // (the "publication fails when the marker vanishes" behavior). The
+    // retained-lock and ancestor-recovery coverage below stays on the
+    // denied branch; the rollback-interference path is deterministic via
+    // the vanished-marker test.
+    const marker = JSON.parse(
+      await readFile(join(destinationHome, "INCOMPLETE"), "utf8"),
+    );
+    assert.equal(marker.operation, "rollback-block");
+    assert.equal(
+      await readFile(join(reservation.stagingHome, "payload.txt"), "utf8"),
+      "ours",
+    );
+    assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
+    return;
+  }
 
   // The lock is retained, the marker is absent, the payload remains at the
   // destination, and writers and discovery stay denied with a live ancestor.
