@@ -124,20 +124,36 @@ test("storage and search fail loudly under permission errors, then recover", asy
   await service.index();
   await service.close();
 
-  const { chmod } = await import("node:fs/promises");
+  const { chmod, readdir } = await import("node:fs/promises");
   await chmod(join(root, "docs"), 0o000);
   try {
-    const service2 = await createZvecGrep({ root, embeddingModel: model });
-    await assert.rejects(
-      () =>
-        service2.context({
-          query: "contained content marker",
-          limit: 3,
-          autoUpdate: false,
-        }),
-      /Filesystem error/,
-      "an unreadable indexed directory must surface as an error, not silence",
+    // Whether mode bits deny the owner's read is a platform capability,
+    // measured independently of the code under test.
+    const denied = await readdir(join(root, "docs")).then(
+      () => false,
+      (error) => error.code === "EACCES",
     );
+    const service2 = await createZvecGrep({ root, embeddingModel: model });
+    if (denied) {
+      await assert.rejects(
+        () =>
+          service2.context({
+            query: "contained content marker",
+            limit: 3,
+            autoUpdate: false,
+          }),
+        /Filesystem error/,
+        "an unreadable indexed directory must surface as an error, not silence",
+      );
+    } else {
+      // Advisory mode bits (Windows): the query must keep working.
+      const advisory = await service2.context({
+        query: "contained content marker",
+        limit: 3,
+        autoUpdate: false,
+      });
+      assert.ok(advisory.items.length > 0);
+    }
     await service2.close();
   } finally {
     await chmod(join(root, "docs"), 0o700);

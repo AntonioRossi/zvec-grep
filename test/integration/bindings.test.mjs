@@ -205,15 +205,26 @@ test("invalidation propagates access failures and never silently keeps trust", a
   assert.equal(store.matches(manifest.id, root), true);
 
   // With the workspace unreadable, invalidation must fail loudly instead of
-  // reporting a revocation that never happened.
-  const { chmod } = await import("node:fs/promises");
+  // reporting a revocation that never happened. Whether mode bits deny the
+  // owner's read is a platform capability, measured independently here.
+  const { chmod, readdir } = await import("node:fs/promises");
   await chmod(parent, 0o000);
   try {
-    assert.throws(
-      () => store.invalidate(manifest.id, root),
-      /EACCES|permission denied/i,
-      "an access failure during invalidation must propagate",
+    const denied = await readdir(parent).then(
+      () => false,
+      (error) => error.code === "EACCES",
     );
+    if (denied) {
+      assert.throws(
+        () => store.invalidate(manifest.id, root),
+        /EACCES|permission denied/i,
+        "an access failure during invalidation must propagate",
+      );
+    } else {
+      // Advisory mode bits (Windows): nothing is denied, so invalidation
+      // must keep working rather than fail.
+      store.invalidate(manifest.id, root);
+    }
   } finally {
     await chmod(parent, 0o755);
   }
