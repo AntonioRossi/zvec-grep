@@ -31,8 +31,8 @@ import {
   assertDenialInducible,
   guardedSyncPermissionProbe,
   isPosixNonRoot,
+  privilegeContext,
   probeDenial,
-  registerPermissionRestore,
 } from "../helpers/permission-probe.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
@@ -828,10 +828,68 @@ test("an incomplete rollback preserves a foreign marker and releases the lock", 
   assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
 });
 
-test("an incomplete rollback with an unrestorable marker retains the write lock", async (t) => {
-  const parent = await createTemporaryDirectory(t, "zg-reserve-retainlock-");
+// Fixture-owned, explicitly ordered teardown: restore known protected
+// paths, finalize the owned reservation (abort's result is inspected — a
+// diagnostic string means incomplete cleanup and is surfaced), then remove
+// the temporary tree. Registered as soon as resources are owned and the
+// fixture's automatic removal is disabled; the returned function is
+// idempotent so controls can await it directly after an injected failure.
+const probeInjections = new Map();
+
+function ownReservationTeardown(t, owned) {
+  const teardown = async () => {
+    if (owned.done) {
+      return;
+    }
+    owned.done = true;
+    const errors = [];
+    for (const entry of owned.protected ?? []) {
+      try {
+        if (existsSync(entry.path)) {
+          chmodSync(entry.path, entry.mode);
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
+      const reservation = owned.reservation?.();
+      if (reservation) {
+        const result = reservation.abort();
+        if (result !== undefined) {
+          t.diagnostic(`teardown abort reported incomplete cleanup: ${result}`);
+        }
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await rm(owned.tempDir, { recursive: true, force: true });
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length > 0) {
+      throw new Error(
+        `fixture teardown failed: ${errors.map((e) => e.message).join("; ")}`,
+      );
+    }
+  };
+  t.after(teardown);
+  return teardown;
+}
+
+async function runRetainLockFixture(t, options = {}) {
+  const owned = options.owned ?? {};
+  const parent = await createTemporaryDirectory(t, "zg-reserve-retainlock-", {
+    cleanup: false,
+  });
+  owned.tempDir = parent;
   const destinationHome = join(parent, "destination", ".zvec-grep");
   await mkdir(join(parent, "destination"), { recursive: true });
+  owned.protected = [{ path: destinationHome, mode: 0o755 }];
+  let reservationRef;
+  owned.reservation = () => reservationRef;
+  owned.teardown = ownReservationTeardown(t, owned);
   // Whether mode bits can make the home unwritable is a platform
   // capability, measured independently inside the hook. An unexpected
   // probe error is captured and rethrown by the test as a probe failure —
@@ -849,11 +907,32 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o555);
         try {
-          const outcome = guardedSyncPermissionProbe(
-            t,
-            "reservation.retainlock:write-home",
-            () => writeFileSync(join(destinationHome, ".write-probe"), ""),
-          );
+          const injection = probeInjections.get("retainlock");
+          let outcome;
+          if (injection) {
+            // Injections replace the attempt's outcome but still pass
+            // through the required-denial guard.
+            outcome = injection();
+            t.diagnostic(
+              `permission-probe operation=reservation.retainlock:write-home ${privilegeContext()} probe=injected:${outcome}`,
+            );
+            t.diagnostic(
+              `permission-branch operation=reservation.retainlock:write-home branch=${
+                outcome === "denied" ? "strict" : "advisory"
+              }`,
+            );
+            assertDenialInducible(
+              t,
+              "reservation.retainlock:write-home",
+              outcome,
+            );
+          } else {
+            outcome = guardedSyncPermissionProbe(
+              t,
+              "reservation.retainlock:write-home",
+              () => writeFileSync(join(destinationHome, ".write-probe"), ""),
+            );
+          }
           if (outcome === "allowed") {
             rmSync(join(destinationHome, ".write-probe"), { force: true });
           }
@@ -865,10 +944,8 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
       },
     },
   });
+  reservationRef = reservation;
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
-  // Failure-safe restore: runs even when the probe, guard or an assertion
-  // fails before the inline restore below.
-  registerPermissionRestore(t, destinationHome, 0o755);
 
   try {
     reservation.publish(() => undefined);
@@ -948,7 +1025,11 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
-});
+  return owned;
+}
+
+test("an incomplete rollback with an unrestorable marker retains the write lock", (t) =>
+  runRetainLockFixture(t));
 
 test("publication rejects a dangling destination child without overwriting it", async (t) => {
   const parent = await createTemporaryDirectory(t, "zg-reserve-dangling-");
@@ -1157,9 +1238,13 @@ test("a complete rollback with an unreadable marker stays blocked with a live an
   await service.close();
 });
 
-test("abort with an unremovable staging payload preserves blockage and reports it", async (t) => {
+async function runAbortCleanupFixture(t, options = {}) {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-  const parent = await createTemporaryDirectory(t, "zg-reserve-abortcleanup-");
+  const owned = options.owned ?? {};
+  const parent = await createTemporaryDirectory(t, "zg-reserve-abortcleanup-", {
+    cleanup: false,
+  });
+  owned.tempDir = parent;
 
   // Live ancestor index.
   await mkdir(join(parent, "docs"), { recursive: true });
@@ -1192,10 +1277,10 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     join(protectedDir, "payload.txt"),
     "owned recoverable payload",
   );
+  owned.protected = [{ path: protectedDir, mode: 0o700 }];
+  owned.reservation = () => reservation;
+  owned.teardown = ownReservationTeardown(t, owned);
   chmodSync(protectedDir, 0o500);
-  // Failure-safe restore: runs even when the probe, guard or an assertion
-  // fails before the inline restore below.
-  registerPermissionRestore(t, protectedDir, 0o700);
   const fs = await import("node:fs/promises");
   const unlinkOutcome = await probeDenial(
     t,
@@ -1261,11 +1346,19 @@ test("abort with an unremovable staging payload preserves blockage and reports i
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
-});
+  return owned;
+}
 
-test("a permission failure retains the write lock and operator recovery restores the workspace", async (t) => {
+test("abort with an unremovable staging payload preserves blockage and reports it", (t) =>
+  runAbortCleanupFixture(t));
+
+async function runPermissionRecoveryFixture(t, options = {}) {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-  const parent = await createTemporaryDirectory(t, "zg-reserve-permrec-");
+  const owned = options.owned ?? {};
+  const parent = await createTemporaryDirectory(t, "zg-reserve-permrec-", {
+    cleanup: false,
+  });
+  owned.tempDir = parent;
 
   await mkdir(join(parent, "docs"), { recursive: true });
   await writeFile(
@@ -1300,12 +1393,31 @@ test("a permission failure retains the write lock and operator recovery restores
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o000);
         try {
-          homeUnreadable =
-            guardedSyncPermissionProbe(
+          const injection = probeInjections.get("permission-recovery");
+          let outcome;
+          if (injection) {
+            outcome = injection();
+            t.diagnostic(
+              `permission-probe operation=reservation.permission-recovery:readdir-home ${privilegeContext()} probe=injected:${outcome}`,
+            );
+            t.diagnostic(
+              `permission-branch operation=reservation.permission-recovery:readdir-home branch=${
+                outcome === "denied" ? "strict" : "advisory"
+              }`,
+            );
+            assertDenialInducible(
+              t,
+              "reservation.permission-recovery:readdir-home",
+              outcome,
+            );
+          } else {
+            outcome = guardedSyncPermissionProbe(
               t,
               "reservation.permission-recovery:readdir-home",
               () => readdirSync(destinationHome),
-            ) === "denied";
+            );
+          }
+          homeUnreadable = outcome === "denied";
         } catch (error) {
           permRecProbeFailure = error;
           throw error;
@@ -1313,10 +1425,10 @@ test("a permission failure retains the write lock and operator recovery restores
       },
     },
   });
+  owned.protected = [{ path: destinationHome, mode: 0o755 }];
+  owned.reservation = () => reservation;
+  owned.teardown = ownReservationTeardown(t, owned);
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
-  // Failure-safe restore: runs even when the probe, guard or an assertion
-  // fails before the inline restore below.
-  registerPermissionRestore(t, destinationHome, 0o755);
 
   let publishError;
   try {
@@ -1397,7 +1509,11 @@ test("a permission failure retains the write lock and operator recovery restores
     "after recovery the ancestor serves again",
   );
   await recovered.close();
-});
+  return owned;
+}
+
+test("a permission failure retains the write lock and operator recovery restores the workspace", (t) =>
+  runPermissionRecoveryFixture(t));
 
 test("abort preserves a staging symlink alias and the moved-aside payload", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
@@ -1596,70 +1712,62 @@ test("a normal abort cleans up completely and releases the workspace", async (t)
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
 });
 
-test("an unexpected permission-probe error fails the fixture as a probe failure", async () => {
-  // Call-site control: the wiring used by the retain-lock and
-  // permission-recovery hooks must surface an unexpected probe error as a
-  // probe failure, never letting publication error handling reinterpret it
-  // into a passing publication-failure assertion.
-  const probeFailure = new Error("probe exploded", { cause: undefined });
-  probeFailure.code = "EIO";
-  let captured;
-  const simulateHook = () => {
-    try {
-      throw probeFailure;
-    } catch (error) {
-      captured = error;
-      throw error;
-    }
-  };
-  assert.throws(
-    () => simulateHook(),
-    (error) => error === probeFailure,
-  );
-  const publicationError = new Error(
-    "Incomplete marker is unexpectedly absent at publication",
-  );
-  const surfaced = captured ?? publicationError;
-  assert.equal(
-    surfaced,
-    probeFailure,
-    "the probe failure must win over the publication error",
-  );
-});
-
-test("an allowed probe result fails the guard in required non-root environments", async (t) => {
-  // Call-site control for the required-denial guard: on non-root
-  // Linux/macOS an allowed outcome must fail the fixture; other
-  // environments follow the measured capability.
-  if (isPosixNonRoot()) {
-    assert.throws(
-      () => assertDenialInducible(t, "control.allowed-in-non-root", "allowed"),
-      /precondition failure/u,
+test("retain-lock fixture fails as a probe failure on an injected unexpected error", async (t) => {
+  const owned = {};
+  const injected = new Error("injected probe failure");
+  injected.code = "EIO";
+  probeInjections.set("retainlock", () => {
+    throw injected;
+  });
+  try {
+    await assert.rejects(
+      runRetainLockFixture(t, { owned }),
+      (error) => error === injected,
+      "the injected probe error must win over publication error handling",
     );
-  } else {
-    assertDenialInducible(t, "control.allowed-in-non-root", "allowed");
-    t.diagnostic(
-      `permission-branch operation=control.allowed-in-non-root branch=capability-followed (uid 0 or unsupported platform)`,
-    );
+  } finally {
+    probeInjections.delete("retainlock");
   }
+  await owned.teardown();
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
 
-test("permission restoration runs as fixture teardown", async (t) => {
-  // Control for the failure-safe restore wiring: the registered teardown
-  // actually restores permissions, so probe, guard or assertion failures
-  // cannot leave the fixture-owned paths unreadable.
-  const temporaryDirectory = await createTemporaryDirectory(
-    t,
-    "zg-restore-ctl-",
-  );
-  const target = join(temporaryDirectory, "locked");
-  await mkdir(target);
-  await writeFile(join(target, "payload.txt"), "x");
-  chmodSync(target, 0o500);
-  const restore = registerPermissionRestore(t, target, 0o700);
-  restore();
-  // The restored mode must allow the fixture owner to read and remove.
-  const entries = readdirSync(target);
-  assert.deepEqual(entries, ["payload.txt"]);
-  await rm(join(target, "payload.txt"));
+test("permission-recovery fixture fails as a probe failure on an injected unexpected error", async (t) => {
+  const owned = {};
+  const injected = new Error("injected probe failure");
+  injected.code = "EIO";
+  probeInjections.set("permission-recovery", () => {
+    throw injected;
+  });
+  try {
+    await assert.rejects(
+      runPermissionRecoveryFixture(t, { owned }),
+      (error) => error === injected,
+      "the injected probe error must win over publication error handling",
+    );
+  } finally {
+    probeInjections.delete("permission-recovery");
+  }
+  await owned.teardown();
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("an injected allowed probe outcome fails the guard in required non-root environments", async (t) => {
+  if (!isPosixNonRoot()) {
+    t.skip("guard control requires a non-root POSIX environment");
+    return;
+  }
+  const owned = {};
+  probeInjections.set("retainlock", () => "allowed");
+  try {
+    await assert.rejects(
+      runRetainLockFixture(t, { owned }),
+      /precondition failure/u,
+      "the required-denial guard must fail the fixture",
+    );
+  } finally {
+    probeInjections.delete("retainlock");
+  }
+  await owned.teardown();
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
