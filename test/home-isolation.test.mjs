@@ -166,6 +166,12 @@ test("unset override writes to a disposable shadow home, never production", asyn
   const childEnv = { ...process.env };
   delete childEnv.ZVEC_GREP_HOME;
   childEnv.HOME = shadowHome;
+  if (process.platform === "win32") {
+    // Windows resolves the user home from USERPROFILE (node:os.homedir),
+    // not from HOME; point both at the shadow so the default-home
+    // resolution is the disposable one.
+    childEnv.USERPROFILE = shadowHome;
+  }
 
   const result = await runChild(childEnv, root);
   assert.ok(result.ok, "the child fixture must succeed");
