@@ -1241,6 +1241,9 @@ async function runAbortCleanupFixture(t, options = {}) {
   owned.tempDir = parent;
   owned.services = [];
   owned.teardown = ownReservationTeardown(t, owned);
+  if (options.failDuringSetup) {
+    throw new Error("injected setup failure before any further acquisition");
+  }
 
   // Live ancestor index.
   await mkdir(join(parent, "docs"), { recursive: true });
@@ -1813,6 +1816,20 @@ test("abort-cleanup probe failure cleans up the owned reservation automatically"
     (owned.services ?? []).length,
     "every acquired service was closed by teardown",
   );
+});
+
+test("a setup failure right after allocation cleans up automatically", async (t) => {
+  const owned = {};
+  await t.test("injected setup failure", async (child) => {
+    await assert.rejects(
+      runAbortCleanupFixture(child, {
+        owned,
+        failDuringSetup: true,
+      }),
+      /injected setup failure/u,
+    );
+  });
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
 
 test("a setup failure after reservation acquisition cleans up automatically", async (t) => {
