@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -94,12 +95,14 @@ test("engine writes bindings only into an inherited isolated home", async (t) =>
   }
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
-  // Bindings record the workspace's physical root (tryRealpathSync in
-  // src/engine/bindings.ts); compare that identity, not the raw spelling,
-  // so a symlinked temporary directory still matches.
+  // Bindings record the workspace's physical root (realpathSync in
+  // src/engine/bindings.ts); compare with the same function the writer
+  // uses, not the raw spelling, so a symlinked temporary directory
+  // (macOS /var, Windows path forms) still matches.
+  const expectedRoot = realpathSync(root);
   assert.ok(
-    roots.includes(await realpath(root)),
-    "the isolated home must carry a binding for this exact workspace",
+    roots.includes(expectedRoot),
+    `the isolated home must carry a binding for this exact workspace; recorded=${JSON.stringify(roots)} expected=${expectedRoot}`,
   );
   const shadowZvec = await readdir(join(shadowHome, ".zvec-grep")).catch(
     () => null,
@@ -137,9 +140,10 @@ test("child inherits the isolated home, executes, and records the exact workspac
   );
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
+  const expectedRoot = realpathSync(root);
   assert.ok(
-    roots.includes(await realpath(root)),
-    "the isolated home must carry a binding for the parent-owned workspace",
+    roots.includes(expectedRoot),
+    `the isolated home must carry a binding for the parent-owned workspace; recorded=${JSON.stringify(roots)} expected=${expectedRoot}`,
   );
   const shadowZvec = await readdir(join(shadowHome, ".zvec-grep")).catch(
     () => null,
@@ -174,8 +178,9 @@ test("unset override writes to a disposable shadow home, never production", asyn
   const roots = await bindingRootsFromStore(
     join(shadowHome, ".zvec-grep", "bindings"),
   );
+  const expectedRoot = realpathSync(root);
   assert.ok(
-    roots.includes(await realpath(root)),
-    "the disposable shadow home must carry a binding for the parent-owned workspace",
+    roots.includes(expectedRoot),
+    `the disposable shadow home must carry a binding for the parent-owned workspace; recorded=${JSON.stringify(roots)} expected=${expectedRoot}`,
   );
 });
