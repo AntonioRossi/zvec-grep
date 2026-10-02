@@ -1159,6 +1159,9 @@ async function runRetainLockFixture(t, options = {}) {
   });
   expectOwnedReservation(owned, recovered);
   trackOwnedReservation(owned, recovered);
+  if (options.failAfterRecoveredReservation) {
+    throw new Error("injected failure after the recovered reservation");
+  }
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
@@ -1501,6 +1504,9 @@ async function runAbortCleanupFixture(t, options = {}) {
   });
   expectOwnedReservation(owned, recovered);
   trackOwnedReservation(owned, recovered);
+  if (options.failAfterRecoveredReservation) {
+    throw new Error("injected failure after the recovered reservation");
+  }
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
@@ -1634,6 +1640,9 @@ async function runPermissionRecoveryFixture(t, options = {}) {
   });
   expectOwnedService(owned, service);
   trackOwnedService(owned, service);
+  if (options.failAfterDiscoveryService) {
+    throw new Error("injected failure with the recovery service open");
+  }
   await assert.rejects(
     service.context({ query: "ancestor content", limit: 3 }),
     (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
@@ -2140,5 +2149,76 @@ test("resource identities match the fixtures that created them", async (t) => {
     treeIndex !== -1 && log.indexOf(reservationAbort) < treeIndex,
     "the reservation is finalized before the tree removal",
   );
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("the retain-lock recovery reservation is aborted automatically after a later failure", async (t) => {
+  // Recovery-acquisition control: the failure fires after the recovered
+  // reservation exists and before it publishes, so it still holds the write
+  // lock when the child fails. The child asserted the intentional retained
+  // lock before the recovery stage; teardown must abort the recovered
+  // reservation before the tree removal.
+  if (!isPosixNonRoot()) {
+    t.skip("recovery-reservation control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test("injected failure after recovery acquisition", async (child) => {
+    await assert.rejects(
+      runRetainLockFixture(child, {
+        owned,
+        failAfterRecoveredReservation: true,
+      }),
+      /injected failure after the recovered reservation/u,
+    );
+  });
+  assertOwnedResourcesFinalized(owned);
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("the abort-cleanup recovery reservation is aborted automatically after a later failure", async (t) => {
+  // Recovery-acquisition control: the failure fires after the recovered
+  // reservation exists and before it publishes. The teardown must abort it
+  // before the tree removal.
+  if (!isPosixNonRoot()) {
+    t.skip("recovery-reservation control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test("injected failure after recovery acquisition", async (child) => {
+    await assert.rejects(
+      runAbortCleanupFixture(child, {
+        owned,
+        failAfterRecoveredReservation: true,
+      }),
+      /injected failure after the recovered reservation/u,
+    );
+  });
+  assertOwnedResourcesFinalized(owned);
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("the permission-recovery discovery service is closed automatically after a later failure", async (t) => {
+  // Recovery-acquisition control: the failure fires after the discovery
+  // service exists and before its inline close, so it is open when the
+  // child fails. The teardown must close it before the tree removal.
+  if (!isPosixNonRoot()) {
+    t.skip("recovery-service control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test(
+    "injected failure with the recovery service open",
+    async (child) => {
+      await assert.rejects(
+        runPermissionRecoveryFixture(child, {
+          owned,
+          failAfterDiscoveryService: true,
+        }),
+        /injected failure with the recovery service open/u,
+      );
+    },
+  );
+  assertOwnedResourcesFinalized(owned);
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
