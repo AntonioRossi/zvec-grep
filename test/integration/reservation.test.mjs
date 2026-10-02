@@ -835,24 +835,138 @@ test("an incomplete rollback preserves a foreign marker and releases the lock", 
 // idempotent so controls can await it directly after an injected failure.
 const probeInjections = new Map();
 
+function expectOwnedService(owned, service) {
+  // Control-side record, written at acquisition and independent of the
+  // teardown registration: removing a registration must not remove the
+  // control's expected resource.
+  (owned.expectedServices ??= []).push(service);
+}
+
 function trackOwnedService(owned, service) {
   owned.services.push(service);
+  observeOwnedClose(owned, service);
 }
 
 function markOwnedServiceClosed(owned, service) {
   owned.closedServices.add(service);
 }
 
+function expectOwnedReservation(owned, reservation) {
+  // Control-side record, independent of the teardown registration.
+  (owned.expectedReservations ??= []).push(reservation);
+}
+
 function trackOwnedReservation(owned, reservation) {
   owned.reservations.push(reservation);
+  observeOwnedAbort(owned, reservation);
+}
+
+// The observers wrap the real resource methods. A control therefore sees
+// the actual close or abort call, the resource identity, the phase and the
+// position of the call relative to the tree removal. Records that only
+// teardown writes never satisfy a control.
+function observeOwnedClose(owned, service) {
+  owned.closeCalls ??= new Map();
+  owned.operationLog ??= [];
+  if (owned.closeCalls.has(service)) {
+    return;
+  }
+  owned.closeCalls.set(service, 0);
+  const originalClose = service.close.bind(service);
+  service.close = async (...args) => {
+    let ok = true;
+    try {
+      return await originalClose(...args);
+    } catch (error) {
+      ok = false;
+      throw error;
+    } finally {
+      owned.closeCalls.set(service, owned.closeCalls.get(service) + 1);
+      owned.operationLog.push({
+        op: "close",
+        resource: service,
+        phase: owned.inTeardown ? "teardown" : "inline",
+        ok,
+      });
+    }
+  };
+}
+
+function observeOwnedAbort(owned, reservation) {
+  owned.abortCalls ??= new Map();
+  owned.operationLog ??= [];
+  if (owned.abortCalls.has(reservation)) {
+    return;
+  }
+  owned.abortCalls.set(reservation, 0);
+  const originalAbort = reservation.abort.bind(reservation);
+  reservation.abort = (...args) => {
+    let ok = true;
+    let result;
+    try {
+      result = originalAbort(...args);
+    } catch (error) {
+      ok = false;
+      throw error;
+    } finally {
+      owned.abortCalls.set(reservation, owned.abortCalls.get(reservation) + 1);
+      owned.operationLog.push({
+        op: "abort",
+        resource: reservation,
+        phase: owned.inTeardown ? "teardown" : "inline",
+        ok,
+      });
+    }
+    return result;
+  };
+}
+
+function assertOwnedResourcesFinalized(owned) {
+  // Every expected service must have one successful close call, and every
+  // expected reservation one successful abort call. Each call is observed
+  // on the real method and must be recorded before the tree removal, which
+  // would otherwise destroy the lock and staging evidence.
+  const log = owned.operationLog ?? [];
+  const treeIndex = log.findIndex((entry) => entry.op === "tree");
+  for (const service of owned.expectedServices ?? []) {
+    const closeIndex = log.findIndex(
+      (entry) => entry.op === "close" && entry.resource === service && entry.ok,
+    );
+    assert.ok(
+      closeIndex !== -1,
+      "each expected service was closed (observed on the real method)",
+    );
+    if (treeIndex !== -1) {
+      assert.ok(
+        closeIndex < treeIndex,
+        "each expected service was closed before the tree removal",
+      );
+    }
+  }
+  for (const reservation of owned.expectedReservations ?? []) {
+    const abortIndex = log.findIndex(
+      (entry) =>
+        entry.op === "abort" && entry.resource === reservation && entry.ok,
+    );
+    assert.ok(
+      abortIndex !== -1,
+      "each expected reservation was aborted (observed on the real method)",
+    );
+    if (treeIndex !== -1) {
+      assert.ok(
+        abortIndex < treeIndex,
+        "each expected reservation was aborted before the tree removal",
+      );
+    }
+  }
 }
 
 function ownReservationTeardown(t, owned) {
   owned.services = owned.services ?? [];
   owned.closedServices = owned.closedServices ?? new Set();
-  owned.closedByTeardown = owned.closedByTeardown ?? new Set();
   owned.reservations = owned.reservations ?? [];
   owned.abortResults = owned.abortResults ?? [];
+  owned.operationLog = owned.operationLog ?? [];
   // Registered immediately after temporary allocation, before any fallible
   // setup; the owned state grows as resources are acquired.
   const teardown = async () => {
@@ -860,6 +974,7 @@ function ownReservationTeardown(t, owned) {
       return;
     }
     owned.done = true;
+    owned.inTeardown = true;
     const errors = [];
     for (const entry of owned.protected ?? []) {
       try {
@@ -879,7 +994,6 @@ function ownReservationTeardown(t, owned) {
       try {
         await service.close();
         owned.closedServices.add(service);
-        owned.closedByTeardown.add(service);
       } catch (error) {
         errors.push(error);
       }
@@ -897,7 +1011,9 @@ function ownReservationTeardown(t, owned) {
     }
     try {
       await rm(owned.tempDir, { recursive: true, force: true });
+      owned.operationLog.push({ op: "tree", ok: true });
     } catch (error) {
+      owned.operationLog.push({ op: "tree", ok: false });
       errors.push(error);
     }
     if (errors.length > 0) {
@@ -959,6 +1075,7 @@ async function runRetainLockFixture(t, options = {}) {
       },
     },
   });
+  expectOwnedReservation(owned, reservation);
   trackOwnedReservation(owned, reservation);
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
@@ -1021,6 +1138,7 @@ async function runRetainLockFixture(t, options = {}) {
     root: join(parent, "destination"),
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, service);
   trackOwnedService(owned, service);
   await assert.rejects(
     service.context({ query: "anything", limit: 1 }),
@@ -1039,6 +1157,7 @@ async function runRetainLockFixture(t, options = {}) {
     operation: "test.recovery",
     existingIndexMarkers: ["manifest.json"],
   });
+  expectOwnedReservation(owned, recovered);
   trackOwnedReservation(owned, recovered);
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
@@ -1279,6 +1398,7 @@ async function runAbortCleanupFixture(t, options = {}) {
     root: parent,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, parentService);
   trackOwnedService(owned, parentService);
   await parentService.index();
   await parentService.close();
@@ -1294,6 +1414,7 @@ async function runAbortCleanupFixture(t, options = {}) {
     operation: "test.abort-cleanup",
     existingIndexMarkers: ["manifest.json"],
   });
+  expectOwnedReservation(owned, reservation);
   trackOwnedReservation(owned, reservation);
   if (options.failAfterReservation) {
     throw new Error("injected setup failure after reservation acquisition");
@@ -1357,6 +1478,7 @@ async function runAbortCleanupFixture(t, options = {}) {
     root: child,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, service);
   trackOwnedService(owned, service);
   await assert.rejects(
     service.context({ query: "ancestor content", limit: 3 }),
@@ -1377,6 +1499,7 @@ async function runAbortCleanupFixture(t, options = {}) {
     operation: "test.recovery",
     existingIndexMarkers: ["manifest.json"],
   });
+  expectOwnedReservation(owned, recovered);
   trackOwnedReservation(owned, recovered);
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
@@ -1406,6 +1529,7 @@ async function runPermissionRecoveryFixture(t, options = {}) {
     root: parent,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, parentService);
   trackOwnedService(owned, parentService);
   await parentService.index();
   await parentService.close();
@@ -1448,6 +1572,7 @@ async function runPermissionRecoveryFixture(t, options = {}) {
     },
   });
   owned.protected = [{ path: destinationHome, mode: 0o755 }];
+  expectOwnedReservation(owned, reservation);
   trackOwnedReservation(owned, reservation);
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
@@ -1507,6 +1632,7 @@ async function runPermissionRecoveryFixture(t, options = {}) {
     root: child,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, service);
   trackOwnedService(owned, service);
   await assert.rejects(
     service.context({ query: "ancestor content", limit: 3 }),
@@ -1523,6 +1649,7 @@ async function runPermissionRecoveryFixture(t, options = {}) {
     root: child,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, recovered);
   trackOwnedService(owned, recovered);
   const result = await recovered.context({
     query: "ancestor content",
@@ -1763,6 +1890,7 @@ test("retain-lock fixture fails as a probe failure and cleans up automatically",
     0,
     "no services were acquired before the failure",
   );
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("permission-recovery fixture fails as a probe failure and cleans up automatically", async (t) => {
@@ -1784,6 +1912,7 @@ test("permission-recovery fixture fails as a probe failure and cleans up automat
     probeInjections.delete("permission-recovery");
   }
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("an injected allowed probe outcome fails the guard and cleans up automatically", async (t) => {
@@ -1805,6 +1934,7 @@ test("an injected allowed probe outcome fails the guard and cleans up automatica
     probeInjections.delete("retainlock");
   }
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("an injected allowed probe outcome fails the permission-recovery guard too", async (t) => {
@@ -1826,6 +1956,7 @@ test("an injected allowed probe outcome fails the permission-recovery guard too"
     probeInjections.delete("permission-recovery");
   }
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("abort-cleanup probe failure cleans up the owned reservation automatically", async (t) => {
@@ -1847,16 +1978,7 @@ test("abort-cleanup probe failure cleans up the owned reservation automatically"
     probeInjections.delete("abort-cleanup");
   }
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
-  assert.equal(
-    owned.closedServices.size,
-    owned.services.length,
-    "every acquired service is closed",
-  );
-  assert.equal(
-    owned.abortResults.length,
-    owned.reservations.length,
-    "every tracked reservation was finalized",
-  );
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("an injected allowed probe outcome fails the abort-cleanup guard and cleans up automatically", async (t) => {
@@ -1881,6 +2003,7 @@ test("an injected allowed probe outcome fails the abort-cleanup guard and cleans
   }
   // The child finished. Teardown ran automatically. We do not call it.
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("a setup failure right after allocation cleans up automatically", async (t) => {
@@ -1909,6 +2032,7 @@ test("a setup failure after reservation acquisition cleans up automatically", as
     );
   });
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
 });
 
 test("a discovery service that stays open is closed by automatic teardown", async (t) => {
@@ -1930,32 +2054,40 @@ test("a discovery service that stays open is closed by automatic teardown", asyn
     );
   });
   // The child finished. The service was open when teardown started. The
-  // teardown must have closed it. We check this by identity.
+  // teardown must have closed it. We check this on the real method, by
+  // identity: the operation log records the close call and its phase.
   assert.equal(owned.services.length, 2, "both services are tracked");
   assert.equal(
     owned.closedServices.size,
     owned.services.length,
     "every tracked service is closed",
   );
+  const discovery = owned.services[1];
+  const discoveryClose = (owned.operationLog ?? []).find(
+    (entry) => entry.op === "close" && entry.resource === discovery && entry.ok,
+  );
   assert.ok(
-    owned.closedByTeardown.size >= 1,
-    "at least one service was closed by teardown, not inline",
+    discoveryClose,
+    "the open discovery service is closed (observed on the real method)",
+  );
+  assert.equal(
+    discoveryClose?.phase,
+    "teardown",
+    "the open discovery service is closed by teardown, not inline",
   );
   for (const service of owned.services) {
     assert.ok(owned.closedServices.has(service), "each service is closed");
   }
-  assert.equal(
-    owned.abortResults.length,
-    owned.reservations.length,
-    "every tracked reservation was finalized",
-  );
+  assertOwnedResourcesFinalized(owned);
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
 
 test("resource identities match the fixtures that created them", async (t) => {
   // Identity control: the abort-cleanup EIO failure tracks the parent
-  // service and the primary reservation, and the teardown finalizes the
-  // reservation by identity.
+  // service and the primary reservation. The parent service is closed
+  // inline before the injected probe error; the teardown finalizes the
+  // reservation after the failure. Both operations are observed on the
+  // real methods, by identity.
   const owned = {};
   const injected = new Error("injected probe failure");
   injected.code = "EIO";
@@ -1973,20 +2105,40 @@ test("resource identities match the fixtures that created them", async (t) => {
     probeInjections.delete("abort-cleanup");
   }
   assert.equal(owned.services.length, 1, "the parent service is tracked");
-  assert.equal(
-    owned.closedServices.size,
-    1,
-    "the parent service is closed by teardown",
+  assert.equal(owned.reservations.length, 1, "the reservation is tracked");
+  const log = owned.operationLog ?? [];
+  const parentClose = log.find(
+    (entry) =>
+      entry.op === "close" && entry.resource === owned.services[0] && entry.ok,
   );
   assert.ok(
-    owned.closedServices.has(owned.services[0]),
-    "the closure is by the same identity",
+    parentClose,
+    "the parent service is closed (observed on the real method)",
   );
-  assert.equal(owned.reservations.length, 1, "the reservation is tracked");
   assert.equal(
-    owned.abortResults.length,
-    1,
-    "the reservation was finalized exactly once",
+    parentClose?.phase,
+    "inline",
+    "the parent service is closed inline, before the injected probe error",
+  );
+  const reservationAbort = log.find(
+    (entry) =>
+      entry.op === "abort" &&
+      entry.resource === owned.reservations[0] &&
+      entry.ok,
+  );
+  assert.ok(
+    reservationAbort,
+    "the reservation is finalized (observed on the real method)",
+  );
+  assert.equal(
+    reservationAbort?.phase,
+    "teardown",
+    "the reservation is aborted by teardown, not inline",
+  );
+  const treeIndex = log.findIndex((entry) => entry.op === "tree");
+  assert.ok(
+    treeIndex !== -1 && log.indexOf(reservationAbort) < treeIndex,
+    "the reservation is finalized before the tree removal",
   );
   assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
