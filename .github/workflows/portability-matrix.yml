@@ -1,0 +1,67 @@
+name: Portability matrix (macos-latest)
+
+# Added on a review branch only (owner authorization, rounds 28 and 33):
+# the default branch is untouched. Push-triggered so the branch's own
+# workflow file fires on its push — no default-branch registration.
+# Scenarios are independent jobs with their own build prerequisite, so one
+# failing scenario cannot hide another's outcome.
+on:
+  push:
+    branches: ["review/portability-matrix-**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  filename-normalization:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Filename normalization coverage (real unit run on APFS)
+        run: >
+          node --test --test-concurrency=1
+          test/unit/canonical-path.test.mjs
+          test/unit/portable-scanner.test.mjs
+          test/unit/root-path-canonicalization.test.mjs
+  relocation:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Relocation probe
+        run: node scripts/portability-relocation.mjs
+  transfer:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Transfer probe (separate prepare/import processes)
+        run: |
+          node scripts/portability-transfer.mjs prepare
+          node scripts/portability-transfer.mjs import-verify
