@@ -164,6 +164,17 @@ zg --index \
   --allow-remote
 ```
 
+For Qwen text models, the Rust CLI accepts either a full Embedding endpoint or
+an OpenAI-compatible API base URL ending in `/v1` (with an optional trailing
+slash). For example, `https://example.com/compatible-mode/v1` resolves to
+`https://example.com/compatible-mode/v1/embeddings`. Authorization and index
+metadata use the resolved request URL. Complete endpoints and custom paths are
+preserved; this expansion does not apply to the Qwen VL endpoint.
+
+If an endpoint returns an empty or non-JSON HTTP error response, the error
+reports the HTTP status. For HTTP 404, check the endpoint and whether the model
+is available at that service.
+
 Credentials are resolved per session from explicit options, the environment,
 or the global provider configuration; they are never written into the
 workspace manifest. A copied or moved workspace index therefore contains no

@@ -10,6 +10,16 @@ import { inWorker } from "../helpers/glob-worker.mjs";
 import * as glob from "../../dist/engine/utils/glob.js";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 
+// Heavy-fixture geometry shared by the stall and ceiling workers: deep
+// nesting with 90-character components and a long file name keep glob
+// matching expensive while every created path stays within a budget every
+// supported platform accepts (macOS PATH_MAX is 1024 bytes including its
+// /var/folders/.../T temp prefix; 200-character components overflow it —
+// the 2026-09-29 macOS CI failures).
+const DEEP_DIR_A = "a".repeat(90);
+const LONG_FILE_FILLER = "g".repeat(160);
+const PORTABLE_PATH_BUDGET = 1000;
+
 test("glob matching preserves wildcard, directory, class, and brace semantics", () => {
   const cases = [
     ["*.ts", "src/main.ts", true],
@@ -127,7 +137,12 @@ test("glob complexity limits reject expensive inputs without hanging", async () 
     assert.equal(withGlobBudget(() => glob.ripgrepGlobMatches('**', 'a')), true);
   `,
     undefined,
-    10_000,
+    // The parent-thread external watchdog budget: coverage instrumentation
+    // on slower hosted runners stretches this suite past the 10s reference
+    // cap (8138ms locally under c8; fork CI run 36733381202 exceeded it).
+    // Scaled finitely for that environment; the watchdog itself, every
+    // assertion and the 3000-match workload are unchanged.
+    process.env.NODE_V8_COVERAGE ? 30_000 : 20_000,
   );
 });
 
@@ -484,11 +499,12 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
     const { join } = await import('node:path');
     let dir = workerData;
     for (let depth = 0; depth < 8; depth++) {
-      dir = join(dir, 'a'.repeat(200));
+      dir = join(dir, ${JSON.stringify(DEEP_DIR_A)});
+      assert.ok(dir.length + ${JSON.stringify("f" + LONG_FILE_FILLER + ".ts")}.length + 1 <= ${PORTABLE_PATH_BUDGET}, 'fixture path exceeds the portable budget: ' + dir.length);
       await mkdir(dir);
     }
-    await writeFile(join(dir, 'f' + 'g'.repeat(201) + '.ts'), 'export const a = 1;\\n');
-    const rules = Array.from({ length: 100 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
+    await writeFile(join(dir, 'f' + ${JSON.stringify(LONG_FILE_FILLER)} + '.ts'), 'export const a = 1;\\n');
+    const rules = Array.from({ length: 300 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
     async function maxHeartbeatGap(op) {
       let maxGap = 0; let last = Date.now();
@@ -508,10 +524,12 @@ test("candidate evaluation yields so heavy admitted rule sets cannot stall the l
       files = result.files.length;
     });
     assert.equal(files, 1);
-    // 100 rules x ~500k units ~= 49M, just under the 50M candidate ceiling:
-    // roughly half a second as one monolithic block on the reference system
-    // (recorded 542-563ms on the withdrawn head), timer-quantum gaps when
-    // chunked. 100ms separates the two reference behaviors.
+    // 300 heavy rules against ~900-character paths ~= 35M units, about 70%
+    // of the 50M candidate ceiling (calibrated 2026-09-30: admission holds to
+    // ~425 rules, the 250k active-rule weight caps admission near 500):
+    // admitted and chunked on this head (timer-quantum gaps), evaluated as
+    // one monolithic block well above the 100ms bound on the withdrawn head.
+    // Path geometry stays inside the portable budget asserted above.
     assert.ok(gap < 100, 'max event-loop block was ' + gap + 'ms');
   `,
     root,
@@ -673,7 +691,7 @@ test("budget refresh control and cancellation reason handling", async (t) => {
   );
 });
 
-test("adversarial 400-rule fixture rejects at the labeled candidate ceiling", async (t) => {
+test("adversarial 450-rule fixture rejects at the labeled candidate ceiling", async (t) => {
   const root = await createTemporaryDirectory(t, "zvec-glob-ceiling-");
   await inWorker(
     `
@@ -681,11 +699,16 @@ test("adversarial 400-rule fixture rejects at the labeled candidate ceiling", as
     const { join } = await import('node:path');
     let dir = workerData;
     for (let depth = 0; depth < 8; depth++) {
-      dir = join(dir, 'a'.repeat(200));
+      dir = join(dir, ${JSON.stringify(DEEP_DIR_A)});
+      assert.ok(dir.length + 'f.ts'.length + 1 <= ${PORTABLE_PATH_BUDGET}, 'fixture path exceeds the portable budget: ' + dir.length);
       await mkdir(dir);
     }
     await writeFile(join(dir, 'f.ts'), 'x');
-    const rules = Array.from({ length: 400 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
+    // 450 rules ~= 53M cumulative units, above the 50M candidate ceiling with
+    // margin for platform path-prefix differences, while staying below the
+    // 250k active-rule weight admission cap (calibrated 2026-09-30: ~425
+    // rules cross the ceiling; ~500 trip the rule-weight limit).
+    const rules = Array.from({ length: 450 }, (_, i) => '*a'.repeat(100) + '*Z' + i);
     await writeFile(join(workerData, '.gitignore'), rules.join('\\n') + '\\n');
     const { GlobWorkLimitError } = await import(${JSON.stringify(new URL("../../dist/engine/utils/glob-budget.js", import.meta.url).href)});
     // Responsiveness is measured as maximum event-loop delay during the
