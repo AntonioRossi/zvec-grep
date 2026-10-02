@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -94,8 +94,11 @@ test("engine writes bindings only into an inherited isolated home", async (t) =>
   }
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
+  // Bindings record the workspace's physical root (tryRealpathSync in
+  // src/engine/bindings.ts); compare that identity, not the raw spelling,
+  // so a symlinked temporary directory still matches.
   assert.ok(
-    roots.includes(root),
+    roots.includes(await realpath(root)),
     "the isolated home must carry a binding for this exact workspace",
   );
   const shadowZvec = await readdir(join(shadowHome, ".zvec-grep")).catch(
@@ -135,7 +138,7 @@ test("child inherits the isolated home, executes, and records the exact workspac
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
   assert.ok(
-    roots.includes(root),
+    roots.includes(await realpath(root)),
     "the isolated home must carry a binding for the parent-owned workspace",
   );
   const shadowZvec = await readdir(join(shadowHome, ".zvec-grep")).catch(
@@ -172,7 +175,7 @@ test("unset override writes to a disposable shadow home, never production", asyn
     join(shadowHome, ".zvec-grep", "bindings"),
   );
   assert.ok(
-    roots.includes(root),
+    roots.includes(await realpath(root)),
     "the disposable shadow home must carry a binding for the parent-owned workspace",
   );
 });
