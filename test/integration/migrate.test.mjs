@@ -21,6 +21,7 @@ import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import { physicallyUnder } from "../helpers/native-path.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
 useIsolatedZvecGrepHome();
@@ -71,8 +72,20 @@ async function copySourceFiles(sourceRoot, destinationRoot) {
   });
 }
 
+// Descriptor accounting reads /proc/self/fd. Only its absence (ENOENT —
+// the filesystem does not expose descriptors, e.g. Windows) makes this
+// Linux-only coverage unavailable; any other error propagates rather than
+// silently skipping the no-leak assertion. The close/reopen, cleanup and
+// retry assertions below carry the guarantee on every platform.
 function fdCount() {
-  return readdirSync("/proc/self/fd").length;
+  try {
+    return readdirSync("/proc/self/fd").length;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
 }
 
 test("migration converts a legacy index preserving vectors and relationships", async (t) => {
@@ -187,7 +200,8 @@ test("migration converts a legacy index preserving vectors and relationships", a
   assert.ok(search.items.length > 0);
   for (const item of search.items) {
     assert.ok(
-      (item.file?.absolutePath ?? "").startsWith(`${destinationRoot}/`),
+      item.file?.absolutePath !== undefined &&
+        physicallyUnder(item.file.absolutePath, destinationRoot),
       "destination must resolve under the migrated workspace",
     );
   }
@@ -286,7 +300,9 @@ test("migration cleans up handles and staging after interruption, and retries", 
       },
     }),
   );
-  assert.equal(fdCount(), fdsBefore, "no native descriptors may leak");
+  if (fdsBefore !== null) {
+    assert.equal(fdCount(), fdsBefore, "no native descriptors may leak");
+  }
   const homeEntriesAfterAbort = await readdir(
     join(destinationRoot, ".zvec-grep"),
   );

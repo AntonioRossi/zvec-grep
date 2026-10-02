@@ -32,6 +32,7 @@ import { detectFileType } from "../../../file-type.js";
 import { resolveMaxFileSizeBytes } from "../../../file-size-policy.js";
 import { EngineError } from "../../../errors.js";
 import {
+  canonicalFromRelative,
   canonicalRelativePath,
   createCanonicalPathResolver,
   findCanonicalNameCollisions,
@@ -244,6 +245,12 @@ async function scanRootPathsImpl(
   const files: FileInfo[] = [];
   const diagnostics = createScanDiagnostics();
   const knownFiles = knownFilesByPath(options.knownFiles);
+  const workspaceRealRoot =
+    options.workspaceRoot === undefined
+      ? undefined
+      : await realpath(options.workspaceRoot).catch(
+          () => options.workspaceRoot,
+        );
 
   for (const rootPath of validatedRootPaths) {
     throwIfAborted(options.signal);
@@ -255,6 +262,7 @@ async function scanRootPathsImpl(
       options.signal,
       knownFiles,
       options.workspaceRoot,
+      workspaceRealRoot,
     );
   }
 
@@ -461,6 +469,12 @@ async function scanDirectoryPathImpl(
   const files: FileInfo[] = [];
   const diagnostics = createScanDiagnostics();
   const knownFiles = knownFilesByPath(options.knownFiles);
+  const workspaceRealRoot =
+    options.workspaceRoot === undefined
+      ? undefined
+      : await realpath(options.workspaceRoot).catch(
+          () => options.workspaceRoot,
+        );
   for (const rootPath of matchingRootPaths(rootPaths, absolutePath)) {
     throwIfAborted(options.signal);
     const root = normalizeRootPath(rootPath);
@@ -532,6 +546,7 @@ async function scanDirectoryPathImpl(
       options.signal,
       knownFiles,
       options.workspaceRoot,
+      workspaceRealRoot,
     );
   }
   return { files: dedupeFiles(files), diagnostics };
@@ -673,6 +688,7 @@ async function scanRootPath(
   signal?: AbortSignal,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
   workspaceRoot?: string,
+  workspaceRealRoot?: string,
 ): Promise<void> {
   throwIfAborted(signal);
   const root = normalizeRootPath(rootPath);
@@ -741,6 +757,7 @@ async function scanRootPath(
     signal,
     knownFiles,
     workspaceRoot,
+    workspaceRealRoot,
   );
 }
 
@@ -814,6 +831,7 @@ async function walk(
   signal?: AbortSignal,
   knownFiles: ReadonlyMap<string, FileInfo> = new Map(),
   workspaceRoot?: string,
+  workspaceRealRoot?: string,
 ): Promise<void> {
   throwIfAborted(signal);
   let entries;
@@ -936,9 +954,12 @@ async function walk(
       if (!realDirectory || visitedDirectories.has(realDirectory)) {
         continue;
       }
+      // Containment compares resolved paths on both sides: the workspace
+      // root may be spelled through an alias (macOS /var, Windows short
+      // names) while realDirectory is always resolved.
       if (
-        workspaceRoot !== undefined &&
-        !isPathInside(workspaceRoot, realDirectory)
+        workspaceRealRoot !== undefined &&
+        !isPathInside(workspaceRealRoot, realDirectory)
       ) {
         continue;
       }
@@ -957,6 +978,7 @@ async function walk(
         signal,
         knownFiles,
         workspaceRoot,
+        workspaceRealRoot,
       );
       continue;
     }
@@ -1022,12 +1044,12 @@ async function walk(
     }
 
     if (
-      workspaceRoot !== undefined &&
+      workspaceRealRoot !== undefined &&
       entry.isSymbolicLink() &&
       rootPath.follow
     ) {
       const realFile = await realpath(absolutePath).catch(() => null);
-      if (realFile !== null && !isPathInside(workspaceRoot, realFile)) {
+      if (realFile !== null && !isPathInside(workspaceRealRoot, realFile)) {
         recordSkippedFile(diagnostics, {
           absolutePath,
           relativePath,
@@ -1575,6 +1597,32 @@ function escapeRegExp(value: string): string {
   return value.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
 }
 
+/**
+ * Canonical path of a scanned file derived from its root's canonical
+ * path and the file's logical position within the root, used when the
+ * caller's workspace spelling differs from the root's (alias) spelling
+ * and the textual comparison fails. The root's CRP already carries the
+ * alias normalization; the file keeps its logical spelling. A file at
+ * the workspace root itself is not a canonical file (unchanged).
+ */
+function canonicalPathFromRootCrp(
+  rootPath: RootPath,
+  absolutePath: string,
+): string | null {
+  const rootCrp = rootPath.canonicalPath;
+  if (rootCrp === undefined) {
+    return null;
+  }
+  const within = toDisplayPath(relative(rootPath.absolutePath, absolutePath));
+  if (within === "") {
+    return rootCrp === "." ? null : canonicalFromRelative(rootCrp);
+  }
+  if (isAbsolute(within) || within === ".." || within.startsWith("../")) {
+    return null;
+  }
+  return canonicalFromRelative(`${rootCrp}/${within}`);
+}
+
 async function readFileInfo(
   workspaceIndexId: string,
   rootPath: RootPath,
@@ -1598,7 +1646,9 @@ async function readFileInfo(
   let id: string;
   let canonicalFields: { canonicalPath?: string } = {};
   if (workspaceRoot !== undefined) {
-    const canonicalPath = canonicalRelativePath(workspaceRoot, absolutePath);
+    const canonicalPath =
+      canonicalRelativePath(workspaceRoot, absolutePath) ??
+      canonicalPathFromRootCrp(rootPath, absolutePath);
     if (canonicalPath === null) {
       recordSkippedFile(diagnostics, {
         absolutePath,

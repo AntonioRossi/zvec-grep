@@ -6,6 +6,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -17,6 +18,7 @@ import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { restoreIndexedMtime } from "../helpers/mtime.mjs";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import { endsWithRelative, physicallyUnder } from "../helpers/native-path.mjs";
 
 useIsolatedZvecGrepHome();
 
@@ -77,7 +79,7 @@ test("copied workspace resolves destinations at the new location", async (t) => 
   assert.ok(whileAExists.items.length > 0);
   for (const file of hitPaths(whileAExists)) {
     assert.ok(
-      file.startsWith(`${B}/`),
+      physicallyUnder(file, B),
       `destination must resolve under B: ${file}`,
     );
   }
@@ -91,7 +93,7 @@ test("copied workspace resolves destinations at the new location", async (t) => 
   });
   assert.ok(afterAGone.items.length > 0);
   for (const file of hitPaths(afterAGone)) {
-    assert.ok(file.startsWith(`${B}/`), `destination under B: ${file}`);
+    assert.ok(physicallyUnder(file, B), `destination under B: ${file}`);
   }
   await rename(`${A}-away`, A);
   await serviceB.close();
@@ -133,7 +135,7 @@ test("refresh after relocation reuses vectors with zero document embeddings", as
     `expected at most 1 document embedding, got ${modelB.counts.document}`,
   );
   for (const file of hitPaths(result)) {
-    assert.ok(file.startsWith(`${B}/`), `destination under B: ${file}`);
+    assert.ok(physicallyUnder(file, B), `destination under B: ${file}`);
   }
   await serviceB.close();
 });
@@ -178,7 +180,7 @@ test("coexisting copies are isolated: operations on B never touch A", async (t) 
     "A's manifest must not be modified by operations on B",
   );
   for (const file of hitPaths(bSearch)) {
-    assert.ok(!file.startsWith(`${A}/`), `B must not read A: ${file}`);
+    assert.ok(!physicallyUnder(file, A), `B must not read A: ${file}`);
   }
 
   // A still serves its own original content.
@@ -192,7 +194,7 @@ test("coexisting copies are isolated: operations on B never touch A", async (t) 
   });
   await serviceA2.close();
   for (const file of hitPaths(aSearch)) {
-    assert.ok(file.startsWith(`${A}/`), `A must serve A: ${file}`);
+    assert.ok(physicallyUnder(file, A), `A must serve A: ${file}`);
   }
 });
 
@@ -258,7 +260,7 @@ test("reconciliation detects changed content with unchanged size and mtime", asy
   const search = await serviceB.context({ query: "PORTABLE", limit: 3 });
   assert.ok(search.items.length > 0);
   assert.ok(
-    hitPaths(search).some((file) => file.endsWith("notes/plain.txt")),
+    hitPaths(search).some((file) => endsWithRelative(file, "notes/plain.txt")),
     "the same-stat edit must be searchable after reconciliation",
   );
   await serviceB.close();
@@ -299,7 +301,7 @@ test("edit, add, delete and rename behave incrementally without orphans", async 
     limit: 5,
   });
   assert.ok(
-    hitPaths(renamed).some((file) => file.endsWith("docs/renamed.md")),
+    hitPaths(renamed).some((file) => endsWithRelative(file, "docs/renamed.md")),
     "renamed file must be searchable",
   );
   const removed = await service.context({
@@ -307,7 +309,7 @@ test("edit, add, delete and rename behave incrementally without orphans", async 
     limit: 5,
   });
   assert.ok(
-    !hitPaths(removed).some((file) => file.endsWith("src/util.ts")),
+    !hitPaths(removed).some((file) => endsWithRelative(file, "src/util.ts")),
     "deleted file must not be searchable",
   );
   await service.close();
@@ -413,3 +415,47 @@ test("indexing never persists credentials or device in the manifest", async (t) 
     "http://127.0.0.1:9/embeddings",
   );
 });
+
+test("explicit index roots inherit persisted scoping through workspace aliases", async (t) => {
+  const parent = await createTemporaryDirectory(t, "zg-portable-scope-");
+  const physical = join(parent, "real", "repo");
+  await mkdir(join(physical, "src"), { recursive: true });
+  await writeFile(join(physical, "src", "inside.ts"), "export const I = 1;\n");
+  await symlink(join(parent, "real"), join(parent, "var"));
+
+  const model = new CountingEmbeddingModel();
+  const service = await createZvecGrep({
+    root: physical,
+    embeddingModel: model,
+  });
+  await service.index({
+    rootPaths: [{ absolutePath: physical, recursive: true, globs: ["src/**"] }],
+  });
+
+  // A caller addresses the same workspace through the alias spelling with
+  // an unscoped explicit root: the persisted scoping must be inherited,
+  // not silently replaced (hosted macOS e2e regression, round 34).
+  await writeFile(join(physical, "outside.ts"), "export const O = 2;\n");
+  const result = await service.index({
+    rootPaths: [{ absolutePath: join(parent, "var", "repo"), recursive: true }],
+  });
+  assert.equal(
+    result.filesAdded,
+    0,
+    "an out-of-scope file must not be indexed through an alias-spelled root",
+  );
+  const search = await service.context({
+    query: "O = 2",
+    route: "fts",
+    autoUpdate: false,
+  });
+  assert.ok(
+    hitPaths(search).every((file) => !endsWithRelativeFix(file, "outside.ts")),
+    "the out-of-scope file must not be searchable",
+  );
+  await service.close();
+});
+
+function endsWithRelativeFix(file, suffix) {
+  return file.split(/[\\/]/).join("/").endsWith(suffix);
+}

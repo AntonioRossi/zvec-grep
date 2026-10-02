@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -61,15 +68,30 @@ test("scanner rejects canonical name collisions", async (t) => {
   await mkdir(join(root, "docs"));
   await writeFile(join(root, "docs", `caf${NFC_E}.md`), "nfc");
   await writeFile(join(root, "docs", `caf${NFD_E}.md`), "nfd");
-
-  await assert.rejects(
-    () =>
-      scanRootPaths("index-id", [{ absolutePath: root, recursive: true }], {
-        workspaceRoot: root,
-      }),
-    (error) =>
-      error.code === "ZVEC_GREP.ENGINE.SCANNER.CANONICAL_NAME_COLLISION",
+  // Record the filesystem's actual entries: on normalization-folding
+  // filesystems (macOS APFS) the two spellings collapse into one entry
+  // and no collision exists to reject; the scan must then succeed with
+  // the single NFC-canonical file.
+  const entries = await readdir(join(root, "docs"));
+  if (entries.length === 2) {
+    await assert.rejects(
+      () =>
+        scanRootPaths("index-id", [{ absolutePath: root, recursive: true }], {
+          workspaceRoot: root,
+        }),
+      (error) =>
+        error.code === "ZVEC_GREP.ENGINE.SCANNER.CANONICAL_NAME_COLLISION",
+    );
+    return;
+  }
+  assert.equal(entries.length, 1);
+  const folded = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: root, recursive: true }],
+    { workspaceRoot: root },
   );
+  assert.equal(folded.files.length, 1);
+  assert.equal(folded.files[0].canonicalPath, `docs/caf${NFC_E}.md`);
 });
 
 test("followed symlinks escaping the workspace are excluded with diagnostics", async (t) => {
@@ -112,5 +134,82 @@ test("NFD filenames receive NFC canonical identities and resolve for reading", a
   assert.equal(
     result.files[0].id,
     makeFileId("index-id", `docs/caf${NFC_E}.md`),
+  );
+});
+
+test("scan descends into directories under an alias-spelled workspace root", async (t) => {
+  // Hosted regression (macOS /var vs /private/var, Windows short names):
+  // the caller spells root and workspaceRoot consistently through a parent
+  // alias, and the scanner must not compare resolved directories against
+  // the unresolved spelling.
+  const base = await mkdtemp(join(tmpdir(), "zg-scan-alias-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const physical = join(base, "real", "A");
+  await mkdir(join(physical, "docs"), { recursive: true });
+  await writeFile(join(physical, "docs", "one.md"), "# One\n");
+  await symlink(join(base, "real"), join(base, "var"), "dir");
+  const aliasRoot = join(base, "var", "A");
+
+  const result = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: aliasRoot, recursive: true }],
+    { workspaceRoot: aliasRoot },
+  );
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].canonicalPath, "docs/one.md");
+  assert.equal(result.files[0].id, makeFileId("index-id", "docs/one.md"));
+});
+
+test("followed contained symlinks are scanned under an alias-spelled workspace root", async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "zg-scan-alias-follow-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const physical = join(base, "real", "A");
+  await mkdir(physical, { recursive: true });
+  await writeFile(join(physical, "target.md"), "# Target\n");
+  await symlink(join(physical, "target.md"), join(physical, "link.md"));
+  await symlink(join(base, "real"), join(base, "var"), "dir");
+  const aliasRoot = join(base, "var", "A");
+
+  const result = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: aliasRoot, recursive: true, follow: true }],
+    { workspaceRoot: aliasRoot },
+  );
+  const followed = result.files.find((file) =>
+    file.relativePath.endsWith("link.md"),
+  );
+  assert.ok(followed, "contained followed symlink must not be skipped");
+  assert.equal(followed.canonicalPath, "link.md");
+});
+
+test("mixed-spelling scans keep canonical identities in both directions", async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "zg-scan-mixed-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const physical = join(base, "real", "A");
+  await mkdir(join(physical, "docs"), { recursive: true });
+  await writeFile(join(physical, "docs", "one.md"), "# One\n");
+  await symlink(join(base, "real"), join(base, "var"), "dir");
+  const alias = join(base, "var", "A");
+
+  const rootViaAlias = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: join(alias, "docs"), recursive: true }],
+    { workspaceRoot: physical },
+  );
+  assert.equal(rootViaAlias.files.length, 1);
+  assert.equal(rootViaAlias.files[0].canonicalPath, "docs/one.md");
+  assert.equal(rootViaAlias.files[0].id, makeFileId("index-id", "docs/one.md"));
+
+  const workspaceViaAlias = await scanRootPaths(
+    "index-id",
+    [{ absolutePath: join(physical, "docs"), recursive: true }],
+    { workspaceRoot: alias },
+  );
+  assert.equal(workspaceViaAlias.files.length, 1);
+  assert.equal(workspaceViaAlias.files[0].canonicalPath, "docs/one.md");
+  assert.equal(
+    workspaceViaAlias.files[0].id,
+    rootViaAlias.files[0].id,
+    "identity must not depend on which side carries the alias spelling",
   );
 });

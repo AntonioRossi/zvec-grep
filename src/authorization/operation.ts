@@ -48,7 +48,7 @@ export function remoteEmbeddingAuthorizationGuard(
       permit.target.model !== request.model ||
       permit.target.endpoint !== request.endpoint
     ) {
-      throw authorizationRequiredError(request);
+      throw authorizationRequiredError(request, permit);
     }
     if (
       permit.scope === "workspace" &&
@@ -56,6 +56,7 @@ export function remoteEmbeddingAuthorizationGuard(
     ) {
       throw authorizationRequiredError(
         request,
+        permit,
         "Workspace grant is missing, invalid, or revoked.",
       );
     }
@@ -64,6 +65,7 @@ export function remoteEmbeddingAuthorizationGuard(
 
 function authorizationRequiredError(
   request: RemoteEmbeddingRequest,
+  permit?: RemoteEmbeddingOperationPermit,
   detail?: string,
 ): EngineError {
   return new EngineError("Remote Embedding authorization is required", {
@@ -73,6 +75,9 @@ function authorizationRequiredError(
       `model=${request.model}`,
       `endpoint=${request.endpoint}`,
       `purpose=${request.purpose}`,
+      permit
+        ? `permit=${permit.target.provider}/${permit.target.model}/${permit.target.endpoint} scope=${permit.scope}`
+        : "permit=none",
       ...(detail ? [`detail=${detail}`] : []),
     ].join(" "),
   });

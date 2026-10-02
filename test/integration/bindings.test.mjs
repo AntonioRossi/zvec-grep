@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  readdir,
   cp,
   mkdir,
   readFile,
@@ -205,15 +206,39 @@ test("invalidation propagates access failures and never silently keeps trust", a
   assert.equal(store.matches(manifest.id, root), true);
 
   // With the workspace unreadable, invalidation must fail loudly instead of
-  // reporting a revocation that never happened.
+  // reporting a revocation that never happened. Whether mode bits deny the
+  // owner's read is a platform capability, measured independently here;
+  // unexpected probe errors propagate rather than passing as advisory.
   const { chmod } = await import("node:fs/promises");
+  const { probeDenial, assertDenialInducible } =
+    await import("../helpers/permission-probe.mjs");
   await chmod(parent, 0o000);
   try {
-    assert.throws(
-      () => store.invalidate(manifest.id, root),
-      /EACCES|permission denied/i,
-      "an access failure during invalidation must propagate",
+    const denied =
+      (await probeDenial(t, "bindings.invalidate:readdir-parent", () =>
+        readdir(parent),
+      )) === "denied";
+    t.diagnostic(
+      `permission-branch operation=bindings.invalidate branch=${
+        denied ? "strict" : "advisory"
+      }`,
     );
+    assertDenialInducible(
+      t,
+      "bindings.invalidate",
+      denied ? "denied" : "allowed",
+    );
+    if (denied) {
+      assert.throws(
+        () => store.invalidate(manifest.id, root),
+        /EACCES|permission denied/i,
+        "an access failure during invalidation must propagate",
+      );
+    } else {
+      // Advisory mode bits (Windows): nothing is denied, so invalidation
+      // must keep working rather than fail.
+      store.invalidate(manifest.id, root);
+    }
   } finally {
     await chmod(parent, 0o755);
   }
@@ -275,7 +300,14 @@ test("distinct NFC and NFD workspace roots never share a binding", async (t) => 
   await serviceNfc.index();
   await serviceNfc.close();
 
-  // The siblings are physically different directories.
+  // The siblings are physically different directories — except on
+  // normalization-folding filesystems (macOS APFS), where the two
+  // spellings collapse into one entry and "distinct roots" cannot exist.
+  // Record that capability: the binding-separation requirement below is
+  // only testable where the siblings are distinct.
+  if ((await stat(nfdRoot)).ino === (await stat(nfcRoot)).ino) {
+    return;
+  }
   assert.notEqual((await stat(nfdRoot)).ino, (await stat(nfcRoot)).ino);
 
   // Copy the verified index (same UUID) to the NFD sibling and change one

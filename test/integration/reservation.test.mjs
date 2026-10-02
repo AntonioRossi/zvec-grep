@@ -4,6 +4,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readlinkSync,
   renameSync,
   rmSync,
@@ -26,6 +27,12 @@ import { createZvecGrep } from "../../dist/index.js";
 import { createTemporaryDirectory } from "../helpers/fixtures.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { useIsolatedZvecGrepHome } from "../helpers/isolated-home.mjs";
+import {
+  assertDenialInducible,
+  guardedSyncPermissionProbe,
+  isPosixNonRoot,
+  probeDenial,
+} from "../helpers/permission-probe.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
 
 useIsolatedZvecGrepHome();
@@ -820,10 +827,222 @@ test("an incomplete rollback preserves a foreign marker and releases the lock", 
   assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
 });
 
-test("an incomplete rollback with an unrestorable marker retains the write lock", async (t) => {
-  const parent = await createTemporaryDirectory(t, "zg-reserve-retainlock-");
+// Fixture-owned, explicitly ordered teardown: restore known protected
+// paths, finalize the owned reservation (abort's result is inspected — a
+// diagnostic string means incomplete cleanup and is surfaced), then remove
+// the temporary tree. Registered as soon as resources are owned and the
+// fixture's automatic removal is disabled; the returned function is
+// idempotent so controls can await it directly after an injected failure.
+const probeInjections = new Map();
+
+function expectOwnedService(owned, service) {
+  // Control-side record, written at acquisition and independent of the
+  // teardown registration: removing a registration must not remove the
+  // control's expected resource.
+  (owned.expectedServices ??= []).push(service);
+}
+
+function trackOwnedService(owned, service) {
+  owned.services.push(service);
+  observeOwnedClose(owned, service);
+}
+
+function markOwnedServiceClosed(owned, service) {
+  owned.closedServices.add(service);
+}
+
+function expectOwnedReservation(owned, reservation) {
+  // Control-side record, independent of the teardown registration.
+  (owned.expectedReservations ??= []).push(reservation);
+}
+
+function trackOwnedReservation(owned, reservation) {
+  owned.reservations.push(reservation);
+  observeOwnedAbort(owned, reservation);
+}
+
+// The observers wrap the real resource methods. A control therefore sees
+// the actual close or abort call, the resource identity, the phase and the
+// position of the call relative to the tree removal. Records that only
+// teardown writes never satisfy a control.
+function observeOwnedClose(owned, service) {
+  owned.closeCalls ??= new Map();
+  owned.operationLog ??= [];
+  if (owned.closeCalls.has(service)) {
+    return;
+  }
+  owned.closeCalls.set(service, 0);
+  const originalClose = service.close.bind(service);
+  service.close = async (...args) => {
+    let ok = true;
+    try {
+      return await originalClose(...args);
+    } catch (error) {
+      ok = false;
+      throw error;
+    } finally {
+      owned.closeCalls.set(service, owned.closeCalls.get(service) + 1);
+      owned.operationLog.push({
+        op: "close",
+        resource: service,
+        phase: owned.inTeardown ? "teardown" : "inline",
+        ok,
+      });
+    }
+  };
+}
+
+function observeOwnedAbort(owned, reservation) {
+  owned.abortCalls ??= new Map();
+  owned.operationLog ??= [];
+  if (owned.abortCalls.has(reservation)) {
+    return;
+  }
+  owned.abortCalls.set(reservation, 0);
+  const originalAbort = reservation.abort.bind(reservation);
+  reservation.abort = (...args) => {
+    let ok = true;
+    let result;
+    try {
+      result = originalAbort(...args);
+    } catch (error) {
+      ok = false;
+      throw error;
+    } finally {
+      owned.abortCalls.set(reservation, owned.abortCalls.get(reservation) + 1);
+      owned.operationLog.push({
+        op: "abort",
+        resource: reservation,
+        phase: owned.inTeardown ? "teardown" : "inline",
+        ok,
+      });
+    }
+    return result;
+  };
+}
+
+function assertOwnedResourcesFinalized(owned) {
+  // Every expected service must have one successful close call, and every
+  // expected reservation one successful abort call. Each call is observed
+  // on the real method and must be recorded before the tree removal, which
+  // would otherwise destroy the lock and staging evidence.
+  const log = owned.operationLog ?? [];
+  const treeIndex = log.findIndex((entry) => entry.op === "tree");
+  for (const service of owned.expectedServices ?? []) {
+    const closeIndex = log.findIndex(
+      (entry) => entry.op === "close" && entry.resource === service && entry.ok,
+    );
+    assert.ok(
+      closeIndex !== -1,
+      "each expected service was closed (observed on the real method)",
+    );
+    if (treeIndex !== -1) {
+      assert.ok(
+        closeIndex < treeIndex,
+        "each expected service was closed before the tree removal",
+      );
+    }
+  }
+  for (const reservation of owned.expectedReservations ?? []) {
+    const abortIndex = log.findIndex(
+      (entry) =>
+        entry.op === "abort" && entry.resource === reservation && entry.ok,
+    );
+    assert.ok(
+      abortIndex !== -1,
+      "each expected reservation was aborted (observed on the real method)",
+    );
+    if (treeIndex !== -1) {
+      assert.ok(
+        abortIndex < treeIndex,
+        "each expected reservation was aborted before the tree removal",
+      );
+    }
+  }
+}
+
+function ownReservationTeardown(t, owned) {
+  owned.services = owned.services ?? [];
+  owned.closedServices = owned.closedServices ?? new Set();
+  owned.reservations = owned.reservations ?? [];
+  owned.abortResults = owned.abortResults ?? [];
+  owned.operationLog = owned.operationLog ?? [];
+  // Registered immediately after temporary allocation, before any fallible
+  // setup; the owned state grows as resources are acquired.
+  const teardown = async () => {
+    if (owned.done) {
+      return;
+    }
+    owned.done = true;
+    owned.inTeardown = true;
+    const errors = [];
+    for (const entry of owned.protected ?? []) {
+      try {
+        if (existsSync(entry.path)) {
+          chmodSync(entry.path, entry.mode);
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    for (const service of owned.services ?? []) {
+      // Close only services that are still open. A service that the test
+      // body closed successfully is marked in owned.closedServices.
+      if (owned.closedServices.has(service)) {
+        continue;
+      }
+      try {
+        await service.close();
+        owned.closedServices.add(service);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    for (const reservation of owned.reservations) {
+      try {
+        const result = reservation.abort();
+        owned.abortResults.push(result ?? null);
+        if (result !== undefined && result !== null) {
+          t.diagnostic(`teardown abort reported incomplete cleanup: ${result}`);
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
+      await rm(owned.tempDir, { recursive: true, force: true });
+      owned.operationLog.push({ op: "tree", ok: true });
+    } catch (error) {
+      owned.operationLog.push({ op: "tree", ok: false });
+      errors.push(error);
+    }
+    if (errors.length > 0) {
+      throw new Error(
+        `fixture teardown failed: ${errors.map((e) => e.message).join("; ")}`,
+      );
+    }
+  };
+  t.after(teardown);
+  return teardown;
+}
+
+async function runRetainLockFixture(t, options = {}) {
+  const owned = options.owned ?? {};
+  const parent = await createTemporaryDirectory(t, "zg-reserve-retainlock-", {
+    cleanup: false,
+  });
+  owned.tempDir = parent;
+  owned.services = [];
+  owned.teardown = ownReservationTeardown(t, owned);
   const destinationHome = join(parent, "destination", ".zvec-grep");
   await mkdir(join(parent, "destination"), { recursive: true });
+  owned.protected = [{ path: destinationHome, mode: 0o755 }];
+  // Whether mode bits can make the home unwritable is a platform
+  // capability, measured independently inside the hook. An unexpected
+  // probe error is captured and rethrown by the test as a probe failure —
+  // publication error handling must not reinterpret it.
+  let homeUnwritable = false;
+  let retainLockProbeFailure;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.retainlock",
@@ -834,18 +1053,61 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
         // cannot move the child back and the marker cannot be restored.
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o555);
+        try {
+          // Injections replace the filesystem attempt and flow through the
+          // same classifier and required-denial guard as the real path.
+          const attempt = probeInjections.get("retainlock");
+          const outcome = guardedSyncPermissionProbe(
+            t,
+            "reservation.retainlock:write-home",
+            attempt ??
+              (() => writeFileSync(join(destinationHome, ".write-probe"), "")),
+            attempt ? "injected" : "real",
+          );
+          if (outcome === "allowed") {
+            rmSync(join(destinationHome, ".write-probe"), { force: true });
+          }
+          homeUnwritable = outcome === "denied";
+        } catch (error) {
+          retainLockProbeFailure = error;
+          throw error;
+        }
       },
     },
   });
+  expectOwnedReservation(owned, reservation);
+  trackOwnedReservation(owned, reservation);
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
-  assert.throws(
-    () => reservation.publish(() => undefined),
-    /retained as the last block/i,
-  );
+  try {
+    reservation.publish(() => undefined);
+    assert.fail("publication must fail");
+  } catch (error) {
+    if (retainLockProbeFailure) {
+      throw retainLockProbeFailure;
+    }
+    assert.match(String(error), /unexpectedly absent/i);
+  }
   // The unwritable home was only needed to fail the rollback and restore;
   // restore permissions before assertions and cleanup.
   chmodSync(destinationHome, 0o755);
+
+  if (!homeUnwritable) {
+    // Advisory mode bits: the intended fault never occurred; the engine
+    // detects the vanished marker and rolls the publication back
+    // completely, restoring the blockage (the "publication fails when
+    // the marker vanishes" behavior).
+    const marker = JSON.parse(
+      await readFile(join(destinationHome, "INCOMPLETE"), "utf8"),
+    );
+    assert.equal(marker.operation, "rollback-block");
+    assert.equal(
+      await readFile(join(reservation.stagingHome, "payload.txt"), "utf8"),
+      "ours",
+    );
+    assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
+    return;
+  }
 
   // The write lock is retained as the last block; nothing else was written.
   const lockInfo = JSON.parse(
@@ -876,11 +1138,14 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
     root: join(parent, "destination"),
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, service);
+  trackOwnedService(owned, service);
   await assert.rejects(
     service.context({ query: "anything", limit: 1 }),
     (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
   );
   await service.close();
+  markOwnedServiceClosed(owned, service);
 
   // Documented operator recovery: quiesce writers, remove the lock directory
   // and the partial contents; publication then succeeds.
@@ -892,10 +1157,19 @@ test("an incomplete rollback with an unrestorable marker retains the write lock"
     operation: "test.recovery",
     existingIndexMarkers: ["manifest.json"],
   });
+  expectOwnedReservation(owned, recovered);
+  trackOwnedReservation(owned, recovered);
+  if (options.failAfterRecoveredReservation) {
+    throw new Error("injected failure after the recovered reservation");
+  }
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
-});
+  return owned;
+}
+
+test("an incomplete rollback with an unrestorable marker retains the write lock", (t) =>
+  runRetainLockFixture(t));
 
 test("publication rejects a dangling destination child without overwriting it", async (t) => {
   const parent = await createTemporaryDirectory(t, "zg-reserve-dangling-");
@@ -1104,9 +1378,18 @@ test("a complete rollback with an unreadable marker stays blocked with a live an
   await service.close();
 });
 
-test("abort with an unremovable staging payload preserves blockage and reports it", async (t) => {
+async function runAbortCleanupFixture(t, options = {}) {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-  const parent = await createTemporaryDirectory(t, "zg-reserve-abortcleanup-");
+  const owned = options.owned ?? {};
+  const parent = await createTemporaryDirectory(t, "zg-reserve-abortcleanup-", {
+    cleanup: false,
+  });
+  owned.tempDir = parent;
+  owned.services = [];
+  owned.teardown = ownReservationTeardown(t, owned);
+  if (options.failDuringSetup) {
+    throw new Error("injected setup failure before any further acquisition");
+  }
 
   // Live ancestor index.
   await mkdir(join(parent, "docs"), { recursive: true });
@@ -1118,8 +1401,11 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     root: parent,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, parentService);
+  trackOwnedService(owned, parentService);
   await parentService.index();
   await parentService.close();
+  markOwnedServiceClosed(owned, parentService);
 
   const child = join(parent, "child");
   const destinationHome = join(child, ".zvec-grep");
@@ -1131,6 +1417,11 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     operation: "test.abort-cleanup",
     existingIndexMarkers: ["manifest.json"],
   });
+  expectOwnedReservation(owned, reservation);
+  trackOwnedReservation(owned, reservation);
+  if (options.failAfterReservation) {
+    throw new Error("injected setup failure after reservation acquisition");
+  }
   // Real permission failure, no syscall mocking: a read-only staged
   // subdirectory cannot be emptied, so recursive staging removal fails.
   const protectedDir = join(reservation.stagingHome, "protected");
@@ -1139,20 +1430,46 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     join(protectedDir, "payload.txt"),
     "owned recoverable payload",
   );
+  owned.protected = [{ path: protectedDir, mode: 0o700 }];
   chmodSync(protectedDir, 0o500);
-  const unlinkControl = await import("node:fs/promises").then((fs) =>
-    fs.unlink(join(protectedDir, "payload.txt")).catch((error) => error.code),
+  const fs = await import("node:fs/promises");
+  const injectedAttempt = probeInjections.get("abort-cleanup");
+  const unlinkOutcome = await probeDenial(
+    t,
+    "reservation.abort-cleanup:unlink-payload",
+    injectedAttempt ?? (() => fs.unlink(join(protectedDir, "payload.txt"))),
+    injectedAttempt ? "injected" : "real",
   );
-  assert.equal(unlinkControl, "EACCES");
+  const unlinkControl = unlinkOutcome === "denied" ? "EACCES" : undefined;
+  t.diagnostic(
+    `permission-branch operation=reservation.abort-cleanup branch=${
+      unlinkOutcome === "denied" ? "strict" : "advisory"
+    }`,
+  );
+  assertDenialInducible(t, "reservation.abort-cleanup", unlinkOutcome);
 
   const cleanup = reservation.abort();
   // Restore normal access before any discovery check: permission failure
   // itself must not be mistaken for persistent protection.
-  chmodSync(protectedDir, 0o700);
+  if (existsSync(protectedDir)) {
+    chmodSync(protectedDir, 0o700);
+  }
 
-  // The cleanup failure is reported, the payload remains, the marker is
+  if (unlinkControl !== "EACCES") {
+    // Advisory mode bits: the staged payload is removable, so the cleanup
+    // completes — staging is emptied and the blockage lifts.
+    assert.equal(cleanup, undefined);
+    assert.ok(!existsSync(protectedDir));
+    assert.ok(!existsSync(join(destinationHome, "INCOMPLETE")));
+    assert.ok(!existsSync(join(destinationHome, "locks", "home.write")));
+    return;
+  }
+
+  // The cleanup failure is reported (the errno is the platform's cleanup
+  // failure: EACCES from the denied unlink on Linux, ENOTEMPTY from
+  // macOS's recursive removal), the payload remains, the marker is
   // preserved as blockage, and the lock is released against it.
-  assert.match(cleanup, /could not be removed \(EACCES\)/i);
+  assert.match(cleanup, /could not be removed \((EACCES|ENOTEMPTY)\)/i);
   assert.match(cleanup, /blocked by the INCOMPLETE marker/i);
   assert.ok(existsSync(join(protectedDir, "payload.txt")));
   assert.ok(existsSync(join(destinationHome, "INCOMPLETE")));
@@ -1164,11 +1481,17 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     root: child,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, service);
+  trackOwnedService(owned, service);
   await assert.rejects(
     service.context({ query: "ancestor content", limit: 3 }),
     /incomplete|INCOMPLETE/i,
   );
+  if (options.failAfterDiscoveryService) {
+    throw new Error("injected failure with the discovery service open");
+  }
   await service.close();
+  markOwnedServiceClosed(owned, service);
 
   // Documented operator recovery: remove the marker and partial contents,
   // then the workspace publishes normally.
@@ -1179,14 +1502,29 @@ test("abort with an unremovable staging payload preserves blockage and reports i
     operation: "test.recovery",
     existingIndexMarkers: ["manifest.json"],
   });
+  expectOwnedReservation(owned, recovered);
+  trackOwnedReservation(owned, recovered);
+  if (options.failAfterRecoveredReservation) {
+    throw new Error("injected failure after the recovered reservation");
+  }
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
-});
+  return owned;
+}
 
-test("a permission failure retains the write lock and operator recovery restores the workspace", async (t) => {
+test("abort with an unremovable staging payload preserves blockage and reports it", (t) =>
+  runAbortCleanupFixture(t));
+
+async function runPermissionRecoveryFixture(t, options = {}) {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-  const parent = await createTemporaryDirectory(t, "zg-reserve-permrec-");
+  const owned = options.owned ?? {};
+  const parent = await createTemporaryDirectory(t, "zg-reserve-permrec-", {
+    cleanup: false,
+  });
+  owned.tempDir = parent;
+  owned.services = [];
+  owned.teardown = ownReservationTeardown(t, owned);
 
   await mkdir(join(parent, "docs"), { recursive: true });
   await writeFile(
@@ -1197,8 +1535,11 @@ test("a permission failure retains the write lock and operator recovery restores
     root: parent,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, parentService);
+  trackOwnedService(owned, parentService);
   await parentService.index();
   await parentService.close();
+  markOwnedServiceClosed(owned, parentService);
 
   const child = join(parent, "child");
   const destinationHome = join(child, ".zvec-grep");
@@ -1208,6 +1549,10 @@ test("a permission failure retains the write lock and operator recovery restores
   // the lock metadata, so even the release path refuses deletion. This
   // fixture cannot distinguish the marker decision itself — that is the
   // pinned marker-only inspection probe's role (validation evidence).
+  // Whether mode bits can make the home unreadable is a platform
+  // capability, measured independently inside the hook.
+  let homeUnreadable = false;
+  let permRecProbeFailure;
   const reservation = reserveDestination({
     destinationHome,
     operation: "test.permission-recovery",
@@ -1216,17 +1561,65 @@ test("a permission failure retains the write lock and operator recovery restores
       afterChildMove() {
         rmSync(join(destinationHome, "INCOMPLETE"));
         chmodSync(destinationHome, 0o000);
+        try {
+          const attempt = probeInjections.get("permission-recovery");
+          const outcome = guardedSyncPermissionProbe(
+            t,
+            "reservation.permission-recovery:readdir-home",
+            attempt ?? (() => readdirSync(destinationHome)),
+            attempt ? "injected" : "real",
+          );
+          homeUnreadable = outcome === "denied";
+        } catch (error) {
+          permRecProbeFailure = error;
+          throw error;
+        }
       },
     },
   });
+  owned.protected = [{ path: destinationHome, mode: 0o755 }];
+  expectOwnedReservation(owned, reservation);
+  trackOwnedReservation(owned, reservation);
   await writeFile(join(reservation.stagingHome, "payload.txt"), "ours");
 
-  assert.throws(
-    () => reservation.publish(() => undefined),
-    /retained as the last block/i,
+  let publishError;
+  try {
+    reservation.publish(() => undefined);
+  } catch (error) {
+    publishError = error;
+  }
+  if (permRecProbeFailure) {
+    throw permRecProbeFailure;
+  }
+  assert.ok(publishError, "publication must fail");
+  // Denied mode bits make the marker uninspectable ("ownership was lost";
+  // retained lock); advisory mode bits leave the marker visibly absent
+  // ("unexpectedly absent"; complete rollback). The outcome decides.
+  assert.match(
+    String(publishError),
+    homeUnreadable ? /retained as the last block/i : /unexpectedly absent/i,
   );
   // Restore normal access before any discovery check.
   chmodSync(destinationHome, 0o755);
+
+  if (!homeUnreadable) {
+    // Advisory mode bits: the intended fault never occurred; the engine
+    // rolls the publication back completely and restores the blockage
+    // (the "publication fails when the marker vanishes" behavior). The
+    // retained-lock and ancestor-recovery coverage below stays on the
+    // denied branch; the rollback-interference path is deterministic via
+    // the vanished-marker test.
+    const marker = JSON.parse(
+      await readFile(join(destinationHome, "INCOMPLETE"), "utf8"),
+    );
+    assert.equal(marker.operation, "rollback-block");
+    assert.equal(
+      await readFile(join(reservation.stagingHome, "payload.txt"), "utf8"),
+      "ours",
+    );
+    assert.throws(() => readWorkspaceManifest(destinationHome), /incomplete/i);
+    return;
+  }
 
   // The lock is retained, the marker is absent, the payload remains at the
   // destination, and writers and discovery stay denied with a live ancestor.
@@ -1245,11 +1638,17 @@ test("a permission failure retains the write lock and operator recovery restores
     root: child,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, service);
+  trackOwnedService(owned, service);
+  if (options.failAfterDiscoveryService) {
+    throw new Error("injected failure with the recovery service open");
+  }
   await assert.rejects(
     service.context({ query: "ancestor content", limit: 3 }),
     (error) => error.code === "ZVEC_GREP.ENGINE.LOCK.BUSY",
   );
   await service.close();
+  markOwnedServiceClosed(owned, service);
 
   // Documented operator recovery: quiesce writers, remove the lock directory
   // and the partial contents; the workspace then serves the ancestor again.
@@ -1259,6 +1658,8 @@ test("a permission failure retains the write lock and operator recovery restores
     root: child,
     embeddingModel: new FakeEmbeddingModel(),
   });
+  expectOwnedService(owned, recovered);
+  trackOwnedService(owned, recovered);
   const result = await recovered.context({
     query: "ancestor content",
     limit: 3,
@@ -1268,7 +1669,12 @@ test("a permission failure retains the write lock and operator recovery restores
     "after recovery the ancestor serves again",
   );
   await recovered.close();
-});
+  markOwnedServiceClosed(owned, recovered);
+  return owned;
+}
+
+test("a permission failure retains the write lock and operator recovery restores the workspace", (t) =>
+  runPermissionRecoveryFixture(t));
 
 test("abort preserves a staging symlink alias and the moved-aside payload", async (t) => {
   ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
@@ -1465,4 +1871,354 @@ test("a normal abort cleans up completely and releases the workspace", async (t)
   writeFileSync(join(recovered.stagingHome, "manifest.json"), "{}");
   recovered.publish(() => undefined);
   assert.ok(existsSync(join(destinationHome, "manifest.json")));
+});
+
+test("retain-lock fixture fails as a probe failure and cleans up automatically", async (t) => {
+  const owned = {};
+  const injected = new Error("injected probe failure");
+  injected.code = "EIO";
+  probeInjections.set("retainlock", () => {
+    throw injected;
+  });
+  try {
+    await t.test("injected child failure", async (child) => {
+      await assert.rejects(
+        runRetainLockFixture(child, { owned }),
+        (error) => error === injected,
+        "the injected probe error must win over publication error handling",
+      );
+    });
+  } finally {
+    probeInjections.delete("retainlock");
+  }
+  // The child finished; its registered teardown must have run. Teardown is
+  // never invoked manually before these assertions.
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assert.equal(
+    owned.services.length,
+    0,
+    "no services were acquired before the failure",
+  );
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("permission-recovery fixture fails as a probe failure and cleans up automatically", async (t) => {
+  const owned = {};
+  const injected = new Error("injected probe failure");
+  injected.code = "EIO";
+  probeInjections.set("permission-recovery", () => {
+    throw injected;
+  });
+  try {
+    await t.test("injected child failure", async (child) => {
+      await assert.rejects(
+        runPermissionRecoveryFixture(child, { owned }),
+        (error) => error === injected,
+        "the injected probe error must win over publication error handling",
+      );
+    });
+  } finally {
+    probeInjections.delete("permission-recovery");
+  }
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("an injected allowed probe outcome fails the guard and cleans up automatically", async (t) => {
+  if (!isPosixNonRoot()) {
+    t.skip("guard control requires a non-root POSIX environment");
+    return;
+  }
+  const owned = {};
+  probeInjections.set("retainlock", () => undefined);
+  try {
+    await t.test("injected allowed child failure", async (child) => {
+      await assert.rejects(
+        runRetainLockFixture(child, { owned }),
+        /precondition failure/u,
+        "the required-denial guard must fail the fixture",
+      );
+    });
+  } finally {
+    probeInjections.delete("retainlock");
+  }
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("an injected allowed probe outcome fails the permission-recovery guard too", async (t) => {
+  if (!isPosixNonRoot()) {
+    t.skip("guard control requires a non-root POSIX environment");
+    return;
+  }
+  const owned = {};
+  probeInjections.set("permission-recovery", () => undefined);
+  try {
+    await t.test("injected allowed child failure", async (child) => {
+      await assert.rejects(
+        runPermissionRecoveryFixture(child, { owned }),
+        /precondition failure/u,
+        "the required-denial guard must fail the fixture",
+      );
+    });
+  } finally {
+    probeInjections.delete("permission-recovery");
+  }
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("abort-cleanup probe failure cleans up the owned reservation automatically", async (t) => {
+  const owned = {};
+  const injected = new Error("injected probe failure");
+  injected.code = "EIO";
+  probeInjections.set("abort-cleanup", () => {
+    throw injected;
+  });
+  try {
+    await t.test("injected child failure", async (child) => {
+      await assert.rejects(
+        runAbortCleanupFixture(child, { owned }),
+        (error) => error === injected,
+        "the injected probe error must fail the fixture",
+      );
+    });
+  } finally {
+    probeInjections.delete("abort-cleanup");
+  }
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("an injected allowed probe outcome fails the abort-cleanup guard and cleans up automatically", async (t) => {
+  if (!isPosixNonRoot()) {
+    t.skip("guard control requires a non-root POSIX environment");
+    return;
+  }
+  const owned = {};
+  // The injected attempt succeeds. The guard must reject this outcome in
+  // a required non-root environment.
+  probeInjections.set("abort-cleanup", () => undefined);
+  try {
+    await t.test("injected allowed child failure", async (child) => {
+      await assert.rejects(
+        runAbortCleanupFixture(child, { owned }),
+        /precondition failure/u,
+        "the required-denial guard must fail the fixture",
+      );
+    });
+  } finally {
+    probeInjections.delete("abort-cleanup");
+  }
+  // The child finished. Teardown ran automatically. We do not call it.
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("a setup failure right after allocation cleans up automatically", async (t) => {
+  const owned = {};
+  await t.test("injected setup failure", async (child) => {
+    await assert.rejects(
+      runAbortCleanupFixture(child, {
+        owned,
+        failDuringSetup: true,
+      }),
+      /injected setup failure/u,
+    );
+  });
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("a setup failure after reservation acquisition cleans up automatically", async (t) => {
+  const owned = {};
+  await t.test("injected setup failure", async (child) => {
+    await assert.rejects(
+      runAbortCleanupFixture(child, {
+        owned,
+        failAfterReservation: true,
+      }),
+      /injected setup failure/u,
+    );
+  });
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+  assertOwnedResourcesFinalized(owned);
+});
+
+test("a discovery service that stays open is closed by automatic teardown", async (t) => {
+  // The discovery service exists only on the strict path, where mode bits
+  // deny the unlink. On advisory platforms the fixture returns from its
+  // advisory branch before the service is created.
+  if (!isPosixNonRoot()) {
+    t.skip("open-service control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test("injected child failure with a service open", async (child) => {
+    await assert.rejects(
+      runAbortCleanupFixture(child, {
+        owned,
+        failAfterDiscoveryService: true,
+      }),
+      /injected failure with the discovery service open/u,
+    );
+  });
+  // The child finished. The service was open when teardown started. The
+  // teardown must have closed it. We check this on the real method, by
+  // identity: the operation log records the close call and its phase.
+  assert.equal(owned.services.length, 2, "both services are tracked");
+  assert.equal(
+    owned.closedServices.size,
+    owned.services.length,
+    "every tracked service is closed",
+  );
+  const discovery = owned.services[1];
+  const discoveryClose = (owned.operationLog ?? []).find(
+    (entry) => entry.op === "close" && entry.resource === discovery && entry.ok,
+  );
+  assert.ok(
+    discoveryClose,
+    "the open discovery service is closed (observed on the real method)",
+  );
+  assert.equal(
+    discoveryClose?.phase,
+    "teardown",
+    "the open discovery service is closed by teardown, not inline",
+  );
+  for (const service of owned.services) {
+    assert.ok(owned.closedServices.has(service), "each service is closed");
+  }
+  assertOwnedResourcesFinalized(owned);
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("resource identities match the fixtures that created them", async (t) => {
+  // Identity control: the abort-cleanup EIO failure tracks the parent
+  // service and the primary reservation. The parent service is closed
+  // inline before the injected probe error; the teardown finalizes the
+  // reservation after the failure. Both operations are observed on the
+  // real methods, by identity.
+  const owned = {};
+  const injected = new Error("injected probe failure");
+  injected.code = "EIO";
+  probeInjections.set("abort-cleanup", () => {
+    throw injected;
+  });
+  try {
+    await t.test("injected child failure", async (child) => {
+      await assert.rejects(
+        runAbortCleanupFixture(child, { owned }),
+        (error) => error === injected,
+      );
+    });
+  } finally {
+    probeInjections.delete("abort-cleanup");
+  }
+  assert.equal(owned.services.length, 1, "the parent service is tracked");
+  assert.equal(owned.reservations.length, 1, "the reservation is tracked");
+  const log = owned.operationLog ?? [];
+  const parentClose = log.find(
+    (entry) =>
+      entry.op === "close" && entry.resource === owned.services[0] && entry.ok,
+  );
+  assert.ok(
+    parentClose,
+    "the parent service is closed (observed on the real method)",
+  );
+  assert.equal(
+    parentClose?.phase,
+    "inline",
+    "the parent service is closed inline, before the injected probe error",
+  );
+  const reservationAbort = log.find(
+    (entry) =>
+      entry.op === "abort" &&
+      entry.resource === owned.reservations[0] &&
+      entry.ok,
+  );
+  assert.ok(
+    reservationAbort,
+    "the reservation is finalized (observed on the real method)",
+  );
+  assert.equal(
+    reservationAbort?.phase,
+    "teardown",
+    "the reservation is aborted by teardown, not inline",
+  );
+  const treeIndex = log.findIndex((entry) => entry.op === "tree");
+  assert.ok(
+    treeIndex !== -1 && log.indexOf(reservationAbort) < treeIndex,
+    "the reservation is finalized before the tree removal",
+  );
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("the retain-lock recovery reservation is aborted automatically after a later failure", async (t) => {
+  // Recovery-acquisition control: the failure fires after the recovered
+  // reservation exists and before it publishes, so it still holds the write
+  // lock when the child fails. The child asserted the intentional retained
+  // lock before the recovery stage; teardown must abort the recovered
+  // reservation before the tree removal.
+  if (!isPosixNonRoot()) {
+    t.skip("recovery-reservation control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test("injected failure after recovery acquisition", async (child) => {
+    await assert.rejects(
+      runRetainLockFixture(child, {
+        owned,
+        failAfterRecoveredReservation: true,
+      }),
+      /injected failure after the recovered reservation/u,
+    );
+  });
+  assertOwnedResourcesFinalized(owned);
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("the abort-cleanup recovery reservation is aborted automatically after a later failure", async (t) => {
+  // Recovery-acquisition control: the failure fires after the recovered
+  // reservation exists and before it publishes. The teardown must abort it
+  // before the tree removal.
+  if (!isPosixNonRoot()) {
+    t.skip("recovery-reservation control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test("injected failure after recovery acquisition", async (child) => {
+    await assert.rejects(
+      runAbortCleanupFixture(child, {
+        owned,
+        failAfterRecoveredReservation: true,
+      }),
+      /injected failure after the recovered reservation/u,
+    );
+  });
+  assertOwnedResourcesFinalized(owned);
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
+test("the permission-recovery discovery service is closed automatically after a later failure", async (t) => {
+  // Recovery-acquisition control: the failure fires after the discovery
+  // service exists and before its inline close, so it is open when the
+  // child fails. The teardown must close it before the tree removal.
+  if (!isPosixNonRoot()) {
+    t.skip("recovery-service control requires the strict denial path");
+    return;
+  }
+  const owned = {};
+  await t.test(
+    "injected failure with the recovery service open",
+    async (child) => {
+      await assert.rejects(
+        runPermissionRecoveryFixture(child, {
+          owned,
+          failAfterDiscoveryService: true,
+        }),
+        /injected failure with the recovery service open/u,
+      );
+    },
+  );
+  assertOwnedResourcesFinalized(owned);
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
 });
