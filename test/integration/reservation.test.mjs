@@ -946,6 +946,7 @@ async function runRetainLockFixture(t, options = {}) {
             "reservation.retainlock:write-home",
             attempt ??
               (() => writeFileSync(join(destinationHome, ".write-probe"), "")),
+            attempt ? "injected" : "real",
           );
           if (outcome === "allowed") {
             rmSync(join(destinationHome, ".write-probe"), { force: true });
@@ -1313,6 +1314,7 @@ async function runAbortCleanupFixture(t, options = {}) {
     t,
     "reservation.abort-cleanup:unlink-payload",
     injectedAttempt ?? (() => fs.unlink(join(protectedDir, "payload.txt"))),
+    injectedAttempt ? "injected" : "real",
   );
   const unlinkControl = unlinkOutcome === "denied" ? "EACCES" : undefined;
   t.diagnostic(
@@ -1435,6 +1437,7 @@ async function runPermissionRecoveryFixture(t, options = {}) {
             t,
             "reservation.permission-recovery:readdir-home",
             attempt ?? (() => readdirSync(destinationHome)),
+            attempt ? "injected" : "real",
           );
           homeUnreadable = outcome === "denied";
         } catch (error) {

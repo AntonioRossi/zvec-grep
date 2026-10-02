@@ -38,7 +38,7 @@ export function privilegeContext() {
  * performs the filesystem operation once and must not swallow errors.
  * Returns "denied" or "allowed" and rethrows unexpected errors.
  */
-export async function probeDenial(t, operation, attempt) {
+export async function probeDenial(t, operation, attempt, source = "real") {
   let outcome;
   let probeError;
   try {
@@ -50,13 +50,13 @@ export async function probeDenial(t, operation, attempt) {
       probeError = `${error.code}`;
     } else {
       t.diagnostic(
-        `permission-probe operation=${operation} ${privilegeContext()} probe=unexpected-error code=${error.code}`,
+        `permission-probe operation=${operation} source=${source} ${privilegeContext()} probe=unexpected-error code=${error.code}`,
       );
       throw error;
     }
   }
   t.diagnostic(
-    `permission-probe operation=${operation} ${privilegeContext()} probe=${outcome}` +
+    `permission-probe operation=${operation} source=${source} ${privilegeContext()} probe=${outcome}` +
       (probeError ? ` error=${probeError}` : ""),
   );
   return outcome;
@@ -75,7 +75,7 @@ export function assertDenialInducible(t, operation, outcome) {
 }
 
 /** Synchronous denial probe for use inside synchronous test hooks. */
-export function probeDenialSync(t, operation, attempt) {
+export function probeDenialSync(t, operation, attempt, source = "real") {
   let outcome;
   let probeError;
   try {
@@ -87,13 +87,13 @@ export function probeDenialSync(t, operation, attempt) {
       probeError = `${error.code}`;
     } else {
       t.diagnostic(
-        `permission-probe operation=${operation} ${privilegeContext()} probe=unexpected-error code=${error.code}`,
+        `permission-probe operation=${operation} source=${source} ${privilegeContext()} probe=unexpected-error code=${error.code}`,
       );
       throw error;
     }
   }
   t.diagnostic(
-    `permission-probe operation=${operation} ${privilegeContext()} probe=${outcome}` +
+    `permission-probe operation=${operation} source=${source} ${privilegeContext()} probe=${outcome}` +
       (probeError ? ` error=${probeError}` : ""),
   );
   return outcome;
@@ -106,8 +106,13 @@ export function probeDenialSync(t, operation, attempt) {
  * surface them as such instead of letting publication error handling
  * reinterpret them.
  */
-export function guardedSyncPermissionProbe(t, operation, attempt) {
-  const outcome = probeDenialSync(t, operation, attempt);
+export function guardedSyncPermissionProbe(
+  t,
+  operation,
+  attempt,
+  source = "real",
+) {
+  const outcome = probeDenialSync(t, operation, attempt, source);
   t.diagnostic(
     `permission-branch operation=${operation} branch=${
       outcome === "denied" ? "strict" : "advisory"
