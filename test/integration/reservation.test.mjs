@@ -1818,6 +1818,30 @@ test("abort-cleanup probe failure cleans up the owned reservation automatically"
   );
 });
 
+test("an injected allowed probe outcome fails the abort-cleanup guard and cleans up automatically", async (t) => {
+  if (!isPosixNonRoot()) {
+    t.skip("guard control requires a non-root POSIX environment");
+    return;
+  }
+  const owned = {};
+  // The injected attempt succeeds. The guard must reject this outcome in
+  // a required non-root environment.
+  probeInjections.set("abort-cleanup", () => undefined);
+  try {
+    await t.test("injected allowed child failure", async (child) => {
+      await assert.rejects(
+        runAbortCleanupFixture(child, { owned }),
+        /precondition failure/u,
+        "the required-denial guard must fail the fixture",
+      );
+    });
+  } finally {
+    probeInjections.delete("abort-cleanup");
+  }
+  // The child finished. Teardown ran automatically. We do not call it.
+  assert.ok(!existsSync(owned.tempDir), "the owned tree is removed");
+});
+
 test("a setup failure right after allocation cleans up automatically", async (t) => {
   const owned = {};
   await t.test("injected setup failure", async (child) => {
