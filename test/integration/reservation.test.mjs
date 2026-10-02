@@ -1912,6 +1912,13 @@ test("a setup failure after reservation acquisition cleans up automatically", as
 });
 
 test("a discovery service that stays open is closed by automatic teardown", async (t) => {
+  // The discovery service exists only on the strict path, where mode bits
+  // deny the unlink. On advisory platforms the fixture returns from its
+  // advisory branch before the service is created.
+  if (!isPosixNonRoot()) {
+    t.skip("open-service control requires the strict denial path");
+    return;
+  }
   const owned = {};
   await t.test("injected child failure with a service open", async (child) => {
     await assert.rejects(
