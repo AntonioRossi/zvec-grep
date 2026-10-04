@@ -186,6 +186,10 @@ export async function migrateWorkspaceIndex(
     const entityDocs = [
       ...sourceEntities.iterDocsSync({ includeVector: true }),
     ];
+    // Finish source reads before native destination handles are created.
+    // Keep the source read lock until publication and cleanup have finished.
+    closeTracked(sourceFiles);
+    closeTracked(sourceEntities);
 
     // Remap file identities to canonical workspace-relative paths.
     report("remap", "Remapping file identities");
@@ -306,9 +310,6 @@ export async function migrateWorkspaceIndex(
       typeof manifest.embeddingRuntime?.apiKey === "string";
     const droppedPersistedDevice =
       typeof manifest.embeddingRuntime?.device === "string";
-
-    closeTracked(sourceFiles);
-    closeTracked(sourceEntities);
 
     // Supported replacement workflow: verification is invalidated before
     // publication releases its reservation, never after the commit window.
