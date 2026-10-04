@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
 import {
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -11,7 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { ZVecOpen } from "@zvec/zvec";
 import { resolveWorkspaceIndexStoragePaths } from "../../dist/engine/storage/layout.js";
 import { acquireReadWriteLock } from "../../dist/engine/utils/lock.js";
@@ -19,6 +20,7 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createZvecGrepMcpServer } from "../../dist/mcp/tools.js";
 import { DaemonBackend } from "../../dist/daemon/backend.js";
 import { createZvecGrep } from "../../dist/index.js";
+import { exportWorkspaceIndex } from "../../dist/engine/transfer/index.js";
 import { CountingEmbeddingModel } from "../helpers/counting-embedding.mjs";
 import { FakeEmbeddingModel } from "../helpers/fake-embedding.mjs";
 import { buildLegacyHome } from "../helpers/legacy-index.mjs";
@@ -28,6 +30,37 @@ useIsolatedZvecGrepHome();
 const operations = ["migrate", "export", "import"];
 const tool = (operation) => `zvec_grep_index_${operation}`;
 const content = "# Beacon\n\nsealed kernel lantern phrase\n";
+
+let templatePromise;
+let templateParent;
+after(async () => {
+  if (templateParent)
+    await rm(templateParent, { recursive: true, force: true });
+});
+
+// Only fixture construction is shared. Every operation still uses its own
+// closed database copies, artifact, server, destination and locks.
+function template() {
+  return (templatePromise ??= (async () => {
+    templateParent = await mkdtemp(join(tmpdir(), "zg-mcp-template-"));
+    const original = await buildSource(templateParent);
+    const legacyHome = join(original.root, ".zvec-grep-legacy");
+    await buildLegacyHome(original.root, legacyHome, original.id);
+    const artifactPath = join(templateParent, "artifact");
+    await exportWorkspaceIndex({
+      sourceHome: original.sourceHome,
+      artifactPath,
+    });
+    return { ...original, legacyHome, artifactPath };
+  })());
+}
+
+const copyOptions = {
+  recursive: true,
+  preserveTimestamps: true,
+  force: false,
+  errorOnExist: true,
+};
 
 async function fixture(t, toolset = "full") {
   const parent = await mkdtemp(join(tmpdir(), "zg-mcp-portability-"));
@@ -82,6 +115,22 @@ async function call(client, operation, args, options) {
 }
 
 async function source(parent) {
+  const original = await template();
+  const root = join(parent, "source");
+  await cp(original.root, root, {
+    ...copyOptions,
+    filter: (path) => path !== original.legacyHome,
+  });
+  return { root, sourceHome: join(root, ".zvec-grep"), id: original.id };
+}
+
+async function legacySource(original) {
+  const home = join(original.root, ".zvec-grep-legacy");
+  await cp((await template()).legacyHome, home, copyOptions);
+  return home;
+}
+
+async function buildSource(parent) {
   const root = join(parent, "source");
   await documents(root);
   const service = await createZvecGrep({
@@ -235,12 +284,46 @@ for (const operation of operations) {
   });
 }
 
+test("MCP fixtures reuse one indexed source and keep copied bytes private", async (t) => {
+  const f = await fixture(t);
+  let embedded = 0;
+  const embed = FakeEmbeddingModel.prototype.doEmbed;
+  t.mock.method(FakeEmbeddingModel.prototype, "doEmbed", function (...args) {
+    embedded += args[0].length;
+    return Reflect.apply(embed, this, args);
+  });
+  const first = await source(join(f.parent, "first"));
+  const second = await source(join(f.parent, "second"));
+  assert.equal(embedded, 2, "fixture setup must index the two documents once");
+  assert.notEqual(first.root, second.root);
+  const before = await inventory(second.root);
+  assert.deepEqual(await inventory(first.root), before);
+  const nativeHome = resolveWorkspaceIndexStoragePaths(
+    first.sourceHome,
+  ).filesPath;
+  const nativeFile = Object.keys(await inventory(nativeHome))[0];
+  assert.ok(nativeFile, "the independence check must change native storage");
+  await writeFile(join(first.root, "beacon.md"), "changed fixture document");
+  await writeFile(join(nativeHome, nativeFile), "changed fixture storage");
+  assert.deepEqual(
+    await inventory(second.root),
+    before,
+    "fixture writes must not reach another copy",
+  );
+  const third = await source(join(f.parent, "third"));
+  assert.deepEqual(
+    await inventory(third.root),
+    before,
+    "fixture writes must not reach the template",
+  );
+  assert.equal(embedded, 2, "copying another fixture must not rebuild it");
+});
+
 test("MCP migration preserves legacy workspace identity, content and all vectors", async (t) => {
   const f = await fixture(t);
   await requireTool(f.client, "migrate");
   const original = await source(f.parent);
-  const legacy = join(original.root, ".zvec-grep-legacy");
-  await buildLegacyHome(original.root, legacy, original.id);
+  const legacy = await legacySource(original);
   const before = await inventory(legacy);
   const destinationRoot = join(f.parent, "migrated");
   await documents(destinationRoot);
@@ -326,10 +409,9 @@ async function preparedOperation(t, operation) {
   const destinationRoot = join(f.parent, "destination");
   await documents(destinationRoot);
   if (operation === "migrate") {
-    sourceHome = join(original.root, ".zvec-grep-legacy");
-    await buildLegacyHome(original.root, sourceHome, original.id);
+    sourceHome = await legacySource(original);
   } else if (operation === "import") {
-    await call(f.client, "export", { sourceHome, artifactPath });
+    await cp((await template()).artifactPath, artifactPath, copyOptions);
   }
   return {
     ...f,
