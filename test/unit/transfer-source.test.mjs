@@ -7,13 +7,17 @@ import test from "node:test";
 for (const stage of ["copy", "open"]) {
   test(`native transfer source removes its private copy after ${stage} fails`, async (t) => {
     const parent = await mkdtemp(join(tmpdir(), "zg-transfer-source-control-"));
-    const previous = process.env.TMPDIR;
-    process.env.TMPDIR = parent;
+    const keys = ["TMPDIR", "TEMP", "TMP"];
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
     t.after(async () => {
-      if (previous === undefined) delete process.env.TMPDIR;
-      else process.env.TMPDIR = previous;
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       await rm(parent, { recursive: true, force: true });
     });
+    for (const key of keys) process.env[key] = parent;
+    assert.equal(tmpdir(), parent, "the fixture must own the actual temp path");
     const source = join(parent, "source");
     await mkdir(join(source, "files.zvec"), { recursive: true });
     await writeFile(join(source, "files.zvec", "keep.txt"), "source remains");
