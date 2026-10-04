@@ -18,6 +18,12 @@ the default and compatibility toolsets. See
 [Server and execution modes](./06-server.md) for lifecycle, mode selection,
 refresh, authentication, and logs.
 
+To relocate a workspace or transfer an existing index, see
+[Move and reuse an index](./09-portable-indexes.md). The current MCP tools
+can search and update a portable index. Migration, export and import currently
+use the CLI. Paths always refer to files visible to the server; copying an
+artifact between hosts is a separate operation.
+
 ## Default agent toolset
 
 The default `agent` toolset intentionally exposes only search:

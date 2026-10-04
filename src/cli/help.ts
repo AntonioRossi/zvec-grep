@@ -91,6 +91,9 @@ confirm that such a word is intended as literal search input.
 
 Actions:
   --index        Build, rebuild, or drop the workspace index
+  --migrate-index Convert a legacy index to a portable workspace index
+  --export-index Export an index and its vectors to a transfer artifact
+  --import-index Import a transfer artifact into a destination workspace
   --status       Show workspace and index status
   --config       Configure provider credentials and embedding model defaults
   --auth         Manage Workspace Remote Embedding authorization

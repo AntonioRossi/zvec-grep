@@ -1,9 +1,20 @@
 # Portable workspace index — identity and path contract
 
-Design status: **fork specification baseline, accepted 2026-09-15; behavior not
-yet demonstrated**. This document is the contract the implementation and its
-validation must satisfy. User-facing documentation is updated only after the
-behavior is demonstrated.
+Design status: **implemented and demonstrated for the Node.js fork**.
+The specification baseline was accepted on 2026-09-15. On 2026-10-04,
+source `72422a9` passed owner-run tests on macOS 26.6.2 arm64: indexing,
+search, reopen, relocation, separate-process transfer, changes and deletions.
+Its test index also opened on a separate Linux x64 host with the same index
+identity, expected content and zero document embeddings. A repeated native
+Mac archive transfer passed without changes to the received payload.
+
+These observations cover the recorded native-index transfer and test harness.
+They do not establish arbitrary native database compatibility, older macOS
+support, Gatekeeper/notarization, or new MCP migration/export/import tools.
+Logical export/import has separate engine integration coverage. New MCP tools
+need their own interface and host evidence. The Rust implementation is outside
+this specification's demonstrated scope. Use the practical
+[Move and reuse an index guide](../09-portable-indexes.md) for instructions.
 
 Objective: an index built in one location (for example macOS with Metal) can be
 transferred with its workspace to another location or host (for example Linux
