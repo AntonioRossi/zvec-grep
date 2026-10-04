@@ -26,6 +26,10 @@ reused; use the verification checks below.
 - A migration or import destination must not already contain a workspace index.
   An export artifact path must be new. Keep artifacts outside indexed roots.
   Do not remove an existing index to make a failed command succeed.
+- Migration and export read private copies of native storage. Allow temporary
+  disk space for the source collections as well as space for the destination.
+  The copies are removed before publication. Native reader metadata changes
+  cannot affect the original index.
 - Use a version that supports the artifact format and portable manifest.
   Logical import creates native storage on the receiving host. It does not
   require compatible native database files from the sending host.

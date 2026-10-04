@@ -18,6 +18,7 @@ import {
   parseRange,
 } from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
+import { readNativeTransferSource } from "../storage/transfer-source.js";
 import { CURRENT_INDEX_VERSION } from "../types.js";
 import {
   canonicalRelativePath,
@@ -175,23 +176,7 @@ export async function migrateWorkspaceIndex(
 
     report("read", "Reading legacy index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-    const sourcePaths = resolveWorkspaceIndexStoragePaths(sourceHome);
-    // Native mapped readers can change vector-index metadata. Non-mapped
-    // source readers preserve source bytes during conversion and transfer.
-    const sourceFiles = track(
-      ZVecOpen(sourcePaths.filesPath, { readOnly: true, enableMMAP: false }),
-    );
-    const sourceEntities = track(
-      ZVecOpen(sourcePaths.indexPath, { readOnly: true, enableMMAP: false }),
-    );
-    const fileDocs = [...sourceFiles.iterDocsSync({ includeVector: false })];
-    const entityDocs = [
-      ...sourceEntities.iterDocsSync({ includeVector: true }),
-    ];
-    // Finish source reads before native destination handles are created.
-    // Keep the source read lock until publication and cleanup have finished.
-    closeTracked(sourceFiles);
-    closeTracked(sourceEntities);
+    const { fileDocs, entityDocs } = readNativeTransferSource(sourceHome);
 
     // Remap file identities to canonical workspace-relative paths.
     report("remap", "Remapping file identities");

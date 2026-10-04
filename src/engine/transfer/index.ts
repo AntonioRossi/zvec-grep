@@ -25,6 +25,7 @@ import {
 import { createFilesSchema, createEntitiesSchema } from "../storage/index.js";
 import { createWorkspaceIndexStorage } from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
+import { readNativeTransferSource } from "../storage/transfer-source.js";
 import { CURRENT_INDEX_VERSION } from "../types.js";
 import { createCanonicalPathResolver } from "../utils/canonical-path.js";
 import { readJsonFileSync, writeJsonFileSync } from "../utils/json.js";
@@ -33,7 +34,6 @@ import {
   ZVecCreateAndOpen,
   ZVecInitialize,
   ZVecLogLevel,
-  ZVecOpen,
   type ZVecCollection,
   type ZVecStatus,
 } from "@zvec/zvec";
@@ -116,7 +116,6 @@ export async function exportWorkspaceIndex(
   const lock = acquireReadWriteLock(join(sourceHome, "locks", "home"), "read", {
     operation: "index.export",
   });
-  const openHandles: ZVecCollection[] = [];
   let reservation: DestinationReservation | undefined;
   try {
     // The incomplete-home guard runs under the source lock before any
@@ -125,19 +124,7 @@ export async function exportWorkspaceIndex(
     assertHomeNotIncomplete(sourceHome);
     report("read", "Reading source index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-    const sourcePaths = resolveWorkspaceIndexStoragePaths(sourceHome);
-    // Native mapped readers can change vector-index metadata. Non-mapped
-    // source readers preserve source bytes during conversion and transfer.
-    const sourceFiles = track(
-      ZVecOpen(sourcePaths.filesPath, { readOnly: true, enableMMAP: false }),
-    );
-    const sourceEntities = track(
-      ZVecOpen(sourcePaths.indexPath, { readOnly: true, enableMMAP: false }),
-    );
-    const fileDocs = [...sourceFiles.iterDocsSync({ includeVector: false })];
-    const entityDocs = [
-      ...sourceEntities.iterDocsSync({ includeVector: true }),
-    ];
+    const { fileDocs, entityDocs } = readNativeTransferSource(sourceHome);
 
     const rawManifest = readJsonFileSync<unknown>(
       join(sourceHome, "manifest.json"),
@@ -279,19 +266,7 @@ export async function exportWorkspaceIndex(
     }
     throw error;
   } finally {
-    for (const handle of openHandles.splice(0).reverse()) {
-      try {
-        handle.closeSync();
-      } catch {
-        // Cleanup is best-effort.
-      }
-    }
     lock.release();
-  }
-
-  function track(collection: ZVecCollection): ZVecCollection {
-    openHandles.push(collection);
-    return collection;
   }
 }
 
