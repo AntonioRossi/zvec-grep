@@ -18,6 +18,7 @@ import {
   parseRange,
 } from "../storage/index.js";
 import { resolveWorkspaceIndexStoragePaths } from "../storage/layout.js";
+import { readNativeTransferSource } from "../storage/transfer-source.js";
 import { CURRENT_INDEX_VERSION } from "../types.js";
 import {
   canonicalRelativePath,
@@ -175,17 +176,7 @@ export async function migrateWorkspaceIndex(
 
     report("read", "Reading legacy index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-    const sourcePaths = resolveWorkspaceIndexStoragePaths(sourceHome);
-    const sourceFiles = track(
-      ZVecOpen(sourcePaths.filesPath, { readOnly: true }),
-    );
-    const sourceEntities = track(
-      ZVecOpen(sourcePaths.indexPath, { readOnly: true }),
-    );
-    const fileDocs = [...sourceFiles.iterDocsSync({ includeVector: false })];
-    const entityDocs = [
-      ...sourceEntities.iterDocsSync({ includeVector: true }),
-    ];
+    const { fileDocs, entityDocs } = readNativeTransferSource(sourceHome);
 
     // Remap file identities to canonical workspace-relative paths.
     report("remap", "Remapping file identities");
@@ -307,11 +298,9 @@ export async function migrateWorkspaceIndex(
     const droppedPersistedDevice =
       typeof manifest.embeddingRuntime?.device === "string";
 
-    closeTracked(sourceFiles);
-    closeTracked(sourceEntities);
-
     // Supported replacement workflow: verification is invalidated before
     // publication releases its reservation, never after the commit window.
+    report("publish", "Publishing verified index");
     new WorkspaceBindingStore().invalidate(manifest.id, destinationRoot);
     // Publication: finalize the manifest into staging, move children with
     // the manifest last, and commit once at reservation release.
