@@ -126,11 +126,13 @@ export async function exportWorkspaceIndex(
     report("read", "Reading source index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
     const sourcePaths = resolveWorkspaceIndexStoragePaths(sourceHome);
+    // Native mapped readers can change vector-index metadata. Non-mapped
+    // source readers preserve source bytes during conversion and transfer.
     const sourceFiles = track(
-      ZVecOpen(sourcePaths.filesPath, { readOnly: true }),
+      ZVecOpen(sourcePaths.filesPath, { readOnly: true, enableMMAP: false }),
     );
     const sourceEntities = track(
-      ZVecOpen(sourcePaths.indexPath, { readOnly: true }),
+      ZVecOpen(sourcePaths.indexPath, { readOnly: true, enableMMAP: false }),
     );
     const fileDocs = [...sourceFiles.iterDocsSync({ includeVector: false })];
     const entityDocs = [
