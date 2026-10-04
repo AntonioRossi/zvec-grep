@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync, readdirSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -13,6 +14,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ZVecOpen } from "@zvec/zvec";
 import { resolveWorkspaceIndexStoragePaths } from "../../dist/engine/storage/layout.js";
+import { acquireReadWriteLock } from "../../dist/engine/utils/lock.js";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createZvecGrepMcpServer } from "../../dist/mcp/tools.js";
 import { DaemonBackend } from "../../dist/daemon/backend.js";
@@ -124,7 +126,7 @@ async function inventory(root) {
 function vectors(home) {
   const collection = ZVecOpen(
     resolveWorkspaceIndexStoragePaths(home).indexPath,
-    { readOnly: true },
+    { readOnly: true, enableMMAP: false },
   );
   try {
     return [...collection.iterDocsSync({ includeVector: true })]
@@ -314,3 +316,292 @@ test("MCP import preserves identity, expected content and zero document embeddin
   );
   await searchAndReconcile(f, destinationRoot, original.id);
 });
+
+async function preparedOperation(t, operation) {
+  const f = await fixture(t);
+  await requireTool(f.client, operation);
+  const original = await source(f.parent);
+  let sourceHome = original.sourceHome;
+  const artifactPath = join(f.parent, "artifact");
+  const destinationRoot = join(f.parent, "destination");
+  await documents(destinationRoot);
+  if (operation === "migrate") {
+    sourceHome = join(original.root, ".zvec-grep-legacy");
+    await buildLegacyHome(original.root, sourceHome, original.id);
+  } else if (operation === "import") {
+    await call(f.client, "export", { sourceHome, artifactPath });
+  }
+  return {
+    ...f,
+    original,
+    input:
+      operation === "export"
+        ? { sourceHome, artifactPath }
+        : operation === "migrate"
+          ? { sourceHome, destinationRoot }
+          : { artifactPath, destinationRoot },
+    source: operation === "import" ? artifactPath : sourceHome,
+    destination:
+      operation === "export"
+        ? artifactPath
+        : join(destinationRoot, ".zvec-grep"),
+  };
+}
+
+async function failure(f, operation, code) {
+  const result = await f.client.callTool({
+    name: tool(operation),
+    arguments: { ...f.input, confirm: true },
+  });
+  assert.equal(result.isError, true, JSON.stringify(result));
+  assert.equal(result.structuredContent.state, "failed");
+  assert.equal(result.structuredContent.operation, operation);
+  assert.match(result.structuredContent.error.code, code);
+  assert.ok(result.structuredContent.error.message.length > 0);
+  return result;
+}
+
+function ownedResources(root) {
+  if (!existsSync(root)) return [];
+  const found = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (
+      entry.name === "INCOMPLETE" ||
+      entry.name === "lock.json" ||
+      entry.name.startsWith("staging-")
+    )
+      found.push(path);
+    if (entry.isDirectory()) found.push(...ownedResources(path));
+  }
+  return found;
+}
+
+async function waitForCleanup(f) {
+  const deadline = Date.now() + 10_000;
+  while (ownedResources(f.parent).length && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.deepEqual(
+    ownedResources(f.parent),
+    [],
+    "the operation must release its locks, marker and staging before fixture teardown",
+  );
+}
+
+test("MCP import rejects malformed entity data and preserves the artifact and destination", async (t) => {
+  const f = await preparedOperation(t, "import");
+  const file = join(f.source, "entities.jsonl");
+  const valid = await readFile(file, "utf8");
+  const entities = valid.trim().split("\n").map(JSON.parse);
+  entities[0].fields.range_json = "null";
+  await writeFile(file, entities.map(JSON.stringify).join("\n") + "\n");
+  const before = await inventory(f.parent);
+  await failure(f, "import", /ZVEC_GREP\.ENGINE\./);
+  await waitForCleanup(f);
+  assert.deepEqual(await inventory(f.parent), before);
+  await writeFile(file, valid);
+  assert.equal(
+    (await call(f.client, "import", f.input)).indexId,
+    f.original.id,
+  );
+});
+
+for (const operation of operations) {
+  test(`MCP ${operation} rejects an occupied destination without changing existing data`, async (t) => {
+    const f = await preparedOperation(t, operation);
+    await mkdir(f.destination, { recursive: true });
+    await writeFile(
+      join(f.destination, "keep.txt"),
+      "foreign destination data",
+    );
+    const before = await inventory(f.parent);
+    await failure(f, operation, /ZVEC_GREP\.ENGINE\.RESERVATION\.FAILED/);
+    await waitForCleanup(f);
+    assert.deepEqual(await inventory(f.parent), before);
+  });
+
+  for (const side of ["source", "destination"]) {
+    test(`MCP ${operation} preserves a competing ${side} lock and allows a retry`, async (t) => {
+      const f = await preparedOperation(t, operation);
+      const lock = acquireReadWriteLock(
+        join(f[side], "locks", "home"),
+        "write",
+        { operation: "MCP competing writer control" },
+      );
+      t.after(() => lock.release());
+      const record = await readFile(join(lock.path, "lock.json"), "utf8");
+      const before = await inventory(f.parent);
+      await failure(f, operation, /LOCK/);
+      assert.equal(
+        await readFile(join(lock.path, "lock.json"), "utf8"),
+        record,
+        "a foreign writer must retain its exact lock",
+      );
+      assert.deepEqual(await inventory(f.parent), before);
+      assert.deepEqual(ownedResources(f.parent), [
+        join(lock.path, "lock.json"),
+      ]);
+      assert.equal(lock.release(), true);
+      assert.equal(
+        (await call(f.client, operation, f.input)).indexId,
+        f.original.id,
+      );
+      await waitForCleanup(f);
+    });
+  }
+
+  test(`MCP ${operation} cancellation before publication removes owned resources and allows a retry`, async (t) => {
+    const f = await preparedOperation(t, operation);
+    const before = await inventory(f.parent);
+    const controller = new AbortController();
+    let cancelledAtPublication = false;
+    let stagedAtCancellation = [];
+    const request = f.client.callTool(
+      {
+        name: tool(operation),
+        arguments: { ...f.input, confirm: true },
+      },
+      {
+        signal: controller.signal,
+        onprogress: (progress) => {
+          if (progress.message.startsWith("publish:")) {
+            stagedAtCancellation = ownedResources(f.destination);
+            cancelledAtPublication = true;
+            controller.abort(
+              new Error("MCP test cancelled before publication"),
+            );
+          }
+        },
+      },
+    );
+    await assert.rejects(request, /cancelled before publication/);
+    assert.equal(
+      cancelledAtPublication,
+      true,
+      "the actual MCP progress notification must trigger cancellation",
+    );
+    assert.ok(
+      stagedAtCancellation.some((path) => path.endsWith("INCOMPLETE")),
+      "a reserved result must exist before cancellation",
+    );
+    assert.ok(
+      stagedAtCancellation.some((path) => /staging-/.test(path)),
+      "the test must exercise populated staging",
+    );
+    await waitForCleanup(f);
+    assert.deepEqual(
+      await inventory(f.parent),
+      before,
+      "cancellation must preserve all pre-existing data and publish nothing",
+    );
+    assert.equal(
+      (await call(f.client, operation, f.input)).indexId,
+      f.original.id,
+    );
+    await waitForCleanup(f);
+  });
+
+  test(`MCP ${operation} connection loss before publication removes owned resources`, async (t) => {
+    const f = await preparedOperation(t, operation);
+    const before = await inventory(f.parent);
+    let disconnectedWithStaging = false;
+    let closing;
+    const request = f.client.callTool(
+      {
+        name: tool(operation),
+        arguments: { ...f.input, confirm: true },
+      },
+      {
+        onprogress: (progress) => {
+          if (progress.message.startsWith("publish:")) {
+            disconnectedWithStaging = ownedResources(f.destination).some(
+              (path) => path.endsWith("INCOMPLETE"),
+            );
+            closing = f.client.close();
+          }
+        },
+      },
+    );
+    await assert.rejects(request, /closed/i);
+    await closing;
+    assert.equal(disconnectedWithStaging, true);
+    await waitForCleanup(f);
+    assert.deepEqual(await inventory(f.parent), before);
+  });
+}
+
+for (const change of ["modified", "deleted"]) {
+  test(`MCP imported index reconciles a ${change} file and preserves the unrelated file`, async (t) => {
+    const f = await preparedOperation(t, "import");
+    await call(f.client, "import", f.input);
+    const root = f.input.destinationRoot;
+    const index = async () => {
+      const result = await f.client.callTool({
+        name: "zvec_grep_index",
+        arguments: { root, wait: true },
+      });
+      assert.equal(
+        result.structuredContent.state,
+        "succeeded",
+        JSON.stringify(result),
+      );
+    };
+    await index();
+    assert.equal(
+      f.model.counts.document,
+      0,
+      "initial reconciliation must reuse the imported vectors",
+    );
+    if (change === "modified") {
+      await writeFile(
+        join(root, "beacon.md"),
+        "# Revised\n\nsilver orchard compass phrase\n",
+      );
+    } else {
+      await rm(join(root, "beacon.md"));
+    }
+    await index();
+    const query = await f.client.callTool({
+      name: "zvec_grep_search",
+      arguments: {
+        root,
+        query: "silver orchard compass quiet harbor anchor",
+        autoUpdate: false,
+        preview: "full",
+      },
+    });
+    assert.notEqual(query.isError, true, JSON.stringify(query));
+    const text = JSON.stringify(query.content);
+    assert.match(text, /stable.md/);
+    assert.match(text, /quiet harbor anchor phrase/);
+    assert.doesNotMatch(text, /sealed kernel lantern phrase/);
+    if (change === "modified") {
+      assert.match(text, /beacon.md/);
+      assert.match(text, /silver orchard compass phrase/);
+      assert.ok(
+        f.model.counts.document > 0,
+        "the changed document must be embedded",
+      );
+    } else {
+      assert.doesNotMatch(text, /beacon.md/);
+      assert.equal(
+        f.model.counts.document,
+        0,
+        "deletion must not embed the unchanged document",
+      );
+    }
+    const status = await f.client.callTool({
+      name: "zvec_grep_index_status",
+      arguments: { root },
+    });
+    assert.equal(
+      status.structuredContent.persistent.files.stored,
+      change === "deleted" ? 1 : 2,
+    );
+    assert.equal(
+      status.structuredContent.persistent.workspace_index.id,
+      f.original.id,
+    );
+  });
+}
