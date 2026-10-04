@@ -315,6 +315,7 @@ export async function migrateWorkspaceIndex(
 
     // Supported replacement workflow: verification is invalidated before
     // publication releases its reservation, never after the commit window.
+    report("publish", "Publishing verified index");
     new WorkspaceBindingStore().invalidate(manifest.id, destinationRoot);
     // Publication: finalize the manifest into staging, move children with
     // the manifest last, and commit once at reservation release.

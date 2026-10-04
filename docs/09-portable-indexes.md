@@ -8,11 +8,11 @@ an indexed workspace. These instructions apply to the Node.js implementation.
 
 ## Choose the operation
 
-| Need | Operation |
-| --- | --- |
-| Move a complete workspace on a compatible host | Relocation of the files and `.zvec-grep/` together |
-| Convert an old absolute-path index (manifest version 1) | Migration to manifest version 2 |
-| Transfer across hosts or native database environments | Logical export and import |
+| Need                                                    | Operation                                          |
+| ------------------------------------------------------- | -------------------------------------------------- |
+| Move a complete workspace on a compatible host          | Relocation of the files and `.zvec-grep/` together |
+| Convert an old absolute-path index (manifest version 1) | Migration to manifest version 2                    |
+| Transfer across hosts or native database environments   | Logical export and import                          |
 
 Keep a restorable copy before you change a workspace. Stop indexing and close
 services that use it before you copy native index files. Do not copy a live
@@ -92,8 +92,10 @@ before publication. It does not compute embeddings. Keep the original artifact
 and source index until verification is complete. A lock conflict or occupied
 destination is an error; resolve the owner of that resource before retrying.
 
-Migration, export and import currently use the CLI. Existing MCP tools can
-search and update the result. A tool path is a path visible to the server,
+Migration, export and import are also available through the full MCP toolset:
+`zvec_grep_index_migrate`, `zvec_grep_index_export` and `zvec_grep_index_import`.
+Each requires `confirm: true` after an explicit user request. Existing MCP
+search and indexing tools can read and update the result. A tool path is a path visible to the server,
 not necessarily to the agent's computer. An agent must have an explicit user
 request before it creates or changes a persistent index.
 

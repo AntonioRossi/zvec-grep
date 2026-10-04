@@ -241,6 +241,7 @@ export async function exportWorkspaceIndex(
     }
 
     writer.finish();
+    report("publish", "Publishing transfer artifact");
     // Publication: format and manifest metadata are finalized into staging
     // and moved into place last; the reservation commits once at release.
     reserved.publish(() => {
@@ -533,6 +534,7 @@ async function importWorkspaceIndexLocked(
 
     // Supported replacement workflow: verification is invalidated before
     // publication releases its reservation, never after the commit window.
+    report("publish", "Publishing verified index");
     new WorkspaceBindingStore().invalidate(
       portableManifest.id,
       destinationRoot,
