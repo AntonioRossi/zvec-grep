@@ -12,6 +12,7 @@ import {
 import { join } from "node:path";
 import { EngineError } from "./errors.js";
 import { incompleteMarkerEntry } from "./manifest.js";
+import { INCOMPLETE_RECOVERY_HINT } from "./utils/recovery-guidance.js";
 import { acquireReadWriteLock, type FileLock } from "./utils/lock.js";
 
 /**
@@ -162,9 +163,9 @@ export function reserveDestination(options: {
     if (markerStatus !== "absent") {
       throw reservationError(
         markerStatus === "present"
-          ? "Destination contains an incomplete reserved result; recover it manually after writers are quiescent (remove the INCOMPLETE marker and its partial contents, then retry)"
+          ? "Destination contains an incomplete reserved result"
           : "Destination incomplete-marker state cannot be inspected; refusing to claim it",
-        options.destinationHome,
+        `${options.destinationHome} hint=${INCOMPLETE_RECOVERY_HINT}`,
       );
     }
     const unrelated = readdirSync(options.destinationHome).filter(
