@@ -280,6 +280,12 @@ Each record includes a `level` field alongside the existing event fields.
 
 ## Index locks
 
+Daemon indexing jobs keep their pending changes during temporary lock
+contention. They retry for up to 30 seconds, with at most one second between
+attempts. Other workspaces can run while a job waits. Cancellation and server
+shutdown stop the pending retry. A longer conflict reports `LOCK.BUSY` and
+leaves the lock owner unchanged; it does not remove the lock or bypass it.
+
 Writers hold a file lock at `<workspace>/.zvec-grep/locks/`. A write lock is
 **never** reclaimed automatically — not for age, and not even when its local
 owner has verifiably exited: no reclamation-by-deletion can be made safe

@@ -48,6 +48,8 @@ export type JobSchedulerOptions = {
   concurrency?: number;
   maxAttempts?: number;
   retryBaseDelayMs?: number;
+  /** Maximum wait for a temporary reader or writer, independent of attempts. */
+  lockWaitTimeoutMs?: number;
   logger?: DaemonLogger;
 };
 
@@ -60,6 +62,7 @@ type ScheduledJob = IndexJobSnapshot & {
   resolveCompletion: (snapshot: IndexJobSnapshot) => void;
   progressListeners: Set<(progress: IndexProgress) => void>;
   retryTimer?: ReturnType<typeof setTimeout>;
+  lockWaitDeadline?: number;
   followup?: ScheduledJob;
 };
 
@@ -76,6 +79,7 @@ export class JobScheduler {
   private readonly concurrency: number;
   private readonly maxAttempts: number;
   private readonly retryBaseDelayMs: number;
+  private readonly lockWaitTimeoutMs: number;
   private running = 0;
   private closed = false;
   private closePromise?: Promise<void>;
@@ -86,6 +90,13 @@ export class JobScheduler {
     this.concurrency = options.concurrency ?? 1;
     this.maxAttempts = options.maxAttempts ?? 3;
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 250;
+    this.lockWaitTimeoutMs = options.lockWaitTimeoutMs ?? 30_000;
+    if (
+      !Number.isFinite(this.lockWaitTimeoutMs) ||
+      this.lockWaitTimeoutMs < 0
+    ) {
+      throw new RangeError("Lock wait timeout must be finite and non-negative");
+    }
     this.logger = options.logger;
   }
 
@@ -304,14 +315,21 @@ export class JobScheduler {
         this.finish(job, "cancelled");
         return;
       }
-      if (
-        !this.closed &&
-        isRetryable(error) &&
-        job.attempt < this.maxAttempts
-      ) {
+      const lockBusy = isLockBusy(error);
+      if (lockBusy) {
+        job.lockWaitDeadline ??= performance.now() + this.lockWaitTimeoutMs;
+      }
+      const remainingLockWait = (job.lockWaitDeadline ?? 0) - performance.now();
+      const canRetry = lockBusy
+        ? remainingLockWait > 0
+        : isRetryable(error) && job.attempt < this.maxAttempts;
+      if (!this.closed && canRetry) {
         job.state = "queued";
         job.error = errorInfo(error);
-        const delay = this.retryBaseDelayMs * 2 ** (job.attempt - 1);
+        const backoff = this.retryBaseDelayMs * 2 ** (job.attempt - 1);
+        const delay = lockBusy
+          ? Math.min(1_000, backoff, remainingLockWait)
+          : backoff;
         this.logger?.event("job.retry", {
           root_id: rootIdentity(job.canonicalRoot),
           job_id: job.id,
@@ -509,6 +527,10 @@ function isRetryable(error: unknown): boolean {
   if (error instanceof DaemonError) {
     return error.retryable;
   }
+  return isLockBusy(error);
+}
+
+function isLockBusy(error: unknown): boolean {
   return Boolean(
     error &&
     typeof error === "object" &&
