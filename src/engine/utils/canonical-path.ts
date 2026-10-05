@@ -161,7 +161,9 @@ export type CanonicalPathResolver = {
 
 export function tryRealpathSync(path: string): string | undefined {
   try {
-    return realpathSync(path);
+    // Use the same physical spelling as fs.promises.realpath in the daemon
+    // and scanner. Windows' JS resolver can retain an 8.3 path alias.
+    return realpathSync.native(path);
   } catch {
     return undefined;
   }
@@ -263,7 +265,7 @@ export function createCanonicalPathResolver(
   // I/O failures are explicit errors, never missing-path evidence.
   function realpathForResolve(path: string): string | undefined {
     try {
-      return realpathSync(path);
+      return realpathSync.native(path);
     } catch (error) {
       if (isAbsenceError(error)) {
         return undefined;
