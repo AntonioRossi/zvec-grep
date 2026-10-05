@@ -5,7 +5,7 @@ export const INDEX_EMBEDDING_CONCURRENCY_ENV =
 
 const LEGACY_LLAMA_PARALLELISM_ENV = "ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM";
 const DEFAULT_PARALLELISM_CAP = 8;
-export const GPU_VRAM_BUDGET_RATIO = 0.25;
+const GPU_VRAM_BUDGET_RATIO = 0.25;
 
 /** Validate an explicit backend limit without consulting the environment. */
 export function normalizeLocalEmbeddingConcurrency(

@@ -124,19 +124,19 @@ such as Potion use static vector lookup, so selecting a GPU does not improve
 their runtime.
 
 GGUF automatic concurrency uses the loaded model's context-memory estimate,
-including graph overhead, with a 50% safety margin. It budgets at most one
-quarter of free GPU memory measured after model loading. It checks current
-free memory before each additional context and raises the estimate when an
-allocation uses more memory than expected. The budget stays fixed for that
-loaded model. If memory information is unavailable, it uses one context.
-The first context still needs enough memory; native allocation checks apply.
-This budget does not reserve memory against other GPU processes.
+including graph overhead, with a 50% margin for estimate uncertainty. The
+calculation uses one quarter of reported free GPU memory and a cap of eight
+contexts. If the estimate or memory information is unavailable, it selects one
+context. This calculation does not reserve memory or control other processes.
+The OS and GPU driver decide whether an allocation succeeds. Even one context
+can fail when memory is insufficient. The tests do not require or establish an
+idle host, and do not guarantee allocation when other processes consume memory.
 
-For a shared GPU, an explicit `--index-embedding-concurrency 2` remains
-available. The environment fallback is
-`ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=2`. An explicit value bypasses the
-automatic budget, so select it for the available capacity. Native memory
-checks remain active.
+The explicit `--index-embedding-concurrency 2` option remains available. The
+environment fallback is `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=2`. An explicit
+value overrides the automatic calculation. Select it for the model and available
+capacity. Native allocation errors retain their cause. A catchable failure while
+adding contexts emits a warning if the batch can use contexts already created.
 
 For ONNX models using Transformers.js, `auto` uses the runtime's Node default
 (CPU). Select a GPU device explicitly when its hardware and runtime libraries

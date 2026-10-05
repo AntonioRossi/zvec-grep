@@ -25,6 +25,9 @@ async function fixture(t, options = {}) {
         },
     createEmbeddingContext: async () => {
       calls.contexts++;
+      if (calls.contexts > (options.failAfter ?? Infinity)) {
+        throw options.allocationError;
+      }
       return {
         getEmbeddingFor: async () => ({ vector: [1, 0] }),
         dispose: async () => {
@@ -41,9 +44,7 @@ async function fixture(t, options = {}) {
       return {
         total: 64 * GiB,
         used: 56 * GiB,
-        free: options.free
-          ? options.free(calls)
-          : 8 * GiB - calls.contexts * (options.actualCost ?? 0),
+        free: options.free ?? 8 * GiB,
       };
     },
     loadModel: async () => fakeModel,
@@ -119,23 +120,54 @@ test("F2 missing estimates or memory counters permit only one automatic context"
   }
 });
 
-test("F2 observed allocation raises an underestimated context cost before another allocation", async (t) => {
-  const setup = await fixture(t, { cost: GiB / 8, actualCost: GiB });
+test("F2 the runtime allocates the calculated contexts without an allocation ledger", async (t) => {
+  const setup = await fixture(t, { cost: GiB / 4 });
   await setup.embed();
-  assert.equal(setup.calls.contexts, 1);
-  assert.ok(setup.calls.vram >= 3);
+  assert.equal(setup.calls.contexts, 5);
+  assert.equal(
+    setup.calls.vram,
+    1,
+    "only the concurrency calculation reads memory",
+  );
 });
 
-test("F2 fresh memory checks stop additional contexts when another GPU user consumes memory", async (t) => {
+test("F2 a partial context allocation failure reports the cause and uses available contexts", async (t) => {
+  const messages = [];
+  t.mock.method(process.stderr, "write", (message) => {
+    messages.push(String(message));
+    return true;
+  });
   const setup = await fixture(t, {
-    cost: GiB / 4,
-    free: ({ vram }) => (vram <= 3 ? 8 * GiB : GiB / 4),
+    override: 2,
+    failAfter: 1,
+    allocationError: new Error("fixture GPU allocation refused"),
   });
   await setup.embed();
-  assert.equal(setup.calls.contexts, 1);
+  assert.equal(setup.calls.contexts, 2);
+  assert.match(
+    messages.join(""),
+    /allocation failed.*fixture GPU allocation refused/,
+  );
+  assert.match(messages.join(""), /continuing with 1 contexts/);
+  assert.match(messages.join(""), /--index-embedding-concurrency/);
 });
 
-test("F2 automatic budget stays bounded across query and indexing batches while explicit concurrency stays available", async (t) => {
+test("F2 a first-context allocation failure preserves the error and recovery hint", async (t) => {
+  const allocationError = new Error("fixture allocation refused");
+  const setup = await fixture(t, { failAfter: 0, allocationError });
+  await assert.rejects(setup.embed(), (error) => {
+    assert.equal(error.code, "ZVEC_GREP.ENGINE.MODELS.LLAMA_CPP_EMBED_FAILED");
+    assert.equal(
+      error.cause.code,
+      "ZVEC_GREP.ENGINE.MODELS.LLAMA_CPP_CONTEXT_FAILED",
+    );
+    assert.equal(error.cause.cause, allocationError);
+    assert.match(error.context, /--index-embedding-concurrency 1/);
+    return true;
+  });
+});
+
+test("F2 automatic calculation and explicit concurrency remain available across batches", async (t) => {
   const automatic = await fixture(t);
   await automatic.embed(1);
   await automatic.embed(8);
