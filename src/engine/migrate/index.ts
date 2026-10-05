@@ -4,6 +4,7 @@ import { EngineError } from "../errors.js";
 import {
   appendReservationCleanup,
   reserveDestination,
+  assertDestinationAvailable,
   type DestinationReservation,
 } from "../reservation.js";
 import {
@@ -177,6 +178,11 @@ export async function migrateWorkspaceIndex(
     // interpreted against it, even when it does not exist on this host.
     const originalRoot = dirname(manifest.path);
     const destinationHome = join(destinationRoot, ".zvec-grep");
+    assertDestinationAvailable(destinationHome, [
+      "manifest.json",
+      "files.zvec",
+      "index.zvec",
+    ]);
 
     report("read", "Reading legacy index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
