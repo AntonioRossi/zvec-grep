@@ -166,6 +166,20 @@ async function runCliTransfer<T extends PortabilityOperation>(
   }
 }
 
+function formatVectorVerification(verification: {
+  vectorsExact: boolean;
+  vectorsPreserved: boolean;
+  vectorsCompared: number;
+  vectorsSampled: boolean;
+}): string {
+  const state = !verification.vectorsPreserved
+    ? "FAILED"
+    : verification.vectorsExact
+      ? "exact"
+      : "preserved (cosine tolerance: at most two float32 steps)";
+  return `vectors ${state} (${verification.vectorsCompared} compared, ${verification.vectorsSampled ? "sampled" : "all"})`;
+}
+
 async function runMigrate(parsed: ParsedArgs): Promise<void> {
   if (parsed.positionals.length !== 2) {
     throw new Error(
@@ -198,7 +212,7 @@ async function runMigrate(parsed: ParsedArgs): Promise<void> {
     );
   }
   console.log(
-    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared${result.verification.vectorsSampled ? ", sampled" : ", all"})`,
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, ${formatVectorVerification(result.verification)}`,
   );
   console.log(
     "The migrated index is unverified; the first indexing run reconciles content by hash.",
@@ -242,7 +256,7 @@ async function runImport(parsed: ParsedArgs): Promise<void> {
     );
   }
   console.log(
-    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared${result.verification.vectorsSampled ? ", sampled" : ", all"})`,
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, ${formatVectorVerification(result.verification)}`,
   );
   console.log(
     "The imported index is unverified; the first indexing run reconciles content by hash.",

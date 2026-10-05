@@ -110,6 +110,12 @@ that operation without stopping the caller. Normal errors and cancellation
 run checked cleanup. A fatal exit can leave a destination marked `INCOMPLETE`.
 The error reports that state as unresolved, not as a clean abort.
 
+The CLI reports `vectors exact` only when every compared component is exact.
+Otherwise it reports `vectors preserved` when the cosine tolerance passes.
+The result states the number compared and whether that check used a sample.
+A sampled result is not proof that every vector was compared. Differences
+outside the permitted tolerance still fail the operation.
+
 The CLI prints `Temporary transfer data: <path>` before the operation starts.
 On Linux and macOS, `SIGINT` and `SIGTERM` request checked cancellation. A
 forced process exit, such as `SIGKILL`, cannot run normal cleanup. After both
