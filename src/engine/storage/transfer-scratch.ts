@@ -79,7 +79,13 @@ export function createTransferScratch(): {
 
 /** Explicit operator recovery. Never remove an unrecorded or live directory. */
 export function recoverTransferScratch(input: string): void {
-  const path = resolve(input);
+  const requested = resolve(input);
+  // Parent aliases such as macOS /var -> /private/var are valid spellings.
+  // Reject a link at the scratch entry itself before resolving its parents.
+  const entry = lstatSync(requested);
+  if (!entry.isDirectory() || entry.isSymbolicLink())
+    unsafe("Not an owned transfer scratch directory.");
+  const path = realpathSync(requested);
   const owner = readOwner(path);
   for (const pid of [owner.pid, owner.childPid]) {
     if (pid !== null && !processIsGone(pid))

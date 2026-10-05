@@ -127,7 +127,9 @@ zg --cleanup-transfer /tmp/zg-portability-process-XXXXXX
 
 Use the exact printed path; the temporary directory can be elsewhere. This
 command checks the host, user, parent and child process IDs, directory identity
-and ownership record. It refuses active processes, copied records and symlinks.
+and ownership record. It accepts aliases in parent directories, such as macOS
+`/var`. It refuses active processes, copied records and a symlink at the scratch
+entry itself.
 It does not remove source or destination locks, index data or `INCOMPLETE`
 markers. Older `zg-transfer-source-*` copies have no ownership record and must
 be inspected manually. Never remove directories by name pattern alone.

@@ -250,7 +250,8 @@ See zg --help environment for precedence and Server-mode scope.`;
 Remove only a recorded private transfer directory after its parent and child
 processes have exited. Use the path printed as "Temporary transfer data".
 The command checks host, user, directory identity and process ownership.
-It refuses live owners, missing records, copied records and symlinks.
+Parent-directory aliases are accepted. A linked scratch entry is refused,
+as are live owners, missing records and copied records.
 Source indexes, destination indexes, INCOMPLETE markers and locks are not
 removed. Older unrecorded temporary copies require separate manual inspection.`;
     case "migrate":
