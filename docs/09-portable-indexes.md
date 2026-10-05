@@ -161,6 +161,13 @@ destination is an error; resolve the owner of that resource before retrying.
 
 Migration, export and import are also available through the full MCP toolset:
 `zvec_grep_index_migrate`, `zvec_grep_index_export` and `zvec_grep_index_import`.
+
+Migration and import return `missingFilesCount`, `missingFilesTruncated` and
+a `missingFiles` sample. By default the sample has at most 20 paths and 4096
+path characters. Text and structured results use the same sample. When the
+complete list is required, set `includeAllMissingFiles: true` in the initial
+operation request. That explicit response can be large. The engine and CLI
+keep the complete count; truncation does not change stored index data.
 Each requires `confirm: true` after an explicit user request. Existing MCP
 search and indexing tools can read and update the result. A tool path is a path visible to the server,
 not necessarily to the agent's computer. An agent must have an explicit user
