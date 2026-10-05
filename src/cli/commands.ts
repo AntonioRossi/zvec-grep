@@ -759,8 +759,20 @@ async function runQuery(parsed: ParsedArgs): Promise<void> {
       mode,
       serverAvailable: () => daemonIsReady(commandOptions.home),
       server: async () => {
-        await ensureServerIndex(commandOptions);
-        await runServerQuery(commandOptions, queries, routes);
+        try {
+          await runServerQuery(commandOptions, queries, routes);
+        } catch (error) {
+          // The search tool performs index discovery and authorization. A
+          // complete status scan is needed only for the missing-index policy.
+          if (
+            !(error instanceof Error) ||
+            !error.message.startsWith("[INDEX_MISSING]") ||
+            !(await ensureServerIndex(commandOptions))
+          ) {
+            throw error;
+          }
+          await runServerQuery(commandOptions, queries, routes);
+        }
       },
       direct: () => runDirectQuery(commandOptions, queries),
     });
@@ -903,11 +915,12 @@ async function buildImplicitDirectIndex(
   }
 }
 
-async function ensureServerIndex(options: CliOptions): Promise<void> {
+async function ensureServerIndex(options: CliOptions): Promise<boolean> {
   const root = resolve(process.cwd());
   const client = daemonClient(options);
   const status = await client.callTool("zvec_grep_index_status", { root });
-  if (status.indexed === true || status.index_policy === "disabled") return;
+  if (status.index_policy === "disabled") return false;
+  if (status.indexed === true) return true;
 
   const embedding = implicitEmbeddingReference(options);
   console.error(`No index found; creating one with ${embedding}.`);
@@ -935,6 +948,7 @@ async function ensureServerIndex(options: CliOptions): Promise<void> {
     progress.finish();
   }
   if (result.state === "failed") throw serverIndexFailure(result);
+  return true;
 }
 
 function implicitEmbeddingReference(options: CliOptions): string {

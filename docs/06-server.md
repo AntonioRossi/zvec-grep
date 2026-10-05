@@ -153,6 +153,12 @@ An explicit `--mode` wins over the environment and global configuration.
 
 ## Refresh behavior
 
+The CLI sends server searches directly to the search tool. It does not request
+a full index status scan before each search. If the search reports a missing
+index, the CLI checks the index policy before its existing implicit creation
+step. A disabled index remains disabled. Authorization failures do not create
+an index. The refresh policy below still applies.
+
 The execution mode changes the default indexed-search refresh policy:
 
 | Policy | Server | Direct |
