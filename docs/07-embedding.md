@@ -123,20 +123,28 @@ The equivalent environment override is `ZVEC_GREP_DEVICE`. Model2Vec models
 such as Potion use static vector lookup, so selecting a GPU does not improve
 their runtime.
 
-GGUF automatic concurrency uses the loaded model's context-memory estimate,
-including graph overhead, with a 50% margin for estimate uncertainty. The
-calculation uses one quarter of reported free GPU memory and a cap of eight
-contexts. If the estimate or memory information is unavailable, it selects one
-context. This calculation does not reserve memory or control other processes.
-The OS and GPU driver decide whether an allocation succeeds. Even one context
-can fail when memory is insufficient. The tests do not require or establish an
-idle host, and do not guarantee allocation when other processes consume memory.
+Local embedding concurrency follows upstream PR #159 (`e76c89f`). An explicit
+CLI/API value takes priority over `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY`.
+The optional llama.cpp legacy fallback is `ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM`.
+An invalid shared setting warns and selects automatic behavior; it does not
+select the legacy setting. These index settings do not change query concurrency.
 
-The explicit `--index-embedding-concurrency 2` option remains available. The
-environment fallback is `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=2`. An explicit
-value overrides the automatic calculation. Select it for the model and available
-capacity. Native allocation errors retain their cause. A catchable failure while
-adding contexts emits a warning if the batch can use contexts already created.
+Without an override, llama.cpp GPU concurrency uses the upstream calculation:
+25% of reported free GPU memory divided by 150 MiB per context, with a minimum
+of one and a maximum of eight. A failed or invalid memory read selects two.
+CPU execution or a backend without the memory API selects one. Batch size can
+lower the number used. The fork does not add another estimate or memory budget.
+
+Use `--index-embedding-concurrency 2` or
+`ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=2` to select concurrency explicitly.
+Each backend keeps its own cap; the local cap does not apply to remote models.
+Neither the automatic calculation nor an explicit value guarantees allocation.
+The OS, GPU driver and model runtime control memory allocation. Tests do not
+require or establish an idle host. No other process is stopped or reconfigured.
+
+Catchable context-creation failures retain their cause and stop indexing before
+failed-file handling can remove stored content. A catchable failure while adding
+contexts emits a warning if the batch can use contexts already created.
 
 For ONNX models using Transformers.js, `auto` uses the runtime's Node default
 (CPU). Select a GPU device explicitly when its hardware and runtime libraries

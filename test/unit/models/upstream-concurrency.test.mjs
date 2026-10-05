@@ -7,22 +7,16 @@ import { createTemporaryDirectory } from "../../helpers/fixtures.mjs";
 
 const GiB = 1024 ** 3;
 async function fixture(t, options = {}) {
-  const root = await createTemporaryDirectory(t, "zvec-gpu-budget-");
+  const root = await createTemporaryDirectory(t, "zvec-upstream-concurrency-");
   const modelPath = join(root, "test.gguf");
   await writeFile(modelPath, "GGUFpayload");
-  const calls = { contexts: 0, estimates: [], vram: 0, disposed: 0 };
+  const calls = { contexts: 0, estimates: 0, vram: 0, disposed: 0 };
   const fakeModel = {
     gpuLayers: 28,
-    fileInsights: options.unknownEstimate
-      ? undefined
-      : {
-          estimateContextResourceRequirements: (input) => {
-            calls.estimates.push(input);
-            return {
-              gpuVram: options.cost ?? (input.contextSize / 8192) * GiB,
-            };
-          },
-        },
+    get fileInsights() {
+      calls.estimates++;
+      throw new Error("fork context estimate must not be used");
+    },
     createEmbeddingContext: async () => {
       calls.contexts++;
       if (calls.contexts > (options.failAfter ?? Infinity)) {
@@ -37,7 +31,7 @@ async function fixture(t, options = {}) {
     },
   };
   const llama = {
-    gpu: "vulkan",
+    gpu: options.cpu ? false : "vulkan",
     getVramState: async () => {
       calls.vram++;
       if (options.vramError) throw new Error("counter unavailable");
@@ -49,6 +43,7 @@ async function fixture(t, options = {}) {
     },
     loadModel: async () => fakeModel,
   };
+  if (options.noMemoryApi) delete llama.getVramState;
   const model = new LlamaCppEmbeddingModel(
     {
       reference: "local/budget-test",
@@ -68,7 +63,7 @@ async function fixture(t, options = {}) {
       maxBatchSize: 8,
     },
     {
-      device: "vulkan",
+      device: options.cpu ? "cpu" : "vulkan",
       modelCacheDir: root,
       embeddingConcurrency: options.override,
     },
@@ -95,40 +90,33 @@ async function fixture(t, options = {}) {
   return { calls, embed };
 }
 
-test("F2 automatic context count uses the model and context estimate with a safety margin", async (t) => {
-  const large = await fixture(t);
-  await large.embed();
-  assert.equal(large.calls.contexts, 1);
-  assert.deepEqual(large.calls.estimates, [
-    { contextSize: 8192, modelGpuLayers: 28, isEmbeddingContext: true },
-  ]);
-  const small = await fixture(t, { contextSize: 2048 });
-  await small.embed();
-  assert.equal(small.calls.contexts, 5);
-});
-
-test("F2 missing estimates or memory counters permit only one automatic context", async (t) => {
-  for (const options of [
-    { unknownEstimate: true },
-    { vramError: true },
-    { cost: NaN },
-    { cost: 0 },
-  ]) {
-    const setup = await fixture(t, options);
+test("F2 llama GPU default follows upstream memory calculation without model estimates", async (t) => {
+  for (const contextSize of [8192, 2048]) {
+    const setup = await fixture(t, { contextSize });
     await setup.embed();
-    assert.equal(setup.calls.contexts, 1);
+    assert.equal(setup.calls.contexts, 8);
+    assert.equal(setup.calls.estimates, 0);
+    assert.equal(setup.calls.vram, 1);
   }
 });
 
-test("F2 the runtime allocates the calculated contexts without an allocation ledger", async (t) => {
-  const setup = await fixture(t, { cost: GiB / 4 });
-  await setup.embed();
-  assert.equal(setup.calls.contexts, 5);
-  assert.equal(
-    setup.calls.vram,
-    1,
-    "only the concurrency calculation reads memory",
-  );
+test("F2 upstream GPU fallback uses two for failed or invalid memory reads", async (t) => {
+  for (const options of [{ vramError: true }, { free: NaN }, { free: -1 }]) {
+    const setup = await fixture(t, options);
+    await setup.embed();
+    assert.equal(setup.calls.contexts, 2);
+    assert.equal(setup.calls.estimates, 0);
+  }
+});
+
+test("F2 upstream CPU and missing-memory-API defaults remain one", async (t) => {
+  for (const options of [{ cpu: true }, { noMemoryApi: true }]) {
+    const setup = await fixture(t, options);
+    await setup.embed();
+    assert.equal(setup.calls.contexts, 1);
+    assert.equal(setup.calls.vram, 0);
+    assert.equal(setup.calls.estimates, 0);
+  }
 });
 
 test("F2 a partial context allocation failure reports the cause and uses available contexts", async (t) => {
@@ -167,15 +155,15 @@ test("F2 a first-context allocation failure preserves the error and recovery hin
   });
 });
 
-test("F2 automatic calculation and explicit concurrency remain available across batches", async (t) => {
-  const automatic = await fixture(t);
-  await automatic.embed(1);
-  await automatic.embed(8);
-  await automatic.embed(8);
-  assert.equal(automatic.calls.contexts, 1);
-  const explicit = await fixture(t, { override: 2, vramError: true });
-  await explicit.embed();
-  assert.equal(explicit.calls.contexts, 2);
-  assert.equal(explicit.calls.estimates.length, 0);
-  assert.equal(explicit.calls.vram, 0);
+test("F2 explicit local concurrency keeps the upstream cap and bypasses memory detection", async (t) => {
+  for (const [override, expected] of [
+    [2, 2],
+    [99, 8],
+  ]) {
+    const setup = await fixture(t, { override, vramError: true });
+    await setup.embed();
+    assert.equal(setup.calls.contexts, expected);
+    assert.equal(setup.calls.estimates, 0);
+    assert.equal(setup.calls.vram, 0);
+  }
 });

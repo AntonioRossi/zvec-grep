@@ -45,14 +45,6 @@ type LlamaEmbeddingContext = {
 
 type LlamaModel = {
   trainContextSize?: number;
-  gpuLayers?: number;
-  fileInsights?: {
-    estimateContextResourceRequirements(options: {
-      contextSize: number;
-      modelGpuLayers: number;
-      isEmbeddingContext: boolean;
-    }): { gpuVram: number };
-  };
   tokenize?(text: string): readonly unknown[];
   detokenize?(tokens: readonly unknown[]): string;
   createEmbeddingContext(
@@ -94,7 +86,6 @@ type LlamaCppDependencies = {
 };
 
 const DEFAULT_MODEL_CACHE_DIR = join(defaultHome(), "models");
-const CONTEXT_MEMORY_MARGIN = 1.5;
 const GGUF_MAGIC = Buffer.from("GGUF");
 const DEFAULT_DARWIN_CMAKE_OPTIONS = {
   GGML_OPENMP: "OFF",
@@ -670,25 +661,8 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     }
 
     const llama = await this.ensureLlama();
-    if (this.shouldDisableModelGpuOffload() || !llama.gpu) return 1;
-
-    let contextCost = 0;
-    try {
-      const model = this.model;
-      if (model?.fileInsights && typeof model.gpuLayers === "number") {
-        contextCost =
-          model.fileInsights.estimateContextResourceRequirements({
-            contextSize: this.entry.contextSize,
-            modelGpuLayers: model.gpuLayers,
-            isEmbeddingContext: true,
-          }).gpuVram * CONTEXT_MEMORY_MARGIN;
-      }
-    } catch {
-      // Unknown estimates permit one context, never speculative extra workers.
-    }
     return await resolveLocalEmbeddingParallelism({
-      gpu: true,
-      contextVramBytes: contextCost,
+      gpu: !this.shouldDisableModelGpuOffload() && Boolean(llama.gpu),
       getVramState: llama.getVramState?.bind(llama),
     });
   }
