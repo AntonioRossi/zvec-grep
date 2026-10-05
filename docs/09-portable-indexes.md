@@ -105,10 +105,26 @@ with native storage and file/fragment identity maps, but the application does
 not retain all source and destination vectors as JavaScript arrays. Increasing
 the Node heap alone does not correct a failed vector verification.
 
-MCP operations run in a separate process. A fatal native error can stop that
-operation without stopping the shared daemon. Normal errors and cancellation
+CLI and MCP operations run in a separate process. A fatal native error can stop
+that operation without stopping the caller. Normal errors and cancellation
 run checked cleanup. A fatal exit can leave a destination marked `INCOMPLETE`.
 The error reports that state as unresolved, not as a clean abort.
+
+The CLI prints `Temporary transfer data: <path>` before the operation starts.
+On Linux and macOS, `SIGINT` and `SIGTERM` request checked cancellation. A
+forced process exit, such as `SIGKILL`, cannot run normal cleanup. After both
+recorded processes have exited, remove only that private copy with:
+
+```bash
+zg --cleanup-transfer /tmp/zg-portability-process-XXXXXX
+```
+
+Use the exact printed path; the temporary directory can be elsewhere. This
+command checks the host, user, parent and child process IDs, directory identity
+and ownership record. It refuses active processes, copied records and symlinks.
+It does not remove source or destination locks, index data or `INCOMPLETE`
+markers. Older `zg-transfer-source-*` copies have no ownership record and must
+be inspected manually. Never remove directories by name pattern alone.
 
 For an abandoned destination, stop all users of that workspace and confirm
 that the recorded owner process is dead on the recorded host. Keep the source

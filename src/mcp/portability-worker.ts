@@ -46,7 +46,7 @@ try {
       ? await migrateWorkspaceIndex({
           sourceHome: input.sourceHome!,
           destinationRoot: input.destinationRoot!,
-          verifySampleLimit: 0,
+          verifySampleLimit: input.verifySampleLimit ?? 0,
           onProgress,
         })
       : operation === "export"
@@ -58,7 +58,7 @@ try {
         : await importWorkspaceIndex({
             artifactPath: input.artifactPath!,
             destinationRoot: input.destinationRoot!,
-            verifySampleLimit: 0,
+            verifySampleLimit: input.verifySampleLimit ?? 0,
             onProgress,
           });
   post({ type: "result", result });

@@ -97,6 +97,7 @@ const ACTION_FLAGS = new Map<string, CliCommand>([
   ["--index", "index"],
   ["--status", "status"],
   ["--migrate-index", "migrate"],
+  ["--cleanup-transfer", "cleanup-transfer"],
   ["--export-index", "export"],
   ["--import-index", "import"],
   ["--install", "install"],
