@@ -160,7 +160,9 @@ paths, `device`, `apiKey`, or any verification claim.
    - full ID remapping (file IDs, fragment IDs, group references,
      `entity_ids_json` inventories) with the index UUID preserved — the
      accepted decision; no permanent lookup table;
-   - stored vectors and fragment content preserved byte-exactly, with native
+   - fragment content preserved byte-exactly; stored vectors are exact for dot
+     and Euclidean metrics and within two float32 ULPs per component for cosine
+     round trips (reported separately from exact equality), with native
      write statuses checked;
    - verification of the destination before activation: counts, unique and
      **correctly derived** identities (`sha256hex(index UUID + "\0" +

@@ -130,7 +130,7 @@ export function readWorkspaceManifest(home: string): WorkspaceManifest | null {
 
   if (isRecord(value) && value.manifestVersion === LEGACY_MANIFEST_VERSION) {
     throw new EngineError(
-      "Workspace index uses the legacy absolute-path format and needs migration",
+      "Workspace index uses the legacy absolute-path format and needs migration. Use zg --migrate-index <source-home> <empty-destination-root>. The destination must not contain an index; see docs/09-portable-indexes.md for replacement at the same root.",
       {
         code: "ZVEC_GREP.ENGINE.MANIFEST.MIGRATION_REQUIRED",
         context: `path=${path}`,

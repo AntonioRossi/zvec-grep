@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import {
   cp,
   mkdir,
@@ -470,6 +470,46 @@ async function waitForCleanup(f) {
     "the operation must release its locks, marker and staging before fixture teardown",
   );
 }
+
+test("MCP survives a fatal portability process exit and retains the incomplete destination", async (t) => {
+  const f = await preparedOperation(t, "migrate");
+  const before = await inventory(f.source);
+  let stopped = false;
+  const result = await f.client.callTool(
+    { name: tool("migrate"), arguments: { ...f.input, confirm: true } },
+    {
+      onprogress: (progress) => {
+        if (progress.message.startsWith("write:") && !stopped) {
+          const lock = JSON.parse(
+            readFileSync(
+              join(f.destination, "locks/home.write/lock.json"),
+              "utf8",
+            ),
+          );
+          stopped = true;
+          // Node's test runner isolates this file. On the old thread path this
+          // deliberately kills that test process, proving the missing boundary.
+          process.kill(lock.pid, "SIGKILL");
+        }
+      },
+    },
+  );
+  assert.equal(stopped, true);
+  assert.equal(result.isError, true);
+  assert.match(JSON.stringify(result), /TRANSFER_PROCESS_FAILED/);
+  assert.ok(existsSync(join(f.destination, "INCOMPLETE")));
+  assert.deepEqual(await inventory(f.source), before);
+  await requireTool(f.client, "migrate");
+  const exported = await call(f.client, "export", {
+    sourceHome: f.source,
+    artifactPath: join(f.parent, "after-crash"),
+  });
+  assert.equal(
+    exported.indexId,
+    f.original.id,
+    "the same MCP server must serve the next operation",
+  );
+});
 
 test("MCP import rejects malformed entity data and preserves the artifact and destination", async (t) => {
   const f = await preparedOperation(t, "import");

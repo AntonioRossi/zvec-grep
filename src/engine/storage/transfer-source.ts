@@ -8,13 +8,13 @@ import { resolveWorkspaceIndexStoragePaths } from "./layout.js";
 // can still change vector-index metadata. Open private copies, never the
 // original files. Reflinks reduce copying where supported; no hard links.
 export function readNativeTransferSource(sourceHome: string): {
-  fileDocs: ZVecDoc[];
-  entityDocs: ZVecDoc[];
+  files: () => Iterable<ZVecDoc>;
+  entities: (includeVector?: boolean) => Iterable<ZVecDoc>;
+  counts: { files: number; entities: number };
+  close: () => void;
 } {
   const snapshot = mkdtempSync(join(tmpdir(), "zg-transfer-source-"));
   const handles: ZVecCollection[] = [];
-  const errors: unknown[] = [];
-  let result: { fileDocs: ZVecDoc[]; entityDocs: ZVecDoc[] } | undefined;
   try {
     const source = resolveWorkspaceIndexStoragePaths(sourceHome);
     const copy = resolveWorkspaceIndexStoragePaths(snapshot);
@@ -29,14 +29,27 @@ export function readNativeTransferSource(sourceHome: string): {
     }
     const files = open(copy.filesPath);
     const entities = open(copy.indexPath);
-    result = {
-      fileDocs: [...files.iterDocsSync({ includeVector: false })],
-      entityDocs: [...entities.iterDocsSync({ includeVector: true })],
+    return {
+      files: function* () {
+        yield* files.iterDocsSync({ includeVector: false });
+      },
+      entities: function* (includeVector = true) {
+        yield* entities.iterDocsSync({ includeVector });
+      },
+      counts: {
+        files: files.stats.docCount,
+        entities: entities.stats.docCount,
+      },
+      close: () => close(),
     };
   } catch (error) {
-    errors.push(error);
-  } finally {
-    for (const handle of handles.reverse()) {
+    close(error);
+    throw error;
+  }
+
+  function close(cause?: unknown) {
+    const errors: unknown[] = cause === undefined ? [] : [cause];
+    for (const handle of handles.splice(0).reverse()) {
       try {
         handle.closeSync();
       } catch (error) {
@@ -48,15 +61,14 @@ export function readNativeTransferSource(sourceHome: string): {
     } catch (error) {
       errors.push(error);
     }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        `Transfer source read or cleanup failed: ${errors.map(String).join("; ")}`,
+      );
+    }
   }
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) {
-    throw new AggregateError(
-      errors,
-      `Transfer source read or cleanup failed: ${errors.map(String).join("; ")}`,
-    );
-  }
-  return result!;
 
   function open(path: string): ZVecCollection {
     const handle = ZVecOpen(path, { readOnly: true, enableMMAP: false });

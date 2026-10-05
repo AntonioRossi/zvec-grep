@@ -40,6 +40,7 @@ const verification = z.object({
   vectorsSampled: z.boolean(),
   vectorsCompared: z.number(),
   vectorsExact: z.boolean(),
+  vectorsPreserved: z.boolean(),
 });
 const results = {
   migrate: z.object({

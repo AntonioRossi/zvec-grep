@@ -70,6 +70,53 @@ vectors are preserved; path-derived file and fragment identifiers change to
 the portable form. Review the returned missing-file list. Do not claim a
 complete workspace when source documents are absent.
 
+Verification reports `vectorsExact` and `vectorsPreserved` separately.
+For cosine storage, a native write/read can change a component by float32
+rounding. `vectorsPreserved` permits at most two float32 representable steps
+per component. Dot and Euclidean storage still require exact equality.
+Non-finite values, different dimensions and larger changes fail verification.
+This rule does not permit a different model or recompute any embedding.
+
+### Replace a legacy index at the same workspace root
+
+Migration does not overwrite an occupied destination. Do not move the working
+legacy index aside before conversion. Use this sequence:
+
+1. Stop writers, watchers and services for the workspace. Keep them stopped
+   through replacement. Make and verify a restorable backup.
+2. Create an empty temporary workspace outside the source workspace. Run
+   `zg --migrate-index /project/.zvec-grep /temporary/workspace`.
+   The source remains in place while conversion runs. If the temporary workspace
+   has no documents, the missing-file list is expected; it is not evidence of
+   lost index records. Check the exit status and all verification fields.
+3. Only after successful verification, rename `/project/.zvec-grep` to a new
+   backup name on the same filesystem. Move the verified
+   `/temporary/workspace/.zvec-grep` to `/project/.zvec-grep`.
+   If the second move fails, restore the backup before restarting clients.
+   Do not overwrite or delete an existing backup.
+4. Reopen the index at `/project`. Check identity, expected query hits and
+   the missing-file list there. Keep the legacy backup until acceptance.
+   The first explicit indexing run reconciles files by content hash.
+
+### Memory and failed operations
+
+Migration and logical transfer stream text and vectors. Memory still grows
+with native storage and file/fragment identity maps, but the application does
+not retain all source and destination vectors as JavaScript arrays. Increasing
+the Node heap alone does not correct a failed vector verification.
+
+MCP operations run in a separate process. A fatal native error can stop that
+operation without stopping the shared daemon. Normal errors and cancellation
+run checked cleanup. A fatal exit can leave a destination marked `INCOMPLETE`.
+The error reports that state as unresolved, not as a clean abort.
+
+For an abandoned destination, stop all users of that workspace and confirm
+that the recorded owner process is dead on the recorded host. Keep the source
+index and its backup. Preserve the failed destination under a new quarantine
+name before retrying with a new, empty destination. Do not remove only the
+`INCOMPLETE` marker or treat partial files as a completed index. Dead reader
+locks are reclaimed by the existing lock protocol; active locks are not removed.
+
 ## Logical export and import
 
 On the sending host:
