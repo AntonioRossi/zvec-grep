@@ -1,6 +1,5 @@
 import { readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { tryRealpathSync } from "./utils/canonical-path.js";
 import { readJsonFileSync, writeJsonFileSync } from "./utils/json.js";
 import { acquireReadWriteLock } from "./utils/lock.js";
 import { defaultHome } from "./utils/path.js";
@@ -40,11 +39,10 @@ export function currentWorkspaceBinding(
   // Resolve the actual filesystem spelling before recording identity: NFC
   // canonical document identities must not change which physical root gets
   // inspected (distinct NFC/NFD root directories are different bindings).
-  const rootPath = tryRealpathSync(workspaceRoot);
-  if (rootPath === undefined) {
-    return null;
-  }
   try {
+    // Match fs.promises.realpath in the daemon. On Windows the JavaScript
+    // resolver can preserve 8.3 path aliases that native realpath expands.
+    const rootPath = realpathSync.native(workspaceRoot);
     const rootInfo = statSync(rootPath);
     const homeInfo = statSync(join(rootPath, ".zvec-grep"));
     return {
@@ -66,7 +64,7 @@ export function currentWorkspaceBinding(
  */
 function resolveBindingRoot(workspaceRoot: string): string | undefined {
   try {
-    return realpathSync(workspaceRoot);
+    return realpathSync.native(workspaceRoot);
   } catch (error) {
     if (
       isNodeError(error) &&

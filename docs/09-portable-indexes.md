@@ -194,6 +194,9 @@ request before it creates or changes a persistent index.
    reconciles content by hash. Unchanged documents reuse vectors; changed
    documents can require new embeddings. Record document-embedding calls when
    testing a zero-document-embedding claim.
+   Host verification uses the native resolved workspace path and filesystem
+   identity. Windows short-path aliases refer to the same binding. An older
+   binding with a different path spelling can require one reconciliation.
 5. In a disposable copy, change one document and remove another. Run indexing
    explicitly. Check the changed content, removal of deleted files from stored
    entries, and preservation of unrelated documents. Retain the output and exits.

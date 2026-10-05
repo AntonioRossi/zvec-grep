@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -95,11 +94,9 @@ test("engine writes bindings only into an inherited isolated home", async (t) =>
   }
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
-  // Bindings record the workspace's physical root (realpathSync in
-  // src/engine/bindings.ts); compare with the same function the writer
-  // uses, not the raw spelling, so a symlinked temporary directory
-  // (macOS /var, Windows path forms) still matches.
-  const expectedRoot = realpathSync(root);
+  // The store and daemon must agree on the physical root, including
+  // macOS /var aliases and Windows short names. Use the daemon's API.
+  const expectedRoot = await realpath(root);
   assert.ok(
     roots.includes(expectedRoot),
     `the isolated home must carry a binding for this exact workspace; recorded=${JSON.stringify(roots)} expected=${expectedRoot}`,
@@ -140,7 +137,7 @@ test("child inherits the isolated home, executes, and records the exact workspac
   );
 
   const roots = await bindingRootsFromStore(join(isolatedHome, "bindings"));
-  const expectedRoot = realpathSync(root);
+  const expectedRoot = await realpath(root);
   assert.ok(
     roots.includes(expectedRoot),
     `the isolated home must carry a binding for the parent-owned workspace; recorded=${JSON.stringify(roots)} expected=${expectedRoot}`,
@@ -184,7 +181,7 @@ test("unset override writes to a disposable shadow home, never production", asyn
   const roots = await bindingRootsFromStore(
     join(shadowHome, ".zvec-grep", "bindings"),
   );
-  const expectedRoot = realpathSync(root);
+  const expectedRoot = await realpath(root);
   assert.ok(
     roots.includes(expectedRoot),
     `the disposable shadow home must carry a binding for the parent-owned workspace; recorded=${JSON.stringify(roots)} expected=${expectedRoot}`,
