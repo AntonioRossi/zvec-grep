@@ -31,10 +31,22 @@ export function readNativeTransferSource(sourceHome: string): {
     const entities = open(copy.indexPath);
     return {
       files: function* () {
-        yield* files.iterDocsSync({ includeVector: false });
+        const iterator = files.iterDocsSync({ includeVector: false });
+        try {
+          // Do not delegate with yield*: it calls native next(undefined).
+          // Some 0.7 bindings enforce a zero-argument next() contract.
+          for (const doc of iterator) yield doc;
+        } finally {
+          iterator.closeSync();
+        }
       },
       entities: function* (includeVector = true) {
-        yield* entities.iterDocsSync({ includeVector });
+        const iterator = entities.iterDocsSync({ includeVector });
+        try {
+          for (const doc of iterator) yield doc;
+        } finally {
+          iterator.closeSync();
+        }
       },
       counts: {
         files: files.stats.docCount,
