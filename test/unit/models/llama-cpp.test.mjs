@@ -60,6 +60,12 @@ function createDependencies(modelPath, options = {}) {
     lifecycle: [],
   };
   const model = {
+    gpuLayers: 28,
+    fileInsights: {
+      estimateContextResourceRequirements: () => ({
+        gpuVram: 150 * 1024 * 1024,
+      }),
+    },
     trainContextSize: options.trainContextSize ?? 6,
     tokenize: (text) => [...text],
     detokenize: (tokens) => tokens.join(""),

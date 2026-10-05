@@ -195,7 +195,7 @@ test("explicit local embedding parallelism bypasses GPU detection and CPU uses o
   assert.equal(reads, 0);
 });
 
-test("automatic GPU parallelism uses a quarter of free VRAM at 150 MiB per worker", async () => {
+test("automatic GPU parallelism uses a quarter of free VRAM with a supplied context cost", async () => {
   for (const [freeMb, expected] of [
     [0, 1],
     [599, 1],
@@ -210,6 +210,7 @@ test("automatic GPU parallelism uses a quarter of free VRAM at 150 MiB per worke
     assert.equal(
       await resolveLocalEmbeddingParallelism({
         gpu: true,
+        contextVramBytes: 150 * 1024 * 1024,
         getVramState: async () => ({ free: freeMb * 1024 * 1024 }),
       }),
       expected,
@@ -218,23 +219,25 @@ test("automatic GPU parallelism uses a quarter of free VRAM at 150 MiB per worke
   }
 });
 
-test("automatic GPU parallelism falls back to two when VRAM is unavailable or invalid", async () => {
+test("automatic GPU parallelism uses one context when VRAM is unavailable or invalid", async () => {
   assert.equal(
     await resolveLocalEmbeddingParallelism({
       gpu: true,
+      contextVramBytes: 150 * 1024 * 1024,
       getVramState: async () => {
         throw new Error("VRAM unavailable");
       },
     }),
-    2,
+    1,
   );
   for (const free of [-1, NaN, Infinity, -Infinity, undefined, "1024"]) {
     assert.equal(
       await resolveLocalEmbeddingParallelism({
         gpu: true,
+        contextVramBytes: 150 * 1024 * 1024,
         getVramState: async () => ({ free }),
       }),
-      2,
+      1,
     );
   }
 });

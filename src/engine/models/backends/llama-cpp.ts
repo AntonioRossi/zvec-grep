@@ -24,6 +24,7 @@ import {
 } from "../artifact-downloader.js";
 import type { LlamaCppEmbeddingCatalogEntry } from "../catalog.js";
 import {
+  GPU_VRAM_BUDGET_RATIO,
   INDEX_EMBEDDING_CONCURRENCY_ENV,
   normalizeLocalEmbeddingConcurrency,
   resolveLocalEmbeddingParallelism,
@@ -45,6 +46,14 @@ type LlamaEmbeddingContext = {
 
 type LlamaModel = {
   trainContextSize?: number;
+  gpuLayers?: number;
+  fileInsights?: {
+    estimateContextResourceRequirements(options: {
+      contextSize: number;
+      modelGpuLayers: number;
+      isEmbeddingContext: boolean;
+    }): { gpuVram: number };
+  };
   tokenize?(text: string): readonly unknown[];
   detokenize?(tokens: readonly unknown[]): string;
   createEmbeddingContext(
@@ -86,6 +95,7 @@ type LlamaCppDependencies = {
 };
 
 const DEFAULT_MODEL_CACHE_DIR = join(defaultHome(), "models");
+const CONTEXT_MEMORY_MARGIN = 1.5;
 const GGUF_MAGIC = Buffer.from("GGUF");
 const DEFAULT_DARWIN_CMAKE_OPTIONS = {
   GGML_OPENMP: "OFF",
@@ -160,6 +170,12 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
   private llamaLoadPromise: Promise<Llama> | null = null;
   private modelLoadPromise: Promise<LlamaModel> | null = null;
   private contextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
+  private automaticGpuPlan: {
+    parallelism: number;
+    budget: number;
+    allocated: number;
+    contextCost: number;
+  } | null = null;
   private sourceFallbackWarningReported = false;
   private usingCpuFallback = false;
   private disposed = false;
@@ -512,6 +528,17 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     const initialContextCount = this.contexts.length;
 
     while (this.contexts.length < targetParallelism) {
+      const plan = this.automaticGpuPlan;
+      const freeBefore = plan ? await this.readFreeVram() : undefined;
+      if (
+        plan &&
+        this.contexts.length > 0 &&
+        (freeBefore === undefined ||
+          plan.allocated + plan.contextCost > plan.budget ||
+          plan.contextCost > freeBefore * GPU_VRAM_BUDGET_RATIO)
+      ) {
+        break;
+      }
       try {
         this.contexts.push(
           await model.createEmbeddingContext({
@@ -519,6 +546,18 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
             threads,
           }),
         );
+        if (plan) {
+          const freeAfter = await this.readFreeVram();
+          // The estimate includes model metadata and graph overhead. Observed
+          // allocation can raise it, but must never lower the safety margin.
+          if (freeBefore !== undefined && freeAfter !== undefined) {
+            plan.contextCost = Math.max(
+              plan.contextCost,
+              (freeBefore - freeAfter) * CONTEXT_MEMORY_MARGIN,
+            );
+          }
+          plan.allocated += plan.contextCost;
+        }
       } catch (error) {
         if (this.contexts.length === initialContextCount) {
           throw error;
@@ -539,6 +578,7 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
   }
 
   private async disposeLoadedRuntime(): Promise<void> {
+    this.automaticGpuPlan = null;
     const contexts = this.contexts;
     this.contexts = [];
     for (const context of contexts) {
@@ -651,10 +691,47 @@ export class LlamaCppEmbeddingModel extends BaseEmbeddingModel {
     }
 
     const llama = await this.ensureLlama();
-    return await resolveLocalEmbeddingParallelism({
-      gpu: !this.shouldDisableModelGpuOffload() && Boolean(llama.gpu),
-      getVramState: llama.getVramState?.bind(llama),
+    if (this.shouldDisableModelGpuOffload() || !llama.gpu) return 1;
+    if (this.automaticGpuPlan) return this.automaticGpuPlan.parallelism;
+
+    let contextCost = 0;
+    try {
+      const model = this.model;
+      if (model?.fileInsights && typeof model.gpuLayers === "number") {
+        contextCost =
+          model.fileInsights.estimateContextResourceRequirements({
+            contextSize: this.entry.contextSize,
+            modelGpuLayers: model.gpuLayers,
+            isEmbeddingContext: true,
+          }).gpuVram * CONTEXT_MEMORY_MARGIN;
+      }
+    } catch {
+      // Unknown estimates permit one context, never speculative extra workers.
+    }
+    const free = await this.readFreeVram();
+    const parallelism = await resolveLocalEmbeddingParallelism({
+      gpu: true,
+      contextVramBytes: contextCost,
+      getVramState: async () => ({ free: free ?? NaN }),
     });
+    this.automaticGpuPlan = {
+      parallelism,
+      budget: (free ?? 0) * GPU_VRAM_BUDGET_RATIO,
+      allocated: 0,
+      contextCost,
+    };
+    return parallelism;
+  }
+
+  private async readFreeVram(): Promise<number | undefined> {
+    try {
+      const free = (await this.llama?.getVramState?.())?.free;
+      return typeof free === "number" && Number.isFinite(free) && free >= 0
+        ? free
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async resolveEffectiveParallelism(
