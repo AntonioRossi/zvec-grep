@@ -11,6 +11,7 @@ import {
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { detail, EngineError, errorDetails } from "../errors.js";
+import { INCOMPLETE_RECOVERY_HINT } from "./recovery-guidance.js";
 
 export type FileLock = {
   readonly path: string;
@@ -393,6 +394,7 @@ function lockBusyError(
   requestedOperation: string,
 ): EngineError {
   const owner = readLockInfo(lockPath);
+  const state = ownerState(owner);
 
   return new EngineError("Index unavailable", {
     code: "ZVEC_GREP.ENGINE.LOCK.BUSY",
@@ -402,10 +404,8 @@ function lockBusyError(
       detail("ownerOperation", owner?.operation),
       detail("ownerPid", owner?.pid),
       detail("ownerHost", owner?.hostname),
-      detail(
-        "hint",
-        "Another operation holds or last owned this lock. Write locks are never reclaimed automatically; after all writers are quiescent, remove the lock directory shown above manually to recover.",
-      ),
+      detail("ownerState", state),
+      detail("hint", lockRecoveryHint(state)),
     ]),
   });
 }
@@ -415,6 +415,7 @@ function readLockBusyError(
   requestedOperation: string,
 ): EngineError {
   const owner = firstActiveReaderInfo(lockPath);
+  const state = ownerState(owner);
 
   return new EngineError("Index unavailable", {
     code: "ZVEC_GREP.ENGINE.LOCK.BUSY",
@@ -424,10 +425,8 @@ function readLockBusyError(
       detail("ownerOperation", owner?.operation),
       detail("ownerPid", owner?.pid),
       detail("ownerHost", owner?.hostname),
-      detail(
-        "hint",
-        "Another operation holds or last owned this lock. Write locks are never reclaimed automatically; after all writers are quiescent, remove the lock directory shown above manually to recover.",
-      ),
+      detail("ownerState", state),
+      detail("hint", lockRecoveryHint(state)),
     ]),
   });
 }
@@ -466,4 +465,18 @@ function readersLockPath(lockPath: string): string {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && "code" in error;
+}
+
+function ownerState(owner: FileLockInfo | null): LockLiveness {
+  return owner?.hostname === hostname()
+    ? processLiveness(owner.pid)
+    : "unknown";
+}
+
+function lockRecoveryHint(state: LockLiveness): string {
+  if (state === "alive")
+    return "Another operation is active. Wait for it to finish or cancel it through its owner. Do not remove an active lock.";
+  if (state === "unknown")
+    return "Owner activity cannot be confirmed. Write locks are never reclaimed automatically. Verify the recorded owner on its host before operator recovery. Do not remove an unconfirmed lock. If the destination is INCOMPLETE, preserve its entire index home for inspection; see docs/09-portable-indexes.md.";
+  return `The recorded local owner has exited. Write locks remain as safety barriers; dead local reader entries are checked separately. ${INCOMPLETE_RECOVERY_HINT}`;
 }

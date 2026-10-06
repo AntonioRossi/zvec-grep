@@ -1,11 +1,12 @@
-import { appendFileSync, createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
+import { appendFileSync, openSync, closeSync, readSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { dirname, join } from "node:path";
 import { WorkspaceBindingStore } from "../bindings.js";
 import { EngineError } from "../errors.js";
 import {
   appendReservationCleanup,
   reserveDestination,
+  assertDestinationAvailable,
   type DestinationReservation,
 } from "../reservation.js";
 import {
@@ -117,14 +118,20 @@ export async function exportWorkspaceIndex(
     operation: "index.export",
   });
   let reservation: DestinationReservation | undefined;
+  let source: ReturnType<typeof readNativeTransferSource> | undefined;
   try {
     // The incomplete-home guard runs under the source lock before any
     // collection or metadata read: a crashed reservation blocks consumption
     // even after its owner is gone.
     assertHomeNotIncomplete(sourceHome);
+    assertDestinationAvailable(options.artifactPath, [
+      "format.json",
+      "manifest.json",
+    ]);
     report("read", "Reading source index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-    const { fileDocs, entityDocs } = readNativeTransferSource(sourceHome);
+    source = readNativeTransferSource(sourceHome);
+    const counts = source.counts;
 
     const rawManifest = readJsonFileSync<unknown>(
       join(sourceHome, "manifest.json"),
@@ -160,10 +167,10 @@ export async function exportWorkspaceIndex(
         computeLegacyIdentityRemaps(
           originalRoot,
           rawManifest.id,
-          fileDocs,
-          entityDocs,
+          source.files(),
+          source.entities(false),
         );
-      for (const doc of fileDocs) {
+      for (const doc of source.files()) {
         const { absolute_path: _legacyAbsolute, ...fields } = doc.fields;
         const newId = fileIdByOld.get(doc.id)!;
         writer.writeDoc("files", {
@@ -186,7 +193,7 @@ export async function exportWorkspaceIndex(
           },
         });
       }
-      for (const doc of entityDocs) {
+      for (const doc of source.entities()) {
         const group = doc.fields.group;
         writer.writeDoc("entities", {
           id: fragmentIdByOld.get(doc.id)!,
@@ -213,10 +220,10 @@ export async function exportWorkspaceIndex(
           sourceHome,
         );
       }
-      for (const doc of fileDocs) {
+      for (const doc of source.files()) {
         writer.writeDoc("files", { id: doc.id, fields: { ...doc.fields } });
       }
-      for (const doc of entityDocs) {
+      for (const doc of source.entities()) {
         writer.writeDoc("entities", {
           id: doc.id,
           fields: { ...doc.fields },
@@ -228,6 +235,8 @@ export async function exportWorkspaceIndex(
     }
 
     writer.finish();
+    source.close();
+    source = undefined;
     report("publish", "Publishing transfer artifact");
     // Publication: format and manifest metadata are finalized into staging
     // and moved into place last; the reservation commits once at release.
@@ -240,7 +249,7 @@ export async function exportWorkspaceIndex(
         indexVersion: CURRENT_INDEX_VERSION,
         createdTime: portableManifest.createdTime,
         exportedTime: Date.now(),
-        counts: { files: fileDocs.length, entities: entityDocs.length },
+        counts,
       };
       writeJsonFileSync(join(reserved.stagingHome, "format.json"), formatFile, {
         fileMode: 0o600,
@@ -256,8 +265,8 @@ export async function exportWorkspaceIndex(
     return {
       artifactPath: options.artifactPath,
       indexId: portableManifest.id,
-      filesExported: fileDocs.length,
-      entitiesExported: entityDocs.length,
+      filesExported: counts.files,
+      entitiesExported: counts.entities,
     };
   } catch (error) {
     const cleanup = reservation?.abort();
@@ -266,7 +275,11 @@ export async function exportWorkspaceIndex(
     }
     throw error;
   } finally {
-    lock.release();
+    try {
+      source?.close();
+    } finally {
+      lock.release();
+    }
   }
 }
 
@@ -307,6 +320,11 @@ async function importWorkspaceIndexLocked(
   artifactPath: string,
   destinationRoot: string,
 ): Promise<ImportWorkspaceIndexResult> {
+  assertDestinationAvailable(join(destinationRoot, ".zvec-grep"), [
+    "manifest.json",
+    "files.zvec",
+    "index.zvec",
+  ]);
   report("read", "Reading transfer artifact");
   const formatFile = readJsonFileSync<TransferFormatFile | null>(
     join(artifactPath, "format.json"),
@@ -396,28 +414,23 @@ async function importWorkspaceIndexLocked(
       ),
     );
 
-    const fileDocs = await readJsonLines<{
-      id: string;
-      fields: Record<string, unknown>;
-    }>(join(artifactPath, "files.jsonl"));
-    const entityDocs = await readJsonLines<{
-      id: string;
-      fields: Record<string, unknown>;
-      vector: string;
-    }>(join(artifactPath, "entities.jsonl"));
-    if (
-      fileDocs.length !== formatFile.counts.files ||
-      entityDocs.length !== formatFile.counts.entities
-    ) {
-      throw transferError(
-        "Transfer artifact counts do not match its format declaration",
-        artifactPath,
+    const files = () =>
+      readJsonLines<{ id: string; fields: Record<string, unknown> }>(
+        join(artifactPath, "files.jsonl"),
       );
-    }
-
+    const entities = () =>
+      readJsonLines<{
+        id: string;
+        fields: Record<string, unknown>;
+        vector: string;
+      }>(join(artifactPath, "entities.jsonl"));
+    let fileCount = 0;
+    let entityCount = 0;
+    let probe: number[] | undefined;
     const resolver = createCanonicalPathResolver(destinationRoot);
     const missingFiles: string[] = [];
-    for (const doc of fileDocs) {
+    for (const doc of files()) {
+      fileCount++;
       assertInsertOk(
         destFiles.insertSync({ id: doc.id, fields: doc.fields }),
         doc.id,
@@ -434,10 +447,10 @@ async function importWorkspaceIndexLocked(
         missingFiles.push(canonicalPath);
       }
     }
-    const vectorById = new Map<string, unknown>();
-    for (const doc of entityDocs) {
+    for (const doc of entities()) {
+      entityCount++;
       const vector = base64ToVector(doc.vector);
-      vectorById.set(doc.id, vector);
+      probe ??= Array.from(vector);
       assertInsertOk(
         destEntities.insertSync({
           id: doc.id,
@@ -447,16 +460,29 @@ async function importWorkspaceIndexLocked(
         doc.id,
       );
     }
+    if (
+      fileCount !== formatFile.counts.files ||
+      entityCount !== formatFile.counts.entities
+    ) {
+      throw transferError(
+        "Transfer artifact counts do not match its format declaration",
+        artifactPath,
+      );
+    }
     closeTracked(destFiles);
     closeTracked(destEntities);
 
     report("verify", "Verifying destination index");
     const verification = verifyConvertedIndex(
       stagingPaths,
-      { files: fileDocs.length, entities: entityDocs.length },
-      vectorById,
+      { files: fileCount, entities: entityCount },
+      (function* () {
+        for (const doc of entities())
+          yield [doc.id, base64ToVector(doc.vector)] as const;
+      })(),
       options.verifySampleLimit ?? 256,
       portableManifest.id,
+      formatFile.embedding,
     );
     if (
       !verification.countsMatch ||
@@ -466,7 +492,7 @@ async function importWorkspaceIndexLocked(
       !verification.ownershipValid ||
       !verification.inventoriesExact ||
       !verification.groupIntegrity ||
-      !verification.vectorsExact
+      !verification.vectorsPreserved
     ) {
       throw transferError(
         "Imported destination failed verification",
@@ -484,17 +510,16 @@ async function importWorkspaceIndexLocked(
     });
     try {
       const stagedFiles = stagedStorage.listFiles();
-      if (stagedFiles.length !== fileDocs.length) {
+      if (stagedFiles.length !== fileCount) {
         throw transferError(
           "Staged index file count does not match through normal readers",
           artifactPath,
         );
       }
-      if (entityDocs.length > 0) {
-        const probe = Array.from(base64ToVector(entityDocs[0].vector));
+      if (probe) {
         const hits = stagedStorage.searchVector(
           probe,
-          Math.min(5, entityDocs.length),
+          Math.min(5, entityCount),
         );
         if (hits.length === 0) {
           throw transferError(
@@ -527,8 +552,8 @@ async function importWorkspaceIndexLocked(
     return {
       destinationHome,
       indexId: portableManifest.id,
-      filesImported: fileDocs.length,
-      entitiesImported: entityDocs.length,
+      filesImported: fileCount,
+      entitiesImported: entityCount,
       missingFiles,
       verification,
     };
@@ -592,18 +617,32 @@ function artifactWriter(artifactPath: string) {
   };
 }
 
-async function readJsonLines<T>(path: string): Promise<T[]> {
-  const results: T[] = [];
-  const reader = createInterface({
-    input: createReadStream(path, { encoding: "utf8" }),
-    crlfDelay: Infinity,
-  });
-  for await (const line of reader) {
-    if (line.trim().length > 0) {
-      results.push(JSON.parse(line) as T);
+// A bounded line reader keeps import independent of total artifact size.
+// StringDecoder preserves UTF-8 characters split across disk reads.
+function* readJsonLines<T>(path: string): Generator<T> {
+  const fd = openSync(path, "r");
+  const decoder = new StringDecoder("utf8");
+  const buffer = Buffer.alloc(64 * 1024);
+  let pending = "";
+  try {
+    for (;;) {
+      const size = readSync(fd, buffer);
+      pending += size ? decoder.write(buffer.subarray(0, size)) : decoder.end();
+      let end: number;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        if (line.trim()) yield JSON.parse(line) as T;
+      }
+      if (pending.length > 64 * 1024 * 1024) {
+        throw transferError("Transfer artifact record exceeds 64 MiB", path);
+      }
+      if (!size) break;
     }
+    if (pending.trim()) yield JSON.parse(pending) as T;
+  } finally {
+    closeSync(fd);
   }
-  return results;
 }
 
 function portableManifestFromLegacy(

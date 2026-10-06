@@ -20,13 +20,25 @@ const path = z
 const confirm = z
   .literal(true)
   .describe("Set true only after an explicit user request for this operation.");
+const includeAllMissingFiles = z
+  .boolean()
+  .optional()
+  .describe(
+    "Request the complete missing-file list. The default response contains a bounded sample. Set this only when the full list is needed; it can be large.",
+  );
 const inputs = {
-  migrate: z.strictObject({ sourceHome: path, destinationRoot: path, confirm }),
+  migrate: z.strictObject({
+    sourceHome: path,
+    destinationRoot: path,
+    confirm,
+    includeAllMissingFiles,
+  }),
   export: z.strictObject({ sourceHome: path, artifactPath: path, confirm }),
   import: z.strictObject({
     artifactPath: path,
     destinationRoot: path,
     confirm,
+    includeAllMissingFiles,
   }),
 };
 const verification = z.object({
@@ -40,6 +52,7 @@ const verification = z.object({
   vectorsSampled: z.boolean(),
   vectorsCompared: z.number(),
   vectorsExact: z.boolean(),
+  vectorsPreserved: z.boolean(),
 });
 const results = {
   migrate: z.object({
@@ -48,6 +61,8 @@ const results = {
     filesConverted: z.number(),
     entitiesConverted: z.number(),
     missingFiles: z.array(z.string()),
+    missingFilesCount: z.number().int().nonnegative(),
+    missingFilesTruncated: z.boolean(),
     droppedPersistedCredential: z.boolean(),
     droppedPersistedDevice: z.boolean(),
     verification,
@@ -64,6 +79,8 @@ const results = {
     filesImported: z.number(),
     entitiesImported: z.number(),
     missingFiles: z.array(z.string()),
+    missingFilesCount: z.number().int().nonnegative(),
+    missingFilesTruncated: z.boolean(),
     verification,
   }),
 };
@@ -111,7 +128,10 @@ export function registerPortabilityTools(server: McpServer): void {
           openWorldHint: false,
         },
       },
-      async (input: PortabilityInput, ctx: ServerContext) => {
+      async (
+        input: PortabilityInput & { includeAllMissingFiles?: boolean },
+        ctx: ServerContext,
+      ) => {
         let progress = 0;
         try {
           const result = await runPortabilityOperation(operation, input, {
@@ -135,7 +155,13 @@ export function registerPortabilityTools(server: McpServer): void {
           const structuredContent = {
             operation,
             state: "succeeded" as const,
-            result,
+            result:
+              "missingFiles" in result
+                ? summarizeMissingFiles(
+                    result,
+                    input.includeAllMissingFiles === true,
+                  )
+                : result,
           };
           return {
             content: [
@@ -178,4 +204,23 @@ export function registerPortabilityTools(server: McpServer): void {
       },
     );
   }
+}
+
+function summarizeMissingFiles<T extends { missingFiles: string[] }>(
+  result: T,
+  all: boolean,
+): T & { missingFilesCount: number; missingFilesTruncated: boolean } {
+  const sample: string[] = [];
+  let characters = 0;
+  for (const file of result.missingFiles) {
+    if (!all && (sample.length >= 20 || characters + file.length > 4096)) break;
+    sample.push(file);
+    characters += file.length;
+  }
+  return {
+    ...result,
+    missingFiles: sample,
+    missingFilesCount: result.missingFiles.length,
+    missingFilesTruncated: sample.length !== result.missingFiles.length,
+  };
 }

@@ -335,7 +335,7 @@ function rootPathToScanDomain(root: RootPath): RootScanDomain {
   let realPath: string;
 
   try {
-    realPath = normalizePath(realpathSync(root.absolutePath));
+    realPath = normalizePath(realpathSync.native(root.absolutePath));
   } catch (cause) {
     throw new EngineError("Workspace index root path could not be resolved", {
       code: "ZVEC_GREP.ENGINE.SCANNER.ROOT_PATH_REALPATH_FAILED",

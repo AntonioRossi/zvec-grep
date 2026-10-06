@@ -87,7 +87,7 @@ export async function buildLegacyHome(
   v2Root,
   legacyHome,
   indexId,
-  { mutateInventory } = {},
+  { mutateInventory, embedding = LEGACY_EMBEDDING } = {},
 ) {
   const v2Paths = resolveWorkspaceIndexStoragePaths(join(v2Root, ".zvec-grep"));
   const srcFiles = ZVecOpen(v2Paths.filesPath, { readOnly: true });
@@ -103,7 +103,7 @@ export async function buildLegacyHome(
   );
   const dstEntities = ZVecCreateAndOpen(
     legacyPaths.indexPath,
-    createEntitiesSchema(LEGACY_EMBEDDING),
+    createEntitiesSchema(embedding),
   );
 
   const legacyFileIds = new Map();
@@ -172,7 +172,7 @@ export async function buildLegacyHome(
       path: legacyHome,
       rootPaths: [{ absolutePath: resolve(v2Root), recursive: true }],
       indexPolicy: "enabled",
-      embedding: LEGACY_EMBEDDING,
+      embedding,
       indexVersion: 1,
       createdTime: 1000,
       updatedTime: 1000,

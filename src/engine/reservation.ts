@@ -12,6 +12,7 @@ import {
 import { join } from "node:path";
 import { EngineError } from "./errors.js";
 import { incompleteMarkerEntry } from "./manifest.js";
+import { INCOMPLETE_RECOVERY_HINT } from "./utils/recovery-guidance.js";
 import { acquireReadWriteLock, type FileLock } from "./utils/lock.js";
 
 /**
@@ -129,6 +130,50 @@ type ReservationState = {
   testHooks: ReservationTestHooks | undefined;
 };
 
+/** Read-only early rejection. Success is advisory; reservation repeats it under its lock. */
+export function assertDestinationAvailable(
+  destinationHome: string,
+  markers: readonly string[] = ["manifest.json"],
+): void {
+  const entry = inspectEntry(destinationHome);
+  if (entry.status === "absent") return;
+  if (entry.status !== "present" || entry.kind !== "directory") {
+    throw reservationError(
+      "Destination is not a verifiable directory",
+      destinationHome,
+    );
+  }
+  const indexMarkers = markers.filter(
+    (marker) => inspectEntry(join(destinationHome, marker)).status !== "absent",
+  );
+  if (indexMarkers.length > 0) {
+    throw reservationError(
+      markers.includes("format.json")
+        ? "Destination already contains a transfer artifact"
+        : "Destination already contains a workspace index",
+      `${destinationHome} markers=${indexMarkers.join(",")}`,
+    );
+  }
+  const markerStatus = incompleteMarkerEntry(destinationHome);
+  if (markerStatus !== "absent") {
+    throw reservationError(
+      markerStatus === "present"
+        ? "Destination contains an incomplete reserved result"
+        : "Destination incomplete-marker state cannot be inspected; refusing to claim it",
+      `${destinationHome} hint=${INCOMPLETE_RECOVERY_HINT}`,
+    );
+  }
+  const unrelated = readdirSync(destinationHome).filter(
+    (entry) => entry !== "locks",
+  );
+  if (unrelated.length > 0) {
+    throw reservationError(
+      "Destination contains unrelated contents and cannot be claimed",
+      `${destinationHome} entries=${unrelated.join(",")}`,
+    );
+  }
+}
+
 export function reserveDestination(options: {
   destinationHome: string;
   operation: string;
@@ -146,36 +191,9 @@ export function reserveDestination(options: {
   );
 
   try {
-    // Destination validation happens under the acquired lock, never from an
-    // absence check or existence observed before it.
-    const indexMarkers = markers.filter(
-      (marker) =>
-        inspectEntry(join(options.destinationHome, marker)).status !== "absent",
-    );
-    if (indexMarkers.length > 0) {
-      throw reservationError(
-        "Destination already contains a workspace index",
-        `${options.destinationHome} markers=${indexMarkers.join(",")}`,
-      );
-    }
-    const markerStatus = incompleteMarkerEntry(options.destinationHome);
-    if (markerStatus !== "absent") {
-      throw reservationError(
-        markerStatus === "present"
-          ? "Destination contains an incomplete reserved result; recover it manually after writers are quiescent (remove the INCOMPLETE marker and its partial contents, then retry)"
-          : "Destination incomplete-marker state cannot be inspected; refusing to claim it",
-        options.destinationHome,
-      );
-    }
-    const unrelated = readdirSync(options.destinationHome).filter(
-      (entry) => entry !== "locks",
-    );
-    if (unrelated.length > 0) {
-      throw reservationError(
-        "Destination contains unrelated contents and cannot be claimed",
-        `${options.destinationHome} entries=${unrelated.join(",")}`,
-      );
-    }
+    // The early check is advisory. Repeat all destination validation under
+    // the acquired lock; do not trust absence observed before copying.
+    assertDestinationAvailable(options.destinationHome, markers);
 
     const state: ReservationState = {
       destinationHome: options.destinationHome,

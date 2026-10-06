@@ -91,6 +91,7 @@ confirm that such a word is intended as literal search input.
 
 Actions:
   --index        Build, rebuild, or drop the workspace index
+  --cleanup-transfer Remove a recorded temporary copy after its processes exit
   --migrate-index Convert a legacy index to a portable workspace index
   --export-index Export an index and its vectors to a transfer artifact
   --import-index Import a transfer artifact into a destination workspace
@@ -242,6 +243,17 @@ ${formatEnvironmentVariables([
 ])}
 
 See zg --help environment for precedence and Server-mode scope.`;
+    case "cleanup-transfer":
+      return `Usage:
+  zg --cleanup-transfer <temporary-directory>
+
+Remove only a recorded private transfer directory after its parent and child
+processes have exited. Use the path printed as "Temporary transfer data".
+The command checks host, user, directory identity and process ownership.
+Parent-directory aliases are accepted. A linked scratch entry is refused,
+as are live owners, missing records and copied records.
+Source indexes, destination indexes, INCOMPLETE markers and locks are not
+removed. Older unrecorded temporary copies require separate manual inspection.`;
     case "migrate":
       return `Usage:
   zg --migrate-index <legacy-home> <destination-root>

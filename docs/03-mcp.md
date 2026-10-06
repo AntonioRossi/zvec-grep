@@ -269,13 +269,19 @@ operation. Import with that host's paths:
 ```
 
 Results include `operation`, `state` and `result`. Migration and import return
-index identity, counts, missing files and verification results. MCP compares
-all vectors. Export returns identity and counts. Failures set `isError: true`
+index identity, counts, missing files and verification results. The default
+missing-file sample has at most 20 paths and 4096 path characters.
+`missingFilesCount` gives the total. `missingFilesTruncated` identifies a sample.
+Set `includeAllMissingFiles: true` to request the full list. MCP compares
+all vectors. `vectorsExact` and `vectorsPreserved` are separate results.
+Cosine storage permits at most two float32 steps per component. Other metrics
+require exact equality. Export returns identity and counts. Failures set `isError: true`
 and return `state: "failed"` with an error code, message and available context.
 Input validation failures use the standard MCP validation error.
 
 Clients can request MCP progress notifications. Native storage operations run
-in a worker so that the server can receive cancellation. Before publication,
+in a separate process so that the server can receive cancellation. A fatal
+native failure stops that process and returns a tool error. Before publication,
 cancellation uses the engine's reservation cleanup. Publication is the commit
 boundary: a late cancellation does not remove a completed index or artifact.
 A forced process kill is different from a cancellation request; incomplete

@@ -4,6 +4,7 @@ import { EngineError } from "../errors.js";
 import {
   appendReservationCleanup,
   reserveDestination,
+  assertDestinationAvailable,
   type DestinationReservation,
 } from "../reservation.js";
 import {
@@ -45,7 +46,7 @@ import {
  * into the portable format (version 2). The source is never modified; the
  * destination is built in an exclusive staging directory, verified, and only
  * then moved into place. No embedding computation occurs: stored vectors and
- * fragment content are preserved exactly while path-derived identities are
+ * fragment content are preserved while path-derived identities are
  * remapped. The migrated index carries no verification claim; its first
  * indexing run reconciles content by hash.
  */
@@ -84,7 +85,10 @@ export type IndexConversionVerification = {
   groupIntegrity: boolean;
   vectorsSampled: boolean;
   vectorsCompared: number;
+  /** Exact equality of the compared stored components. */
   vectorsExact: boolean;
+  /** Exact, or within two float32 ULPs per component for cosine only. */
+  vectorsPreserved: boolean;
 };
 
 export type LegacyManifest = {
@@ -152,6 +156,7 @@ export async function migrateWorkspaceIndex(
   };
 
   let reservation: DestinationReservation | undefined;
+  let source: ReturnType<typeof readNativeTransferSource> | undefined;
   try {
     // The incomplete-home guard runs under the source lock before any
     // metadata read: a crashed reservation blocks migration even after its
@@ -173,10 +178,16 @@ export async function migrateWorkspaceIndex(
     // interpreted against it, even when it does not exist on this host.
     const originalRoot = dirname(manifest.path);
     const destinationHome = join(destinationRoot, ".zvec-grep");
+    assertDestinationAvailable(destinationHome, [
+      "manifest.json",
+      "files.zvec",
+      "index.zvec",
+    ]);
 
     report("read", "Reading legacy index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
-    const { fileDocs, entityDocs } = readNativeTransferSource(sourceHome);
+    source = readNativeTransferSource(sourceHome);
+    const counts = source.counts;
 
     // Remap file identities to canonical workspace-relative paths.
     report("remap", "Remapping file identities");
@@ -185,8 +196,8 @@ export async function migrateWorkspaceIndex(
       computeLegacyIdentityRemaps(
         originalRoot,
         manifest.id,
-        fileDocs,
-        entityDocs,
+        source.files(),
+        source.entities(false),
       );
 
     // Reserve the destination exclusively before building anything: the
@@ -213,7 +224,7 @@ export async function migrateWorkspaceIndex(
     );
 
     const missingFiles: string[] = [];
-    for (const doc of fileDocs) {
+    for (const doc of source.files()) {
       const canonicalPath = canonicalByOldFileId.get(doc.id)!;
       const newId = fileIdByOld.get(doc.id)!;
       const rootCrp = rootCanonicalFromLegacy(
@@ -250,7 +261,7 @@ export async function migrateWorkspaceIndex(
         newId,
       );
     }
-    for (const doc of entityDocs) {
+    for (const doc of source.entities()) {
       const newId = fragmentIdByOld.get(doc.id)!;
       const group = doc.fields.group;
       assertInsertOk(
@@ -273,19 +284,24 @@ export async function migrateWorkspaceIndex(
 
     // Verify the staged destination before activation.
     report("verify", "Verifying portable destination");
-    const vectorById = new Map(
-      entityDocs.map((doc) => [
-        fragmentIdByOld.get(doc.id)!,
-        doc.vectors[ENTITY_VECTOR_FIELD],
-      ]),
-    );
+    const vectors = source.entities();
     const verification = verifyConvertedIndex(
       stagingPaths,
-      { files: fileDocs.length, entities: entityDocs.length },
-      vectorById,
+      counts,
+      (function* () {
+        for (const doc of vectors) {
+          yield [
+            fragmentIdByOld.get(doc.id)!,
+            doc.vectors[ENTITY_VECTOR_FIELD],
+          ] as const;
+        }
+      })(),
       options.verifySampleLimit ?? DEFAULT_VERIFY_SAMPLE_LIMIT,
       manifest.id,
+      manifest.embedding,
     );
+    source.close();
+    source = undefined;
     if (!verificationPassed(verification)) {
       throw migrationError(
         "Migrated destination failed verification",
@@ -327,8 +343,8 @@ export async function migrateWorkspaceIndex(
     return {
       destinationHome,
       indexId: manifest.id,
-      filesConverted: fileDocs.length,
-      entitiesConverted: entityDocs.length,
+      filesConverted: counts.files,
+      entitiesConverted: counts.entities,
       missingFiles,
       droppedPersistedCredential,
       droppedPersistedDevice,
@@ -343,7 +359,11 @@ export async function migrateWorkspaceIndex(
     }
     throw error;
   } finally {
-    lock.release();
+    try {
+      source?.close();
+    } finally {
+      lock.release();
+    }
   }
 
   function track(collection: ZVecCollection): ZVecCollection {
@@ -367,8 +387,8 @@ export async function migrateWorkspaceIndex(
 export function computeLegacyIdentityRemaps(
   originalRoot: string,
   indexId: string,
-  fileDocs: readonly ZVecDoc[],
-  entityDocs: readonly ZVecDoc[],
+  fileDocs: Iterable<ZVecDoc>,
+  entityDocs: Iterable<ZVecDoc>,
 ): {
   fileIdByOld: Map<string, string>;
   canonicalByOldFileId: Map<string, string>;
@@ -428,55 +448,48 @@ function verificationPassed(
     verification.ownershipValid &&
     verification.inventoriesExact &&
     verification.groupIntegrity &&
-    verification.vectorsExact
+    verification.vectorsPreserved
   );
 }
 
 export function verifyConvertedIndex(
   stagingPaths: { filesPath: string; indexPath: string },
   expectedCounts: { files: number; entities: number },
-  vectorById: ReadonlyMap<string, unknown>,
+  sourceVectors: Iterable<readonly [string, unknown]>,
   sampleLimit: number,
   indexId: string,
+  embedding: { dimension: number; metric: "cosine" | "dot" | "euclidean" },
 ): IndexConversionVerification {
+  if (!Number.isInteger(sampleLimit) || sampleLimit < 0) {
+    throw migrationError("Invalid vector sample limit", String(sampleLimit));
+  }
   const destFiles = ZVecOpen(stagingPaths.filesPath, { readOnly: true });
-  const destEntities = ZVecOpen(stagingPaths.indexPath, { readOnly: true });
+  let destEntities: ZVecCollection | undefined;
   try {
-    const destFileDocs = [...destFiles.iterDocsSync({ includeVector: false })];
-    const destEntityDocs = [
-      ...destEntities.iterDocsSync({ includeVector: true }),
-    ];
-
-    const countsMatch =
-      destFileDocs.length === expectedCounts.files &&
-      destEntityDocs.length === expectedCounts.entities;
-
-    const fileIds = new Set(destFileDocs.map((doc) => doc.id));
-    const entityIds = new Set(destEntityDocs.map((doc) => doc.id));
-    const identitiesUnique =
-      fileIds.size === destFileDocs.length &&
-      entityIds.size === destEntityDocs.length;
-
-    // Application-level identity: native IDs, stored identity fields, and
-    // the portable derivation (index UUID + canonical path) must all agree,
-    // and required fields must be present and typed.
+    destEntities = ZVecOpen(stagingPaths.indexPath, { readOnly: true });
+    // Keep only identities and relationships, never full text or vector arrays.
+    const fileIds = new Set<string>();
+    const entityIds = new Set<string>();
     const canonicalPaths = new Set<string>();
     const derivedFileIds = new Set<string>();
+    let fileCount = 0;
+    let entityCount = 0;
     let identitiesDerived = true;
     let requiredFieldsValid = true;
-    for (const doc of destFileDocs) {
+    for (const doc of destFiles.iterDocsSync({ includeVector: false })) {
+      fileCount++;
+      fileIds.add(doc.id);
       const canonicalPath = String(doc.fields.canonical_path ?? "");
       const validPath =
         isCanonicalRelativePath(canonicalPath) && canonicalPath !== ".";
-      if (!validPath || canonicalPaths.has(canonicalPath)) {
+      if (!validPath || canonicalPaths.has(canonicalPath))
         identitiesDerived = false;
-      }
       canonicalPaths.add(canonicalPath);
       const derived = validPath ? makeFileId(indexId, canonicalPath) : null;
       if (
         derived === null ||
         doc.id !== derived ||
-        String(doc.fields.file_id ?? "") !== derived
+        doc.fields.file_id !== derived
       ) {
         identitiesDerived = false;
       } else {
@@ -484,33 +497,36 @@ export function verifyConvertedIndex(
       }
       if (
         typeof doc.fields.relative_path !== "string" ||
-        doc.fields.relative_path.length === 0 ||
+        !doc.fields.relative_path.length ||
         typeof doc.fields.root_path !== "string" ||
-        !isCanonicalRelativePath(String(doc.fields.root_path)) ||
+        !isCanonicalRelativePath(doc.fields.root_path) ||
         !Number.isInteger(doc.fields.size_bytes) ||
         !Number.isInteger(doc.fields.last_modified_time) ||
         typeof doc.fields.kind !== "string" ||
         typeof doc.fields.format !== "string"
-      ) {
+      )
         requiredFieldsValid = false;
-      }
     }
-    for (const doc of destEntityDocs) {
+    const groups = new Map<string, { fileId: string; majors: number }>();
+    const publicIdsByFile = new Map<string, Set<string>>();
+    let ownershipValid = true;
+    let groupIntegrity = true;
+    for (const doc of destEntities.iterDocsSync({ includeVector: false })) {
+      entityCount++;
+      entityIds.add(doc.id);
       const fileId = String(doc.fields.file_id ?? "");
+      if (!fileIds.has(fileId)) ownershipValid = false;
       const fragmentIndex = Number(doc.fields.fragment_index);
       if (
         derivedFileIds.has(fileId) &&
         (!Number.isInteger(fragmentIndex) ||
           fragmentIndex < 0 ||
           doc.id !== sha256Text(`${fileId}\0${fragmentIndex}`))
-      ) {
+      )
         identitiesDerived = false;
-      }
-      // Serialized fields must parse through the application's reader
-      // schemas; nonempty text alone does not make the record usable.
       if (
         typeof doc.fields.range_json !== "string" ||
-        doc.fields.range_json.length === 0
+        !doc.fields.range_json.length
       ) {
         requiredFieldsValid = false;
       } else {
@@ -522,89 +538,75 @@ export function verifyConvertedIndex(
           requiredFieldsValid = false;
         }
       }
-    }
-
-    // Ownership: every entity belongs to a converted file, and every group
-    // stays within one file with exactly one major fragment owned by it.
-    const ownershipValid = destEntityDocs.every((doc) =>
-      fileIds.has(String(doc.fields.file_id ?? "")),
-    );
-    const groups = new Map<string, { fileId: string; majors: number }>();
-    let groupIntegrity = true;
-    for (const doc of destEntityDocs) {
       const group =
         typeof doc.fields.group === "string" && doc.fields.group.length > 0
           ? doc.fields.group
           : doc.id;
-      const fileId = String(doc.fields.file_id ?? "");
       const current = groups.get(group);
-      if (!current) {
+      if (!current)
         groups.set(group, { fileId, majors: doc.id === group ? 1 : 0 });
-      } else if (current.fileId !== fileId) {
-        groupIntegrity = false;
-        break;
-      } else if (doc.id === group) {
-        current.majors += 1;
+      else {
+        if (current.fileId !== fileId) groupIntegrity = false;
+        if (doc.id === group) current.majors++;
+      }
+      if (group === doc.id) {
+        const ids = publicIdsByFile.get(fileId) ?? new Set<string>();
+        ids.add(doc.id);
+        publicIdsByFile.set(fileId, ids);
       }
     }
-    if (groupIntegrity) {
-      groupIntegrity = [...groups.values()].every(
-        (group) => group.majors === 1,
-      );
-    }
-
-    // Inventories: the stored public ID set of each file is exactly the
-    // computed public entity set of that file (major or ungrouped fragments).
-    const publicIdsByFile = new Map<string, Set<string>>();
-    for (const doc of destEntityDocs) {
-      const group = doc.fields.group;
-      const isPublic =
-        typeof group !== "string" || group.length === 0 || group === doc.id;
-      if (!isPublic) {
-        continue;
-      }
-      const fileId = String(doc.fields.file_id ?? "");
-      const set = publicIdsByFile.get(fileId) ?? new Set<string>();
-      set.add(typeof group === "string" && group.length > 0 ? group : doc.id);
-      publicIdsByFile.set(fileId, set);
-    }
-    const inventoriesExact = destFileDocs.every((doc) => {
+    for (const group of groups.values())
+      if (group.majors !== 1) groupIntegrity = false;
+    let inventoriesExact = true;
+    for (const doc of destFiles.iterDocsSync({ includeVector: false })) {
       const stored = new Set(
         JSON.parse(String(doc.fields.entity_ids_json ?? "[]")) as string[],
       );
       const computed = publicIdsByFile.get(doc.id) ?? new Set<string>();
-      return (
-        stored.size === computed.size &&
-        [...stored].every((id) => computed.has(id))
-      );
-    });
-
-    const sampled = sampleLimit > 0 && destEntityDocs.length > sampleLimit;
-    const sample = sampled
-      ? destEntityDocs.filter(
-          (_, index) =>
-            index % Math.floor(destEntityDocs.length / sampleLimit) === 0,
-        )
-      : destEntityDocs;
-    let vectorsCompared = 0;
-    let vectorsExact = true;
-    for (const doc of sample) {
-      const sourceVector = vectorToArray(vectorById.get(doc.id));
-      const destVector = vectorToArray(doc.vectors[ENTITY_VECTOR_FIELD]);
-      vectorsCompared++;
       if (
-        !sourceVector ||
-        !destVector ||
-        sourceVector.length !== destVector.length ||
-        !sourceVector.every((value, index) => value === destVector[index])
-      ) {
-        vectorsExact = false;
-        break;
-      }
+        stored.size !== computed.size ||
+        [...stored].some((id) => !computed.has(id))
+      )
+        inventoriesExact = false;
     }
 
+    const identitiesUnique =
+      fileIds.size === fileCount && entityIds.size === entityCount;
+    const sampled = sampleLimit > 0 && entityCount > sampleLimit;
+    const stride = sampled ? Math.ceil(entityCount / sampleLimit) : 1;
+    let vectorsCompared = 0;
+    let vectorsExact = true;
+    let vectorsPreserved = true;
+    let sourceCount = 0;
+    // Consume each source vector once and fetch only its destination peer.
+    // No all-vector map or array is retained, even when all vectors are checked.
+    for (const [id, vector] of sourceVectors) {
+      const position = sourceCount++;
+      if (!entityIds.delete(id)) {
+        vectorsPreserved = false;
+        vectorsExact = false;
+      }
+      if (position % stride !== 0) continue;
+      const dest = destEntities.fetchSync({
+        ids: id,
+        outputFields: [],
+        includeVector: true,
+      })[id];
+      const compared = compareStoredVectors(
+        vector,
+        dest?.vectors[ENTITY_VECTOR_FIELD],
+        embedding,
+      );
+      vectorsCompared++;
+      vectorsExact &&= compared.exact;
+      vectorsPreserved &&= compared.preserved;
+    }
     return {
-      countsMatch,
+      countsMatch:
+        fileCount === expectedCounts.files &&
+        entityCount === expectedCounts.entities &&
+        sourceCount === entityCount &&
+        entityIds.size === 0,
       identitiesUnique,
       identitiesDerived,
       requiredFieldsValid,
@@ -614,11 +616,57 @@ export function verifyConvertedIndex(
       vectorsSampled: sampled,
       vectorsCompared,
       vectorsExact,
+      vectorsPreserved,
     };
   } finally {
-    destFiles.closeSync();
-    destEntities.closeSync();
+    try {
+      destEntities?.closeSync();
+    } finally {
+      destFiles.closeSync();
+    }
   }
+}
+
+// COSINE read/write round trips can change retrieved float32 components.
+// Permit at most two representable float32 steps for that storage round trip.
+// Other metrics stay exact. Never use a broad absolute/cosine-similarity bound.
+export function compareStoredVectors(
+  source: unknown,
+  destination: unknown,
+  embedding: { dimension: number; metric: string },
+): { exact: boolean; preserved: boolean } {
+  const a = vectorToArray(source);
+  const b = vectorToArray(destination);
+  if (
+    !a ||
+    !b ||
+    a.length !== embedding.dimension ||
+    b.length !== a.length ||
+    !a.every(Number.isFinite) ||
+    !b.every(Number.isFinite)
+  )
+    return { exact: false, preserved: false };
+  const exact = a.every((value, i) => value === b[i]);
+  const bits = new DataView(new ArrayBuffer(4));
+  const ordered = (value: number) => {
+    bits.setFloat32(0, value);
+    const word = bits.getUint32(0);
+    return word & 0x80000000
+      ? 0x80000000 - (word & 0x7fffffff)
+      : 0x80000000 + word;
+  };
+  return {
+    exact,
+    preserved:
+      exact ||
+      (embedding.metric === "cosine" &&
+        a.every(
+          (value, i) =>
+            Math.fround(value) === value &&
+            Math.fround(b[i]) === b[i] &&
+            Math.abs(ordered(value) - ordered(b[i])) <= 2,
+        )),
+  };
 }
 
 function assertInsertOk(status: ZVecStatus, id: string): void {
@@ -703,7 +751,7 @@ function vectorToArray(vector: unknown): number[] | null {
     return null;
   }
   if (Array.isArray(vector)) {
-    return vector.map((value) => Number(value));
+    return Array.from(vector as number[]);
   }
   if (ArrayBuffer.isView(vector)) {
     return Array.from(vector as Float32Array);

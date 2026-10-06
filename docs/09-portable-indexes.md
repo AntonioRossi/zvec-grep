@@ -70,6 +70,78 @@ vectors are preserved; path-derived file and fragment identifiers change to
 the portable form. Review the returned missing-file list. Do not claim a
 complete workspace when source documents are absent.
 
+Verification reports `vectorsExact` and `vectorsPreserved` separately.
+For cosine storage, a native write/read can change a component by float32
+rounding. `vectorsPreserved` permits at most two float32 representable steps
+per component. Dot and Euclidean storage still require exact equality.
+Non-finite values, different dimensions and larger changes fail verification.
+This rule does not permit a different model or recompute any embedding.
+
+### Replace a legacy index at the same workspace root
+
+Migration does not overwrite an occupied destination. Do not move the working
+legacy index aside before conversion. Use this sequence:
+
+1. Stop writers, watchers and services for the workspace. Keep them stopped
+   through replacement. Make and verify a restorable backup.
+2. Create an empty temporary workspace outside the source workspace. Run
+   `zg --migrate-index /project/.zvec-grep /temporary/workspace`.
+   The source remains in place while conversion runs. If the temporary workspace
+   has no documents, the missing-file list is expected; it is not evidence of
+   lost index records. Check the exit status and all verification fields.
+3. Only after successful verification, rename `/project/.zvec-grep` to a new
+   backup name on the same filesystem. Move the verified
+   `/temporary/workspace/.zvec-grep` to `/project/.zvec-grep`.
+   If the second move fails, restore the backup before restarting clients.
+   Do not overwrite or delete an existing backup.
+4. Reopen the index at `/project`. Check identity, expected query hits and
+   the missing-file list there. Keep the legacy backup until acceptance.
+   The first explicit indexing run reconciles files by content hash.
+
+### Memory and failed operations
+
+Migration and logical transfer stream text and vectors. Memory still grows
+with native storage and file/fragment identity maps, but the application does
+not retain all source and destination vectors as JavaScript arrays. Increasing
+the Node heap alone does not correct a failed vector verification.
+
+CLI and MCP operations run in a separate process. A fatal native error can stop
+that operation without stopping the caller. Normal errors and cancellation
+run checked cleanup. A fatal exit can leave a destination marked `INCOMPLETE`.
+The error reports that state as unresolved, not as a clean abort.
+
+The CLI reports `vectors exact` only when every compared component is exact.
+Otherwise it reports `vectors preserved` when the cosine tolerance passes.
+The result states the number compared and whether that check used a sample.
+A sampled result is not proof that every vector was compared. Differences
+outside the permitted tolerance still fail the operation.
+The CLI selects a sample of at most 256 vectors. MCP compares all vectors.
+
+The CLI prints `Temporary transfer data: <path>` before the operation starts.
+On Linux and macOS, `SIGINT` and `SIGTERM` request checked cancellation. A
+forced process exit, such as `SIGKILL`, cannot run normal cleanup. After both
+recorded processes have exited, remove only that private copy with:
+
+```bash
+zg --cleanup-transfer /tmp/zg-portability-process-XXXXXX
+```
+
+Use the exact printed path; the temporary directory can be elsewhere. This
+command checks the host, user, parent and child process IDs, directory identity
+and ownership record. It accepts aliases in parent directories, such as macOS
+`/var`. It refuses active processes, copied records and a symlink at the scratch
+entry itself.
+It does not remove source or destination locks, index data or `INCOMPLETE`
+markers. Older `zg-transfer-source-*` copies have no ownership record and must
+be inspected manually. Never remove directories by name pattern alone.
+
+For an abandoned destination, stop all users of that workspace and confirm
+that the recorded owner process is dead on the recorded host. Keep the source
+index and its backup. Preserve the failed destination under a new quarantine
+name before retrying with a new, empty destination. Do not remove only the
+`INCOMPLETE` marker or treat partial files as a completed index. Dead reader
+locks are reclaimed by the existing lock protocol; active locks are not removed.
+
 ## Logical export and import
 
 On the sending host:
@@ -98,6 +170,13 @@ destination is an error; resolve the owner of that resource before retrying.
 
 Migration, export and import are also available through the full MCP toolset:
 `zvec_grep_index_migrate`, `zvec_grep_index_export` and `zvec_grep_index_import`.
+
+Migration and import return `missingFilesCount`, `missingFilesTruncated` and
+a `missingFiles` sample. By default the sample has at most 20 paths and 4096
+path characters. Text and structured results use the same sample. When the
+complete list is required, set `includeAllMissingFiles: true` in the initial
+operation request. That explicit response can be large. The engine and CLI
+keep the complete count; truncation does not change stored index data.
 Each requires `confirm: true` after an explicit user request. Existing MCP
 search and indexing tools can read and update the result. A tool path is a path visible to the server,
 not necessarily to the agent's computer. An agent must have an explicit user
@@ -116,9 +195,17 @@ request before it creates or changes a persistent index.
    reconciles content by hash. Unchanged documents reuse vectors; changed
    documents can require new embeddings. Record document-embedding calls when
    testing a zero-document-embedding claim.
+   Host verification uses the native resolved workspace path and filesystem
+   identity. Windows short-path aliases refer to the same binding. An older
+   binding with a different path spelling can require one reconciliation.
 5. In a disposable copy, change one document and remove another. Run indexing
    explicitly. Check the changed content, removal of deleted files from stored
    entries, and preservation of unrelated documents. Retain the output and exits.
+
+Status reports an unverified index as needing an update. A default MCP search
+schedules reconciliation when automatic refresh is enabled. Set
+`freshness: "wait_for_fresh"` to wait for that work. If automatic refresh is
+disabled, search keeps the unverified state and reports stale results.
 
 See `zg --help migrate`, `zg --help export` and `zg --help import` for the
 installed command contract. The [design contract](./design/portable-workspace-index.md)

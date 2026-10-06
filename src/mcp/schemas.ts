@@ -523,6 +523,7 @@ export const zvecGrepIndexStatusOutputSchema = z.object({
   persistent: z.object({
     home: z.string(),
     index_path: z.string(),
+    unverified: z.boolean().optional(),
     workspace_index: z
       .object({
         id: z.string(),

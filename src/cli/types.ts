@@ -76,6 +76,7 @@ export type CliCommand =
   | "query"
   | "index"
   | "status"
+  | "cleanup-transfer"
   | "migrate"
   | "export"
   | "import"
