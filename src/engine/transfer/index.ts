@@ -6,6 +6,7 @@ import { EngineError } from "../errors.js";
 import {
   appendReservationCleanup,
   reserveDestination,
+  assertDestinationAvailable,
   type DestinationReservation,
 } from "../reservation.js";
 import {
@@ -123,6 +124,10 @@ export async function exportWorkspaceIndex(
     // collection or metadata read: a crashed reservation blocks consumption
     // even after its owner is gone.
     assertHomeNotIncomplete(sourceHome);
+    assertDestinationAvailable(options.artifactPath, [
+      "format.json",
+      "manifest.json",
+    ]);
     report("read", "Reading source index");
     ZVecInitialize({ logLevel: ZVecLogLevel.WARN });
     source = readNativeTransferSource(sourceHome);
@@ -315,6 +320,11 @@ async function importWorkspaceIndexLocked(
   artifactPath: string,
   destinationRoot: string,
 ): Promise<ImportWorkspaceIndexResult> {
+  assertDestinationAvailable(join(destinationRoot, ".zvec-grep"), [
+    "manifest.json",
+    "files.zvec",
+    "index.zvec",
+  ]);
   report("read", "Reading transfer artifact");
   const formatFile = readJsonFileSync<TransferFormatFile | null>(
     join(artifactPath, "format.json"),

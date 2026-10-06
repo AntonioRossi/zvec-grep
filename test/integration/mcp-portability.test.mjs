@@ -489,6 +489,9 @@ test("MCP survives a fatal portability process exit and retains the incomplete d
           stopped = true;
           // Node's test runner isolates this file. On the old thread path this
           // deliberately kills that test process, proving the missing boundary.
+          process.stderr.write(
+            "CONTROL: fatal portability exit reached the write stage\n",
+          );
           process.kill(lock.pid, "SIGKILL");
         }
       },

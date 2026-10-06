@@ -171,16 +171,16 @@ zg --server on --mcp-toolset full
 
 The `full` toolset exposes nine tools:
 
-| Tool                      | Purpose                                              |
-| ------------------------- | ---------------------------------------------------- |
-| `zvec_grep_search`        | Indexed retrieval                                    |
-| `zvec_grep_rg`            | No-index exhaustive search                           |
-| `zvec_grep_index`         | Create, update, rebuild, or explicitly drop an index |
-| `zvec_grep_index_migrate` | Convert a legacy index without document embeddings   |
-| `zvec_grep_index_export`  | Create a logical transfer artifact                   |
-| `zvec_grep_index_import`  | Verify an artifact and create native storage         |
-| `zvec_grep_index_drop`    | Explicitly delete an index                           |
-| `zvec_grep_index_status`  | Inspect persisted and active index state             |
+| Tool | Purpose |
+| --- | --- |
+| `zvec_grep_search` | Indexed retrieval |
+| `zvec_grep_rg` | No-index exhaustive search |
+| `zvec_grep_index` | Create, update, rebuild, or explicitly drop an index |
+| `zvec_grep_index_drop` | Explicitly delete an index |
+| `zvec_grep_index_migrate` | Migrate a legacy index into a portable workspace index |
+| `zvec_grep_index_export` | Write a logical index artifact with stored vectors |
+| `zvec_grep_index_import` | Create native storage from a received artifact |
+| `zvec_grep_index_status` | Inspect persisted and active index state |
 | `zvec_grep_server_status` | Inspect daemon, queue, runtime, and model-pool state |
 
 `zvec_grep_index` requires an absolute root. Its `wait` input defaults to
@@ -269,13 +269,19 @@ operation. Import with that host's paths:
 ```
 
 Results include `operation`, `state` and `result`. Migration and import return
-index identity, counts, missing files and verification results. MCP compares
-all vectors. Export returns identity and counts. Failures set `isError: true`
+index identity, counts, missing files and verification results. The default
+missing-file sample has at most 20 paths and 4096 path characters.
+`missingFilesCount` gives the total. `missingFilesTruncated` identifies a sample.
+Set `includeAllMissingFiles: true` to request the full list. MCP compares
+all vectors. `vectorsExact` and `vectorsPreserved` are separate results.
+Cosine storage permits at most two float32 steps per component. Other metrics
+require exact equality. Export returns identity and counts. Failures set `isError: true`
 and return `state: "failed"` with an error code, message and available context.
 Input validation failures use the standard MCP validation error.
 
 Clients can request MCP progress notifications. Native storage operations run
-in a worker so that the server can receive cancellation. Before publication,
+in a separate process so that the server can receive cancellation. A fatal
+native failure stops that process and returns a tool error. Before publication,
 cancellation uses the engine's reservation cleanup. Publication is the commit
 boundary: a late cancellation does not remove a completed index or artifact.
 A forced process kill is different from a cancellation request; incomplete

@@ -19,6 +19,11 @@ import {
 } from "../engine/errors.js";
 import { listEmbeddingModels } from "../engine/models/index.js";
 import { DaemonClient } from "../client/daemon-client.js";
+import type {
+  PortabilityInput,
+  PortabilityOperation,
+  PortabilityResults,
+} from "../mcp/portability-operation.js";
 import {
   resolveDirectSearchPolicy,
   resolveServerSearchPolicy,
@@ -90,6 +95,19 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
     case "status":
       await runStatus(parsed);
       return;
+    case "cleanup-transfer": {
+      if (parsed.positionals.length !== 1)
+        throw new Error(
+          "zg --cleanup-transfer requires one owned temporary directory path.",
+        );
+      const { recoverTransferScratch } =
+        await import("../engine/storage/transfer-scratch.js");
+      recoverTransferScratch(parsed.positionals[0]!);
+      console.log(
+        "Removed the abandoned transfer scratch directory. Destination locks were not changed.",
+      );
+      return;
+    }
     case "migrate":
       await runMigrate(parsed);
       return;
@@ -120,6 +138,48 @@ export async function runParsedCommand(parsed: ParsedArgs): Promise<void> {
   }
 }
 
+async function runCliTransfer<T extends PortabilityOperation>(
+  operation: T,
+  input: Omit<PortabilityInput, "confirm">,
+): Promise<PortabilityResults[T]> {
+  const { runPortabilityOperation } =
+    await import("../mcp/portability-operation.js");
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  process.on("SIGINT", cancel);
+  process.on("SIGTERM", cancel);
+  try {
+    return await runPortabilityOperation(
+      operation,
+      { ...input, confirm: true, verifySampleLimit: 256 },
+      {
+        signal: controller.signal,
+        onScratch: (path) => console.error(`Temporary transfer data: ${path}`),
+        onProgress: async (stage, detail) => {
+          console.error(`${stage}: ${detail}`);
+        },
+      },
+    );
+  } finally {
+    process.off("SIGINT", cancel);
+    process.off("SIGTERM", cancel);
+  }
+}
+
+function formatVectorVerification(verification: {
+  vectorsExact: boolean;
+  vectorsPreserved: boolean;
+  vectorsCompared: number;
+  vectorsSampled: boolean;
+}): string {
+  const state = !verification.vectorsPreserved
+    ? "FAILED"
+    : verification.vectorsExact
+      ? "exact"
+      : "preserved (cosine tolerance: at most two float32 steps)";
+  return `vectors ${state} (${verification.vectorsCompared} compared, ${verification.vectorsSampled ? "sampled" : "all"})`;
+}
+
 async function runMigrate(parsed: ParsedArgs): Promise<void> {
   if (parsed.positionals.length !== 2) {
     throw new Error(
@@ -128,11 +188,9 @@ async function runMigrate(parsed: ParsedArgs): Promise<void> {
   }
   const sourceHome = resolve(parsed.positionals[0]!);
   const destinationRoot = resolve(parsed.positionals[1]!);
-  const { migrateWorkspaceIndex } = await import("../engine/migrate/index.js");
-  const result = await migrateWorkspaceIndex({
+  const result = await runCliTransfer("migrate", {
     sourceHome,
     destinationRoot,
-    onProgress: (stage, detail) => console.error(`${stage}: ${detail}`),
   });
   console.log(`Migrated index: ${result.destinationHome}`);
   console.log(
@@ -154,7 +212,7 @@ async function runMigrate(parsed: ParsedArgs): Promise<void> {
     );
   }
   console.log(
-    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared${result.verification.vectorsSampled ? ", sampled" : ", all"})`,
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, ${formatVectorVerification(result.verification)}`,
   );
   console.log(
     "The migrated index is unverified; the first indexing run reconciles content by hash.",
@@ -167,11 +225,9 @@ async function runExport(parsed: ParsedArgs): Promise<void> {
       "zg --export-index requires an index home and an artifact directory: zg --export-index <index-home> <artifact-dir>",
     );
   }
-  const { exportWorkspaceIndex } = await import("../engine/transfer/index.js");
-  const result = await exportWorkspaceIndex({
+  const result = await runCliTransfer("export", {
     sourceHome: resolve(parsed.positionals[0]!),
     artifactPath: resolve(parsed.positionals[1]!),
-    onProgress: (stage, detail) => console.error(`${stage}: ${detail}`),
   });
   console.log(`Exported index: ${result.artifactPath}`);
   console.log(
@@ -186,11 +242,9 @@ async function runImport(parsed: ParsedArgs): Promise<void> {
       "zg --import-index requires an artifact directory and an explicit destination workspace root: zg --import-index <artifact-dir> <destination-root>",
     );
   }
-  const { importWorkspaceIndex } = await import("../engine/transfer/index.js");
-  const result = await importWorkspaceIndex({
+  const result = await runCliTransfer("import", {
     artifactPath: resolve(parsed.positionals[0]!),
     destinationRoot: resolve(parsed.positionals[1]!),
-    onProgress: (stage, detail) => console.error(`${stage}: ${detail}`),
   });
   console.log(`Imported index: ${result.destinationHome}`);
   console.log(
@@ -202,7 +256,7 @@ async function runImport(parsed: ParsedArgs): Promise<void> {
     );
   }
   console.log(
-    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, vectors exact (${result.verification.vectorsCompared} compared${result.verification.vectorsSampled ? ", sampled" : ", all"})`,
+    `Verification: counts ${result.verification.countsMatch ? "ok" : "FAILED"}, identities ${result.verification.identitiesUnique ? "ok" : "FAILED"}, ownership ${result.verification.ownershipValid ? "ok" : "FAILED"}, inventories ${result.verification.inventoriesExact ? "ok" : "FAILED"}, groups ${result.verification.groupIntegrity ? "ok" : "FAILED"}, ${formatVectorVerification(result.verification)}`,
   );
   console.log(
     "The imported index is unverified; the first indexing run reconciles content by hash.",

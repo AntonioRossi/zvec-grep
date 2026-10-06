@@ -168,7 +168,7 @@ paths, `device`, `apiKey`, or any verification claim.
      **correctly derived** identities (`sha256hex(index UUID + "\0" +
      canonical path)` for files and the fragment rule for entities),
      per-file ownership, exact public inventories, single-file groups with
-     exactly one owned major, required typed fields, and vector equality
+     exactly one owned major, required typed fields, and vector preservation
      (sampled checks are named as such);
    - every opened handle is closed in exception-safe finalizers; the source
      is never modified; an interrupted or rejected conversion leaves no
@@ -248,7 +248,8 @@ artifact, never the source database.
 5. **Import**: build inside the destination reservation (§7a), insert with
    status checks, and run the same verification as migration — counts, unique
    and correctly derived identities, ownership, exact inventories, group
-   integrity, required fields, vector equality. Import pays structure
+   integrity, required fields, vector preservation under the metric rules in §7.
+   Import pays structure
    rebuild, never inference, and the imported index starts unverified with
    verification explicitly invalidated at publication.
 6. **Boundary proof**: import runs in a separate process with the source

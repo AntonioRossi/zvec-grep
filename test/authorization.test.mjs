@@ -256,12 +256,13 @@ function status(filesModified) {
   };
 }
 
-test("authorization targets and grants are stable across equivalent workspace spellings", async () => {
+test("authorization targets and grants are stable across equivalent workspace spellings", async (t) => {
   // Spelling-stability guard for the hosted macOS e2e investigation
   // (runs 36827233150/36829847220/36835086578: incremental index ran with
   // permit=none). Targets and grants must not depend on which equivalent
   // spelling of the workspace root an invocation happens to compute.
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "zg-auth-alias-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
   const physical = join(temporaryDirectory, "real", "repo");
   await mkdir(physical, { recursive: true });
   await symlink(

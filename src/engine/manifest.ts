@@ -1,6 +1,7 @@
 import { lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { EngineError } from "./errors.js";
+import { INCOMPLETE_RECOVERY_HINT } from "./utils/recovery-guidance.js";
 import type {
   RootPath,
   WorkspaceIndexEmbeddingSchema,
@@ -105,7 +106,7 @@ export function assertHomeNotIncomplete(home: string): void {
       "Workspace index destination is incomplete from an interrupted reservation",
       {
         code: "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
-        context: `home=${home} hint=recover by removing the INCOMPLETE marker and partial contents after all writers are quiescent, then retry the operation`,
+        context: `home=${home} hint=${INCOMPLETE_RECOVERY_HINT}`,
       },
     );
   }
@@ -114,7 +115,7 @@ export function assertHomeNotIncomplete(home: string): void {
       "Workspace index incomplete-marker state cannot be inspected; treating the destination as blocked",
       {
         code: "ZVEC_GREP.ENGINE.MANIFEST.INCOMPLETE_DESTINATION",
-        context: `home=${home} hint=the INCOMPLETE marker could not be inspected; recover by removing it and partial contents after all writers are quiescent, then retry the operation`,
+        context: `home=${home} hint=the INCOMPLETE marker could not be inspected. ${INCOMPLETE_RECOVERY_HINT}`,
       },
     );
   }
