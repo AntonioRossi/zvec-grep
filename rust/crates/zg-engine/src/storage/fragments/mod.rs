@@ -330,7 +330,7 @@ fn fragments_schema(dimension: u32, metric: MetricType) -> EngineResult<Collecti
     )?;
     native(
         vector.set_index_params(&native(
-            IndexParams::hnsw(metric, 16, 200),
+            IndexParams::hnsw(metric, 50, 500),
             "define vector index",
         )?),
         "attach vector index",
