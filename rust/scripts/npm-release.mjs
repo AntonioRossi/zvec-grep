@@ -2,10 +2,12 @@
 
 import {
   chmod,
+  appendFile,
   copyFile,
   cp,
   mkdir,
   readdir,
+  readFile,
   rename,
   rm,
   stat,
@@ -24,6 +26,20 @@ import {
   stageZvecRuntime,
   workspaceDir,
 } from "./npm-package-core.mjs";
+import {
+  collectRelease,
+  promoteRelease,
+  publishRelease,
+} from "./npm-release-registry.mjs";
+import {
+  stageCompliance,
+  verifyPublicationInputs,
+} from "./npm-release-compliance.mjs";
+import {
+  rollbackVersion,
+  smokeInstalledPackage,
+  smokeRegistryRelease,
+} from "./npm-release-smoke.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const releaseRoot = join(workspaceDir, "dist", "npm", "release");
@@ -66,7 +82,12 @@ function parseOptions(args) {
 
 function currentPlatform(manifest) {
   const report = process.report?.getReport();
-  return selectPlatform(manifest, process.platform, process.arch, report?.header ?? {});
+  return selectPlatform(
+    manifest,
+    process.platform,
+    process.arch,
+    report?.header ?? {},
+  );
 }
 
 async function replaceDirectory(destination, populate) {
@@ -89,7 +110,7 @@ async function listFiles(root, directory = root) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      files.push(...await listFiles(root, path));
+      files.push(...(await listFiles(root, path)));
     } else {
       files.push(relative(root, path).split(sep).join("/"));
     }
@@ -123,7 +144,9 @@ async function packDirectory(packageDirectory) {
   );
   const result = JSON.parse(stdout);
   if (!result[0]?.filename) {
-    throw new Error(`npm pack did not report a tarball for ${packageDirectory}`);
+    throw new Error(
+      `npm pack did not report a tarball for ${packageDirectory}`,
+    );
   }
   return join(tarballRoot, result[0].filename);
 }
@@ -131,15 +154,20 @@ async function packDirectory(packageDirectory) {
 async function packPlatform(options) {
   const manifest = loadReleaseManifest();
   const current = currentPlatform(manifest);
-  const entry = options.target ? platformByTarget(manifest, options.target) : current;
+  const entry = options.target
+    ? platformByTarget(manifest, options.target)
+    : current;
   if (options.build) {
     if (entry.target !== current.target) {
-      throw new Error("cross-platform packaging requires --no-build and --binary");
+      throw new Error(
+        "cross-platform packaging requires --no-build and --binary",
+      );
     }
     run("cargo", ["build", "--locked", "--release", "--package", "zg"]);
   }
 
-  const binary = options.binary ?? join(workspaceDir, "target", "release", entry.binary);
+  const binary =
+    options.binary ?? join(workspaceDir, "target", "release", entry.binary);
   await stat(binary).catch(() => {
     throw new Error(`missing native release binary: ${binary}`);
   });
@@ -162,6 +190,11 @@ async function packPlatform(options) {
     }
 
     const checksums = await checksumManifest(temporary, entry.target);
+    await stageCompliance(
+      join(workspaceDir, "npm", "compliance", entry.target),
+      temporary,
+    );
+
     const packageJson = {
       name: entry.package,
       version,
@@ -170,14 +203,27 @@ async function packPlatform(options) {
       repository: "https://github.com/zvec-ai/zvec-grep",
       os: [entry.os],
       cpu: [entry.cpu],
-      files: ["bin", "lib", "checksums.json", "README.md", "LICENSES", "SBOM.spdx.json"],
+      files: [
+        "bin",
+        "lib",
+        "checksums.json",
+        "README.md",
+        "LICENSES",
+        "SBOM.spdx.json",
+      ],
       publishConfig: { access: "public", provenance: true },
     };
     if (entry.libc) {
       packageJson.libc = [entry.libc];
     }
-    await writeFile(join(temporary, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
-    await writeFile(join(temporary, "checksums.json"), `${JSON.stringify(checksums, null, 2)}\n`);
+    await writeFile(
+      join(temporary, "package.json"),
+      `${JSON.stringify(packageJson, null, 2)}\n`,
+    );
+    await writeFile(
+      join(temporary, "checksums.json"),
+      `${JSON.stringify(checksums, null, 2)}\n`,
+    );
     await writeFile(
       join(temporary, "README.md"),
       `# ${entry.package}\n\nNative zvec-grep payload for ${entry.target}. Install @zvec/zvec-grep instead.\n`,
@@ -214,7 +260,10 @@ async function packMeta() {
       optionalDependencies,
       publishConfig: { access: "public", provenance: true },
     };
-    await writeFile(join(temporary, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
+    await writeFile(
+      join(temporary, "package.json"),
+      `${JSON.stringify(packageJson, null, 2)}\n`,
+    );
     await writeFile(
       join(temporary, "platforms.json"),
       `${JSON.stringify(manifest.platforms, null, 2)}\n`,
@@ -228,18 +277,15 @@ async function packMeta() {
 async function verifyManifest() {
   const manifest = loadReleaseManifest();
   const version = cargoPackageVersion();
-  const packageNames = new Set(manifest.platforms.map((entry) => entry.package));
+  const packageNames = new Set(
+    manifest.platforms.map((entry) => entry.package),
+  );
   if (packageNames.size !== manifest.platforms.length) {
     throw new Error("npm platform package names must be unique");
   }
-  console.log(`verified ${manifest.platforms.length} npm platform packages at version ${version}`);
-}
-
-function installedPackageRoot(prefix, packageName) {
-  const modules = process.platform === "win32"
-    ? join(prefix, "node_modules")
-    : join(prefix, "lib", "node_modules");
-  return join(modules, ...packageName.split("/"));
+  console.log(
+    `verified ${manifest.platforms.length} npm platform packages at version ${version}`,
+  );
 }
 
 async function smokeCurrent(options) {
@@ -256,23 +302,20 @@ async function smokeCurrent(options) {
       prefix,
       "--no-audit",
       "--no-fund",
-      `--allow-scripts=${loadReleaseManifest().metaPackage}`,
+      `--allow-scripts=${meta.tarball}`,
       platform.tarball,
       meta.tarball,
     ],
     { env: npmEnvironment(cacheRoot) },
   );
 
-  const installedMeta = installedPackageRoot(prefix, loadReleaseManifest().metaPackage);
-  const installedPlatform = installedPackageRoot(prefix, platform.entry.package);
-  const materializedDigest = await sha256File(join(installedMeta, "bin", "zg.exe"));
-  const platformDigest = await sha256File(
-    join(installedPlatform, "bin", platform.entry.binary),
-  );
-  if (materializedDigest !== platformDigest) {
-    throw new Error("materialized meta binary does not match the platform package");
-  }
-  console.log(`release smoke passed: ${platform.entry.target} payload materialized and verified`);
+  await smokeInstalledPackage({
+    manifest: loadReleaseManifest(),
+    entry: platform.entry,
+    version: platform.version,
+    prefix,
+    fixtureRoot: join(releaseRoot, "smoke-workspace"),
+  });
 }
 
 async function main() {
@@ -295,12 +338,57 @@ async function main() {
     await verifyManifest();
     return;
   }
+  if (command === "verify-publication") {
+    await verifyPublicationInputs(
+      loadReleaseManifest(),
+      join(workspaceDir, "npm", "compliance"),
+    );
+    return;
+  }
   if (command === "smoke-current") {
     await smokeCurrent(options);
     return;
   }
+  if (command === "collect") {
+    await packMeta();
+    await collectRelease({
+      manifest: loadReleaseManifest(),
+      version: cargoPackageVersion(),
+      tarballRoot,
+    });
+    return;
+  }
+  if (command === "publish") {
+    await publishRelease({ manifest: loadReleaseManifest(), tarballRoot });
+    return;
+  }
+  if (command === "promote") {
+    await promoteRelease({ manifest: loadReleaseManifest(), tarballRoot });
+    return;
+  }
+  if (command === "rollback-version") {
+    const baseline = await rollbackVersion(
+      loadReleaseManifest(),
+      cargoPackageVersion(),
+    );
+    if (process.env.GITHUB_OUTPUT)
+      await appendFile(process.env.GITHUB_OUTPUT, `baseline=${baseline}\n`);
+    console.log(baseline);
+    return;
+  }
+  if (command === "smoke-registry") {
+    await smokeRegistryRelease({
+      manifest: loadReleaseManifest(),
+      release: JSON.parse(
+        await readFile(join(tarballRoot, "release.json"), "utf8"),
+      ),
+      baseline: process.env.NPM_ROLLBACK_VERSION,
+      prefixRoot: join(releaseRoot, "registry-smoke"),
+    });
+    return;
+  }
   throw new Error(
-    "usage: npm-release.mjs <verify|pack-platform|pack-meta|pack-current|smoke-current> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--no-build]",
+    "usage: npm-release.mjs <verify|verify-publication|pack-platform|pack-meta|pack-current|smoke-current|collect|publish|promote|rollback-version|smoke-registry> [--target TARGET] [--binary PATH] [--lib-dir PATH] [--no-build]",
   );
 }
 

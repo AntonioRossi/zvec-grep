@@ -404,6 +404,65 @@ The runtime library directory must include zvec's shared library and its
 `data/jieba_dict` directory. Without `--lib-dir`, these assets are read from
 the binary's directory.
 
-All native platform packages must be published and smoke-tested before the meta
-package. The release script intentionally does not run `npm publish` or move a
-dist-tag.
+The `Publish Rust packages` workflow builds all five published native targets on matching
+GitHub runners. Pushes to `main` or `release/rust-*` branches and manual runs
+produce downloadable candidates without publishing to npm. Each runner installs
+its platform and meta tarballs, then runs `zg --version`, checks managed-rg,
+starts the packaged daemon, compares workspace status in direct and server
+modes, and stops the daemon. The server status request crosses the IPC boundary;
+managed-rg intentionally stays local. macOS binaries receive ad hoc signatures;
+Developer ID, notarization, and Windows certificate signing are not required for
+candidate builds.
+
+Intel macOS is built and verified first. Only after its tarball installation,
+CLI startup, managed-rg, and daemon IPC checks pass do the other four native
+builds start. The final artifact is collected after all five targets pass.
+
+Linux candidates are built and smoke-tested on Ubuntu 24.04. The current ONNX
+Runtime prebuilt libraries cannot link against Ubuntu 22.04's glibc and C++
+runtime, so older Linux distributions are not covered by this release workflow.
+Intel macOS builds ONNX Runtime 1.28.0 with CoreML and the native zvec SDK from
+pinned source revisions because neither dependency supplies prebuilt Intel
+macOS libraries. Both SDKs are cached and their shared libraries are included
+in the npm payload. The Intel release targets macOS 14 and later.
+
+Download the `rust-release-<version>` artifact from the successful workflow run
+and unzip it. It contains all five platform tarballs, the meta tarball,
+`SHA256SUMS`, `release.json` with the source commit, and platform-specific install
+commands. For example, on an ARM64 Mac:
+
+```sh
+npm install --global --allow-scripts=./zvec-zvec-grep-0.0.1.tgz ./zvec-zvec-grep-darwin-arm64-0.0.1.tgz ./zvec-zvec-grep-0.0.1.tgz
+zg --version
+zg --rg -F "zvec-grep" README.md
+```
+
+Use the filenames from the downloaded artifact when the version changes. On
+Windows, use `zg.cmd` if PowerShell blocks the generated `zg.ps1` shim. Artifacts
+are retained for 14 days.
+
+To publish, update the Rust workspace version, tag the release commit on `main`
+as `rust-v<version>`, and manually run the workflow with `publish` enabled. The
+publishing repository must have an npm trusted publisher configured for all six
+packages with both **Allow npm publish** and the independent **Allow npm
+dist-tag** permission enabled, or provide an eligible `NPM_TOKEN` secret.
+Publishing and promotion install npm 11.21.0 explicitly for OIDC dist-tag support.
+
+Registry publication is currently blocked until reviewed license texts and
+SPDX SBOMs are supplied for every target in [`npm/compliance/`](npm/compliance/README.md).
+Candidate downloads remain available while these inputs are prepared.
+Every publication uses `rust-canary`, letting users opt into Rust with
+`npm install --global @zvec/zvec-grep@rust-canary`. Five native runners then
+install only the meta package from the registry, test actual daemon IPC, and
+exercise update and rollback with a distinct previously published version.
+Selecting `latest` requests a separate promotion job that changes the default
+installation only after all registry checks pass.
+
+`release:collect` requires all platform tarballs and packs the meta package last.
+`release:publish` validates the collected files before publishing native packages
+and then the meta package under `rust-canary` with npm provenance. An already published version is
+reused only when its tarball integrity matches, allowing a partial publication
+to be retried without replacing a version. `release:promote` only moves tags for
+an already published identical release and runs after registry validation in the
+workflow. Ordinary build and packaging commands
+do not publish or move dist-tags.

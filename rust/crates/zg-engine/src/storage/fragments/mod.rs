@@ -165,6 +165,23 @@ impl Fragments {
         Ok(())
     }
 
+    pub(super) fn needs_optimize(&self) -> EngineResult<bool> {
+        for index in self.indexes.values() {
+            let stats = native(index.stats(), "inspect fragment indexes")?;
+            if stats.indexes.iter().any(|stat| stat.completeness < 1.0) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn optimize(&self) -> EngineResult<()> {
+        for index in self.indexes.values() {
+            native(index.optimize(), "optimize fragment collection")?;
+        }
+        Ok(())
+    }
+
     pub(super) fn search_fts(
         &self,
         query: &str,
@@ -313,7 +330,7 @@ fn fragments_schema(dimension: u32, metric: MetricType) -> EngineResult<Collecti
     )?;
     native(
         vector.set_index_params(&native(
-            IndexParams::hnsw(metric, 16, 200),
+            IndexParams::hnsw(metric, 50, 500),
             "define vector index",
         )?),
         "attach vector index",
