@@ -33,8 +33,8 @@ use zg_host_native::{
 };
 
 use crate::job_scheduler::{
-    IndexExecutor, IndexJobCompletion, IndexJobScheduler, IndexJobSnapshot, JobReason, JobState,
-    SchedulerConfig, SchedulerError, SchedulerSnapshot,
+    IndexExecutor, IndexJobScheduler, IndexJobSnapshot, JobReason, JobState, SchedulerConfig,
+    SchedulerError, SchedulerSnapshot,
 };
 mod lifecycle;
 use lifecycle::{RuntimeActivity, RuntimeLifecycle};
@@ -141,6 +141,19 @@ struct WatcherHandle {
     cancellation: CancellationToken,
     session: Arc<dyn WorkspaceWatchSessionPort>,
     task: JoinHandle<()>,
+}
+
+impl WatcherHandle {
+    async fn wait_for_pending_batches(&self) -> Result<(), EngineError> {
+        let (sender, receiver) = oneshot::channel();
+        self.barrier
+            .send(sender)
+            .await
+            .map_err(|_| EngineError::resource_closed("workspace watcher has stopped"))?;
+        receiver
+            .await
+            .map_err(|_| EngineError::resource_closed("workspace watcher barrier was interrupted"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,7 +333,7 @@ impl WorkspaceRuntimeManager {
         }
         let canonical_root = canonical_root(options.root.as_deref())?;
         options.root = Some(canonical_root.clone());
-        let runtime = self.runtime(canonical_root.clone(), &options)?;
+        let runtime = self.runtime(canonical_root, &options)?;
         let reconfigure = options.reset_paths || options.scan != ScanRulesUpdate::default();
         let template = index_template(&options);
         runtime.require_reconciliation();
@@ -342,7 +355,7 @@ impl WorkspaceRuntimeManager {
                     let _ = manager
                         .on_index_succeeded(
                             Arc::clone(&activity),
-                            completed.job,
+                            completed.job.id,
                             target_revision,
                             template,
                             reconfigure,
@@ -369,7 +382,7 @@ impl WorkspaceRuntimeManager {
             && let Err(error) = self
                 .on_index_succeeded(
                     Arc::clone(&runtime),
-                    completed.job.clone(),
+                    completed.job.id,
                     target_revision,
                     template,
                     reconfigure,
@@ -393,7 +406,11 @@ impl WorkspaceRuntimeManager {
                 .wait_for_root_idle(&runtime.canonical_root)
                 .await;
         }
-        Ok(submission(completed, submitted.reused))
+        Ok(RuntimeIndexSubmission {
+            job: completed.job,
+            reused: submitted.reused,
+            result: completed.result,
+        })
     }
 
     /// Returns whether refresh work was scheduled or is already in flight.
@@ -420,10 +437,10 @@ impl WorkspaceRuntimeManager {
                 };
                 refresh
             };
-            let busy = self
-                .job_for_root(&root)
-                .is_some_and(|job| matches!(job.state, JobState::Queued | JobState::Running));
-            if !wait && busy {
+            if !wait
+                && let Some(job) = self.job_for_root(&root)
+                && matches!(job.state, JobState::Queued | JobState::Running)
+            {
                 return Ok(true);
             }
             self.ensure_watching(Arc::clone(&runtime))
@@ -431,9 +448,8 @@ impl WorkspaceRuntimeManager {
                 .map_err(WorkspaceRuntimeError::into_engine_error)?;
             self.flush_watcher(&runtime).await?;
             if !wait
-                && self
-                    .job_for_root(&root)
-                    .is_some_and(|job| matches!(job.state, JobState::Queued | JobState::Running))
+                && let Some(job) = self.job_for_root(&root)
+                && matches!(job.state, JobState::Queued | JobState::Running)
             {
                 return Ok(true);
             }
@@ -522,15 +538,7 @@ impl WorkspaceRuntimeManager {
             .flush_pending()
             .await
             .map_err(map_host_error)?;
-        let (sender, receiver) = oneshot::channel();
-        handle
-            .barrier
-            .send(sender)
-            .await
-            .map_err(|_| EngineError::resource_closed("workspace watcher has stopped"))?;
-        receiver
-            .await
-            .map_err(|_| EngineError::resource_closed("workspace watcher barrier was interrupted"))
+        handle.wait_for_pending_batches().await
     }
 
     /// Explicit inspection always reads disk. The runtime keeps the observation for cheap
@@ -757,7 +765,7 @@ impl WorkspaceRuntimeManager {
     async fn on_index_succeeded(
         &self,
         runtime: Arc<WorkspaceRuntime>,
-        job: IndexJobSnapshot,
+        job_id: uuid::Uuid,
         revision: u64,
         template: IndexOptions,
         reconfigure: bool,
@@ -769,7 +777,7 @@ impl WorkspaceRuntimeManager {
             .indexed_revision
             .fetch_max(revision, Ordering::AcqRel);
         let result = if reconfigure {
-            self.configure_watcher(Arc::clone(&runtime), Some((job.id, template)))
+            self.configure_watcher(Arc::clone(&runtime), Some((job_id, template)))
                 .await
         } else {
             *lock(&runtime.index_template) = template;
@@ -879,7 +887,7 @@ impl WorkspaceRuntimeManager {
             )
             .await;
         });
-        *watcher = Some(WatcherHandle {
+        let handle = watcher.insert(WatcherHandle {
             configured_job,
             barrier,
             cancellation,
@@ -888,18 +896,8 @@ impl WorkspaceRuntimeManager {
         });
         // Cover the interval between indexing and installing a watcher, including
         // first activation. A barrier ensures the daemon has queued the reconciliation.
-        if let Some(handle) = watcher.as_ref() {
-            handle.session.flush().await?;
-            let (acknowledge, acknowledged) = oneshot::channel();
-            handle
-                .barrier
-                .send(acknowledge)
-                .await
-                .map_err(|_| EngineError::resource_closed("workspace watcher has stopped"))?;
-            acknowledged.await.map_err(|_| {
-                EngineError::resource_closed("workspace watcher barrier was interrupted")
-            })?;
-        }
+        handle.session.flush().await?;
+        handle.wait_for_pending_batches().await?;
         Ok(())
     }
 
@@ -1045,18 +1043,15 @@ impl IndexOperationProvider for WorkspaceRuntimeManager {
             })
             .await?;
             info.compatibility.ensure_compatible()?;
-            let activity = if info.indexed {
-                Some(self.runtime(info.root.clone(), &options)?)
-            } else {
-                None
-            };
-            if info.indexed {
-                let mut options = options;
-                options.root = Some(info.root);
-                self.refresh_index(options, true).await?;
+            if !info.indexed {
+                // Preserve the engine's missing-index error without silently creating one.
+                return Ok(None);
             }
-            // Preserve the engine's missing-index error without silently creating one.
-            Ok(activity)
+            let activity = self.runtime(info.root.clone(), &options)?;
+            let mut options = options;
+            options.root = Some(info.root);
+            self.refresh_index(options, true).await?;
+            Ok(Some(activity))
         })
         .await?;
         // Resident Wait reconciles delivered watcher events. OS notifications
@@ -1282,15 +1277,9 @@ async fn watch_loop(
         }) {
             runtime.observe_file_changes(revision);
         }
-        let mut options = lock(&runtime.index_template).clone();
         // One-operation consent must never authorize later watcher jobs.
-        options.allow_remote = false;
-        options.authorized_remote.clear();
-        options.name = None;
-        options.signal = None;
-        options.on_progress = None;
+        let mut options = lock(&runtime.index_template).clone();
         options.root = Some(runtime.canonical_root.clone());
-        options.rebuild = false;
         options.changes = batch.changes.into_iter().map(map_change).collect();
         if options.changes.contains(&IndexChange::Rescan) {
             runtime.require_reconciliation();
@@ -1299,13 +1288,10 @@ async fn watch_loop(
         else {
             continue;
         };
-        let scheduler = inner.scheduler.clone();
-        let manager = WorkspaceRuntimeManager {
-            inner: Arc::clone(&inner),
-        };
+        let manager = WorkspaceRuntimeManager { inner };
         tokio::spawn(async move {
             let runtime = activity;
-            let Ok(completed) = scheduler.wait(submitted.job.id).await else {
+            let Ok(completed) = manager.inner.scheduler.wait(submitted.job.id).await else {
                 runtime.forget_job_proof(submitted.job.id);
                 return;
             };
@@ -1321,14 +1307,6 @@ async fn watch_loop(
     if let Some(runtime) = weak_runtime.upgrade() {
         runtime.require_reconciliation();
         runtime.watcher_active.store(false, Ordering::Release);
-    }
-}
-
-fn submission(completed: IndexJobCompletion, reused: bool) -> RuntimeIndexSubmission {
-    RuntimeIndexSubmission {
-        job: completed.job,
-        reused,
-        result: completed.result,
     }
 }
 
