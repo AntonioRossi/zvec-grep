@@ -195,8 +195,8 @@ scripts.
 ## `zg --install` and `zg --uninstall`
 
 ```text
-zg --install [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|all|auto] [--mcp-transport stdio|http] [--mcp-toolset agent|full] [--yes] [--force]
-zg --uninstall [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|all|auto] [--yes]
+zg --install [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|pi|all|auto] [--mcp-transport stdio|http] [--mcp-toolset agent|full] [--yes] [--force]
+zg --uninstall [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|pi|all|auto] [--yes]
 ```
 
 `--target` is repeatable. `qoder` is the single Qoder target and configures
@@ -209,13 +209,20 @@ the Copilot CLI. `zg --install` also accepts:
 | --- | --- |
 | `--mcp-transport <stdio\|http>` | MCP connection mode; default `stdio` |
 | `--mcp-toolset <agent\|full>` | Daemon MCP surface; default `agent` |
-| `--mcp-tool-timeout <seconds>` | Codex, Qwen Code, both Qoder clients, OpenCode, and GitHub Copilot MCP timeout; default 600 seconds |
+| `--mcp-tool-timeout <seconds>` | Codex, Qwen Code, both Qoder clients, OpenCode, GitHub Copilot, and Pi MCP timeout; default 600 seconds |
 | `--mcp-token-env <name>` | Environment variable containing the server token |
 | `--force` | Write the selected configuration despite a conflicting unmanaged `zvec_grep` entry; malformed inspected files still fail. For OpenCode this writes the selected file only — sibling definitions in other merged files can remain effective |
 
 The `grok` target keeps Grok Build's own per-call timeout default, which is
 already generous, and manages tool pre-approval through the `[permission]`
 table instead.
+
+The `pi` target configures user-level MCP and the active context
+file under `${PI_CODING_AGENT_DIR:-~/.pi/agent}`. Both transports start with
+direct tool exposure; reinstall preserves user exposure and enabled-state
+choices. HTTP authentication is retained when `--mcp-token-env` is omitted.
+Use `/reload` or a new Pi session to apply changes. Pi may require manual
+`zg --auth grant` authorization before Remote Embedding can be used.
 
 See [Agent integrations](./01-agents.md) before using `--force`.
 

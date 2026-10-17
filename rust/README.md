@@ -27,6 +27,29 @@ let reply = zg.context(ContextOptions {
 zg.close();
 ```
 
+Index embedding concurrency is configured with
+`zg --index --index-embedding-concurrency <n>`; the old
+`--embedding-concurrency` spelling is rejected. For automatic indexing and
+refreshes as well, set `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY=<n>`. Values must be
+positive integers. Explicit CLI/API index settings take precedence over this
+environment variable, followed by the legacy
+`ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM` for llama.cpp indexing, then backend defaults.
+Invalid environment values warn and select the automatic default. These overrides
+do not configure query-vector inference and are not persisted in workspace settings.
+Direct and Server indexing use the same engine boundary; restart the Server after
+changing its inherited environment, while explicit CLI overrides need no restart.
+
+For llama.cpp, the limit controls contexts within a serialized batch and is capped
+at eight, defaulting to one. Transformers/ORT limits in-flight batches to at most
+eight, defaulting to one. ORT may create sessions within this budget;
+CoreML retains one physical session. Potion/model2vec defaults to two batch tasks
+and retains an independent CPU worker capacity; remote models retain adaptive
+request scheduling. Model2vec and remote overrides are not capped at eight.
+
+Matching local concurrency configurations share runtime admission. Different
+configurations use separate cached native resources; active leases keep their
+models alive, while unused variants are released when switching configurations.
+
 `zg --install --target opencode` respects a nonempty `OPENCODE_CONFIG` override.
 Otherwise it selects an existing `opencode.jsonc` before `opencode.json` under
 `${XDG_CONFIG_HOME:-~/.config}/opencode`, creating `opencode.json` when neither
@@ -42,6 +65,18 @@ every detected Stable and Insiders user profile, using `VSCODE_USER_DIR`,
 `VSCODE_PORTABLE`, or `VSCODE_APPDATA` when set. It also registers the server in
 Copilot's home because the shared instructions are read by both clients.
 Uninstall preserves that shared server until both integrations are removed.
+
+`zg --install --target pi` configures Pi's built-in user-level MCP in
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}/mcp.json` and adds guidance to the active
+global context file, including `AGENTS.override.md` when present. Both stdio
+and HTTP use the shared daemon; new entries have direct exposure and a timeout
+in seconds. Reinstall preserves Pi UI choices and existing HTTP authentication
+unless an explicit token environment option replaces it. Uninstall uses a
+stable ownership marker, so changing the daemon URL does not leave stale
+managed entries. Use `/reload` or a new session. Native filesystem paths are
+required for the directory override; file URIs and Windows shell drive paths
+are rejected. Pi's built-in MCP currently needs user-managed `zg --auth grant`
+authorization for Remote Embedding; see the [integration guide](../docs/01-agents.md).
 
 `ZvecGrep` is normally shared for the lifetime of a process. Workspace root is
 request state, so the same instance can serve multiple workspaces. It exposes
@@ -217,8 +252,10 @@ events and queued successors; concurrent waiters share one refresh. A clean
 `Background` query reports `idle` without submitting another job. Initial watcher
 installation, recovery, overflow, rejected batches, and failed indexing require a
 full reconciliation. Proofs retain their original revision and recovery epoch so
-an older completion cannot clear newer changes; partial file failures are never
-cached as fresh. Native `flush_pending` drains delivered events without forcing a
+an older completion cannot clear newer changes; partial file failures never
+establish a reconciliation proof. Public search freshness requires observed
+file-change evidence independently of reconciliation or background activity.
+Native `flush_pending` drains delivered events without forcing a
 scan, while explicit `flush` and periodic/recovery checks retain full rescans.
 Explicit `info` inspection still reads current disk status.
 

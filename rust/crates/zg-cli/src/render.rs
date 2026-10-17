@@ -40,6 +40,45 @@ pub fn write_context_result(mut writer: impl Write, result: &ContextResult) -> i
     Ok(())
 }
 
+/// Writes Node-compatible indexed-search status to the caller's diagnostic stream.
+/// # Errors
+/// Returns the underlying writer error.
+pub fn write_context_status(mut writer: impl Write, result: &ContextResult) -> io::Result<()> {
+    use zg_engine::api::context::result::ContextSource;
+    if result.source != ContextSource::Index {
+        return Ok(());
+    }
+    let has_drift =
+        result.freshness.as_deref() == Some("possibly_stale") || result.has_stale_items();
+    if !has_drift && result.indexing.is_none() {
+        return Ok(());
+    }
+    writeln!(writer, "status: possibly_stale")?;
+    let Some(state) = result
+        .indexing
+        .as_ref()
+        .map(|indexing| indexing.state.as_str())
+        .or(result.background_refresh.as_deref())
+    else {
+        return Ok(());
+    };
+    writeln!(writer, "results: served_from_current_index")?;
+    write!(
+        writer,
+        "background_refresh: {}",
+        if state == "off" { "idle" } else { state }
+    )?;
+    if let Some((completed, total)) = result
+        .indexing
+        .as_ref()
+        .and_then(|indexing| indexing.completed.zip(indexing.total))
+    {
+        write!(writer, " ({completed}/{total})")?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
 /// Writes context using the selected terminal presentation.
 /// # Errors
 /// Returns the underlying writer error.
@@ -397,8 +436,24 @@ Embedding options:
   --endpoint <url>                  Embedding provider endpoint
   --model-cache <path>              Local model cache directory
   --device <device>                 auto, cpu, metal, vulkan, cuda
-  --embedding-concurrency <n>       Embedding task concurrency
+  --index-embedding-concurrency <n>  Positive index embedding concurrency
   --allow-remote                    Allow Remote Embedding for this command only
+
+Index embedding concurrency:
+  Applies only to index construction and updates, including automatic indexing
+  and refresh; query-vector inference keeps its own defaults. The CLI option
+  is accepted only with --index and is never saved in workspace settings.
+  llama.cpp: context limit capped at 8, with serialized batches; defaults to 1.
+  Transformers/ORT: in-flight batch limit capped at 8; defaults to 1. Native
+    sessions honor that budget; CoreML uses one physical session.
+  Potion/model2vec: concurrent batch tasks; defaults to 2, with an independent
+    CPU worker-pool capacity. No cap of 8 is applied.
+  Remote: concurrent requests; adaptive scheduling may reduce the limit after
+    failures or rate limits. No cap of 8 is applied.
+  Precedence: CLI/API override, ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY, legacy
+    ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM for llama.cpp indexing, then defaults.
+  Explicit CLI overrides work without restarting the Server. Environment
+    changes require restarting the Server so it inherits the new value.
 
 Scan rules:
   -g, --glob <glob>                 Include paths; prefix with ! to exclude; repeatable
@@ -438,6 +493,13 @@ Environment:
   ZVEC_GREP_ENDPOINT     Remote Embedding endpoint fallback
   ZVEC_GREP_MODEL_CACHE  Local embedding model cache directory
   ZVEC_GREP_DEVICE       Local embedding device: auto, cpu, metal, vulkan, or cuda
+
+Index-only embedding concurrency:
+  ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY  Positive index/update concurrency override
+  Applies to automatic indexing and refresh, never query-vector inference.
+  Explicit CLI/API index settings take precedence. Invalid values warn and use
+  automatic selection. Server mode reads the Server process environment;
+  restart the Server after changing it. Overrides are not persisted.
 
 See zg --help environment for precedence and Server-mode scope.";
 
@@ -532,10 +594,10 @@ Environment:
 See zg --help environment for daemon startup scope.";
 
 const INSTALL_HELP: &str = r"Usage:
-  zg --install [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|all|auto] [--mcp-transport stdio|http] [--mcp-toolset agent|full] [--yes] [--force]
+  zg --install [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|pi|all|auto] [--mcp-transport stdio|http] [--mcp-toolset agent|full] [--yes] [--force]
 
 Options:
-  --target <agent>                  codex, claude, qwen, qoder, opencode, cursor, copilot, vscode, grok, auto, or all; repeatable
+  --target <agent>                  codex, claude, qwen, qoder, opencode, cursor, copilot, vscode, grok, pi, auto, or all; repeatable
   --mcp-transport <stdio|http>      MCP connection mode (default: stdio)
   --mcp-toolset <agent|full>        Daemon MCP toolset (default: agent)
   --mcp-tool-timeout <seconds>      MCP tool timeout where supported (default: 600)
@@ -548,12 +610,20 @@ The copilot target configures GitHub Copilot CLI and Agent Host. The vscode
 target configures detected VS Code profiles and shared Copilot instructions.
 The grok target configures Grok Build's user-level config.toml, global
 rules file, and tool pre-approval.
+The pi target configures built-in MCP in ~/.pi/agent/mcp.json and the active
+global context file. PI_CODING_AGENT_DIR overrides this directory; use native
+filesystem paths (file:// and Windows shell drive paths are unsupported).
+New servers use direct exposure and a timeout in seconds. Reinstall preserves
+user exposure/enabled settings and existing HTTP authentication when no token
+option is supplied. Use /reload or a new session; replacement MCP extensions
+must be disabled separately. Remote Embedding may require the user to run
+zg --auth grant in their terminal before retrying.
 
 Interactive setup detects supported agents, configures stdio by default, and
 starts the shared daemon. In stdio mode an agent reconnect also starts the
 daemon automatically after a reboot. HTTP users manage later daemon restarts.
 Codex, Claude Code, Qwen Code, Qoder CLI, OpenCode, Copilot, VS Code, and
-Grok Build receive managed guidance. Qoder IDE has no supported global Rules
+Grok Build and Pi receive managed guidance. Qoder IDE has no supported global Rules
 file, so only its MCP configuration is managed.
 Codex and Claude Code receive local tool pre-approval. Grok Build receives
 pre-approval through its permission rules unless the configuration already
@@ -563,11 +633,12 @@ use. Restart the agent or open a new session after installation. This does not
 install the npm package.";
 
 const UNINSTALL_HELP: &str = r"Usage:
-  zg --uninstall [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|all|auto] [--yes]
+  zg --uninstall [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|pi|all|auto] [--yes]
 
 Removes zvec-grep-managed MCP configuration, agent-specific approval, and
 guidance. The qoder target removes the managed Qoder CLI and IDE integration
-together.";
+together. The pi target removes its managed server and guidance blocks from
+the effective agent directory; unrelated configuration and context are kept.";
 
 const HELP_HELP: &str = r"Usage:
   zg --help [topic]
@@ -713,6 +784,14 @@ Embedding:
   ZVEC_GREP_MODEL_CACHE  Local embedding model cache directory
   ZVEC_GREP_DEVICE       Local embedding device: auto, cpu, metal, vulkan, or cuda
 
+Index-only embedding concurrency:
+  ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY  Positive index/update concurrency override
+  Applies to automatic indexing and refresh, never query-vector inference.
+  Precedence: explicit CLI/API index setting, this variable, legacy llama.cpp
+  index setting, then backend defaults. Invalid values warn and use defaults.
+  Server mode reads the Server process environment; restart it after changes.
+  These overrides are not persisted in workspace settings.
+
 Qwen credential aliases:
   DASHSCOPE_API_KEY  Qwen credential fallback after ZVEC_GREP_API_KEY
   QWEN_API_KEY       Qwen credential fallback after DASHSCOPE_API_KEY
@@ -723,13 +802,14 @@ State and authorization:
 
 Advanced:
   ZVEC_GREP_METAL_KEEP_RESIDENCY       Set to 1 to keep llama.cpp Metal residency enabled (advanced)
-  ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM  Positive llama.cpp context parallelism override (advanced)
+  ZVEC_GREP_LLAMA_CONTEXT_PARALLELISM  Legacy index-only llama.cpp fallback after the index concurrency variable
   NO_COLOR                             Disable terminal colors
 
 Agent integration paths:
   CODEX_HOME            Codex configuration directory used by zg --install
   CLAUDE_CONFIG_DIR     Claude configuration directory used by zg --install
   GROK_HOME             Grok Build configuration directory used by zg --install
+  PI_CODING_AGENT_DIR   Pi agent directory used by zg --install/--uninstall
   QWEN_HOME             Qwen Code configuration directory used by zg --install
   QODER_CONFIG_DIR      Qoder CLI configuration directory used by zg --install
   QODER_IDE_MCP_PATH    Full Qoder IDE SharedClientCache/mcp.json path used by zg --install
@@ -806,6 +886,22 @@ mod output_tests {
         }
     }
 
+    fn indexed_result() -> ContextResult {
+        ContextResult {
+            query: "needle".into(),
+            freshness: None,
+            background_refresh: None,
+            indexing: None,
+            root: std::env::temp_dir(),
+            source: ContextSource::Index,
+            coverage: ContextCoverage::RankedSample,
+            workspace_index: None,
+            group_results: vec![],
+            diagnostics: ContextDiagnostics::default(),
+            items: vec![indexed_item()],
+        }
+    }
+
     #[test]
     fn preview_numbers_follow_content_range_instead_of_match_or_entity_range() {
         for trailing_newline in [false, true] {
@@ -869,19 +965,53 @@ mod output_tests {
     }
 
     #[test]
-    fn preview_modes_and_trace_preserve_indexed_result_information() {
-        let mut result = ContextResult {
-            query: "needle".into(),
-            freshness: None,
-            background_refresh: None,
-            root: std::env::temp_dir(),
-            source: ContextSource::Index,
-            coverage: ContextCoverage::RankedSample,
-            workspace_index: None,
-            group_results: vec![],
-            diagnostics: ContextDiagnostics::default(),
-            items: vec![indexed_item()],
+    fn context_status_is_independent_of_results_and_reports_index_progress() {
+        use zg_engine::api::context::result::ContextIndexingStatus;
+        let mut result = indexed_result();
+        result.freshness = Some("fresh".into());
+        result.background_refresh = Some("idle".into());
+        result.items.clear();
+        let render = |result: &ContextResult| {
+            let mut output = Vec::new();
+            super::write_context_status(&mut output, result).expect("status");
+            String::from_utf8(output).expect("UTF-8")
         };
+        assert_eq!(render(&result), "");
+        result.indexing = Some(ContextIndexingStatus {
+            state: "idle".into(),
+            completed: Some(2),
+            total: Some(3),
+        });
+        assert_eq!(
+            render(&result),
+            "status: possibly_stale\nresults: served_from_current_index\nbackground_refresh: idle (2/3)\n"
+        );
+        for state in ["queued", "running", "failed", "cancelled", "succeeded"] {
+            result.indexing = Some(ContextIndexingStatus {
+                state: state.into(),
+                completed: None,
+                total: Some(3),
+            });
+            assert_eq!(
+                render(&result),
+                format!(
+                    "status: possibly_stale\nresults: served_from_current_index\nbackground_refresh: {state}\n"
+                )
+            );
+        }
+        result.indexing = None;
+        result.freshness = Some("served_from_current_index".into());
+        assert_eq!(render(&result), "");
+        result.freshness = Some("possibly_stale".into());
+        result.background_refresh = None;
+        assert_eq!(render(&result), "status: possibly_stale\n");
+        result.source = ContextSource::Rg;
+        assert_eq!(render(&result), "");
+    }
+
+    #[test]
+    fn preview_modes_and_trace_preserve_indexed_result_information() {
+        let mut result = indexed_result();
         let render = |preview, trace| {
             let mut buffer = Vec::new();
             write_context_with_options(
