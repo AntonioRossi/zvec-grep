@@ -23,12 +23,13 @@ managed-rg route.
 | GitHub Copilot | `copilot` | `~/.copilot/mcp-config.json` and `~/.copilot/copilot-instructions.md` |
 | VS Code | `vscode` | the `mcp.json` of every detected VS Code profile, `~/.copilot/mcp-config.json`, and `~/.copilot/instructions/zvec-grep.instructions.md` |
 | Grok Build | `grok` | `~/.grok/config.toml` and `~/.grok/rules/zvec-grep.md` |
-| Pi | `pi` | `~/.pi/agent/mcp.json` and the active global context file |
+| Pi (Rust only) | `pi` | `~/.pi/agent/mcp.json` and the active global context file |
 
 The standard environment overrides used by each agent are respected, including
 `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GROK_HOME`, `QWEN_HOME`, `QODER_CONFIG_DIR`,
 `QODER_IDE_MCP_PATH`, `QODER_IDE_EXECUTABLE`, `OPENCODE_CONFIG`,
-`CURSOR_CONFIG_DIR`, `COPILOT_HOME`, `PI_CODING_AGENT_DIR`, `VSCODE_PORTABLE`, and `VSCODE_APPDATA`.
+`CURSOR_CONFIG_DIR`, `COPILOT_HOME`, `VSCODE_PORTABLE`, and `VSCODE_APPDATA`.
+The Rust CLI also uses `PI_CODING_AGENT_DIR` for Pi.
 `VSCODE_USER_DIR` overrides the complete VS Code `User` profile directory, for
 a non-default profile, VS Code Insiders, or a VS Code derivative.
 
@@ -102,7 +103,7 @@ zg --install --target qoder --yes
 zg --install --target copilot --yes
 zg --install --target vscode --yes
 zg --install --target grok --yes
-zg --install --target pi --yes
+zg --install --target pi --yes # Rust CLI only
 zg --install --target all --yes
 ```
 
@@ -269,7 +270,7 @@ an existing `claude` or `cursor` install may already expose the zg server
 there; the `grok` target replaces that compat-sourced entry with a native one
 and adds the guidance and pre-approval those sources cannot provide.
 
-For Pi, the installer configures its built-in MCP support in
+For Pi, the Rust installer configures its built-in MCP support in
 `${PI_CODING_AGENT_DIR:-~/.pi/agent}/mcp.json`. Pi introduced built-in MCP in
 0.99.0; replacement extensions such as `pi-mcp-adapter` can take over `/mcp`
 and prevent a session from loading this configuration. Enable built-in MCP
@@ -407,7 +408,7 @@ zg --uninstall --target qwen --yes
 zg --uninstall --target qoder --yes
 zg --uninstall --target copilot --yes
 zg --uninstall --target vscode --yes
-zg --uninstall --target pi --yes
+zg --uninstall --target pi --yes # Rust CLI only
 zg --uninstall --target all --yes
 ```
 

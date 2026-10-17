@@ -153,9 +153,10 @@ zg --migrate-index <legacy-home> <destination-root>
 
 Converts a legacy (version 1, absolute-path) Workspace index into the portable
 format. The source is never modified; the destination is built in an exclusive
-staging directory, verified, and only then moved into place. Stored vectors and
-fragment content are preserved exactly and no embedding computation occurs, so
-migrated indexes keep the compute already invested in them.
+staging directory, verified, and only then moved into place. Fragment content
+is preserved exactly. Cosine vectors can differ by at most two float32 steps
+per component. Other metrics require exact vector values. No embedding
+computation occurs, so migrated indexes keep the compute already invested in them.
 
 `legacy-home` is the legacy `.zvec-grep` directory. `destination-root` is
 required and must not already contain a workspace index. Persisted credentials
@@ -199,6 +200,8 @@ zg --install [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|gr
 zg --uninstall [--target codex|claude|qwen|qoder|opencode|cursor|copilot|vscode|grok|pi|all|auto] [--yes]
 ```
 
+The `pi` target is available only in the Rust CLI. The Node CLI rejects it.
+
 `--target` is repeatable. `qoder` is the single Qoder target and configures
 Qoder CLI and Qoder IDE together. `copilot` configures GitHub Copilot CLI and
 Agent Host; `vscode` configures every detected VS Code profile and shares the
@@ -209,7 +212,7 @@ the Copilot CLI. `zg --install` also accepts:
 | --- | --- |
 | `--mcp-transport <stdio\|http>` | MCP connection mode; default `stdio` |
 | `--mcp-toolset <agent\|full>` | Daemon MCP surface; default `agent` |
-| `--mcp-tool-timeout <seconds>` | Codex, Qwen Code, both Qoder clients, OpenCode, GitHub Copilot, and Pi MCP timeout; default 600 seconds |
+| `--mcp-tool-timeout <seconds>` | Codex, Qwen Code, both Qoder clients, OpenCode, GitHub Copilot, and Pi (Rust only) MCP timeout; default 600 seconds |
 | `--mcp-token-env <name>` | Environment variable containing the server token |
 | `--force` | Write the selected configuration despite a conflicting unmanaged `zvec_grep` entry; malformed inspected files still fail. For OpenCode this writes the selected file only — sibling definitions in other merged files can remain effective |
 
@@ -217,7 +220,7 @@ The `grok` target keeps Grok Build's own per-call timeout default, which is
 already generous, and manages tool pre-approval through the `[permission]`
 table instead.
 
-The `pi` target configures user-level MCP and the active context
+In the Rust CLI, the `pi` target configures user-level MCP and the active context
 file under `${PI_CODING_AGENT_DIR:-~/.pi/agent}`. Both transports start with
 direct tool exposure; reinstall preserves user exposure and enabled-state
 choices. HTTP authentication is retained when `--mcp-token-env` is omitted.
