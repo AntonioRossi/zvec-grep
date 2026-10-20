@@ -2,6 +2,12 @@
 # reason and removal condition.
 
 [[difference]]
+id = "cli-managed-rg-files"
+owner = "CLI/engine"
+reason = "Rust supports explicit metadata-only file discovery with zg --rg --files, native input-path semantics, glob/type/ignore filters, plain paths, NUL delimiters and file-discovery exit codes. TypeScript and the MCP rg tool retain their content-search contracts. Direct, Server and Auto modes all run discovery locally; recursive walks skip internal directories like managed content search. Validation: rg_files integration tests and CLI parsing tests."
+removal_condition = "TypeScript gains equivalent CLI file discovery or its compatibility surface is retired."
+
+[[difference]]
 id = "cli-positional-words-form-one-query"
 owner = "CLI"
 reason = "Rust adopts the positional-query behavior proposed in PR #134: nonempty positional arguments form one hybrid query, while repeated --hybrid/--fts/--vector options retain explicit groups. Ambiguous phrase arguments warn on stderr. Direct and Server modes share this parsing; managed --rg keeps pattern/path semantics."

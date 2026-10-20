@@ -78,6 +78,8 @@ fn search_help_describes_terminal_and_compact_defaults() {
     let help = stdout(&["--help", "search"]);
     assert!(help.starts_with("Usage:\n  zg <query> [options]\n"));
     assert!(help.contains("--compact"));
+    assert!(help.contains("zg --rg --files [discovery-options] [path...]"));
+    assert!(help.contains("-0/--null"));
     assert!(help.contains("full on TTY, none in compact mode"));
     assert!(!help.contains("--human"));
     assert!(!help.contains("zg query"));

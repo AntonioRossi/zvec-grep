@@ -21,6 +21,7 @@ mod workspace;
 
 use api::{
     context::{ContextOptions, ContextResult},
+    files::{FilesOptions, FilesResult},
     index::{IndexOptions, IndexResult},
     info::{InfoOptions, InfoResult},
 };
@@ -52,6 +53,13 @@ impl ZvecGrep {
     pub async fn context(&self, options: ContextOptions) -> EngineResult<ContextResult> {
         self.service
             .context(options)
+            .await
+            .map_err(|error| error.report_here())
+    }
+
+    /// Enumerates current files without reading source contents or opening an index.
+    pub async fn files(&self, options: FilesOptions) -> EngineResult<FilesResult> {
+        lexical::files::list(options)
             .await
             .map_err(|error| error.report_here())
     }

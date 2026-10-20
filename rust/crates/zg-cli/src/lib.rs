@@ -34,6 +34,7 @@ use zg_engine::api::{
             SymbolType,
         },
     },
+    files::FilesOptions,
     index::{
         IndexOptions,
         options::{Device, EmbeddingModelSpec, GlobRule, ScanRulesUpdate},
@@ -53,7 +54,7 @@ pub use install::{
 pub use managed_rg::{ManagedRgArgumentError, parse_managed_rg_args};
 pub use render::{
     HelpTopicError, help_text, print_help, write_context_result, write_context_status,
-    write_context_with_options,
+    write_context_with_options, write_file_paths,
 };
 
 #[derive(Debug, Parser)]
@@ -522,6 +523,25 @@ impl QueryArgs {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
     }
+
+    fn output_options(&self, terminal: bool) -> OutputOptions {
+        let human = terminal && !self.compact;
+        OutputOptions {
+            debug: self.debug,
+            trace: self.trace,
+            human,
+            preview: self.preview.unwrap_or(if human {
+                PreviewMode::Full
+            } else {
+                PreviewMode::None
+            }),
+            color: if self.no_color {
+                ColorMode::Never
+            } else {
+                self.color.unwrap_or_default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -647,6 +667,10 @@ pub struct ServerStatusArgs {
 
 #[derive(Debug)]
 pub enum CliPlan {
+    Files {
+        request: Box<FilesOptions>,
+        null: bool,
+    },
     Query {
         mode: ClientMode,
         home: Option<PathBuf>,
@@ -701,6 +725,10 @@ pub enum ServerPlan {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error(
+        "--limit cannot be combined with --rg --files; use glob or type filters to narrow the file list"
+    )]
+    FilesWithLimit,
     #[error(
         "zg requires text or --hybrid/--fts/--vector routes; use zg --help search for examples"
     )]
@@ -1318,28 +1346,18 @@ fn query_plan(
     let mode = resolve_query_mode(&args)?;
     validate_query(&args, mode)?;
     let home = args.home.clone();
-    let human = terminal && !args.compact;
-    let output = OutputOptions {
-        debug: args.debug,
-        trace: args.trace,
-        human,
-        preview: args.preview.unwrap_or(if human {
-            PreviewMode::Full
-        } else {
-            PreviewMode::None
-        }),
-        color: if args.no_color {
-            ColorMode::Never
-        } else {
-            args.color.unwrap_or_default()
-        },
-    };
+    let output = args.output_options(terminal);
+    let mut files = false;
+    let mut null = false;
     let mut request = if args.rg {
         if args.literal_value_count > 0 {
             args.values
                 .insert(args.values.len() - args.literal_value_count, "--".into());
         }
-        parse_managed_rg_args(&args.values)?
+        let parsed = managed_rg::parse_rg_args(&args.values, true)?;
+        files = parsed.files;
+        null = parsed.null;
+        parsed.request
     } else {
         let positional_query = args.positional_query_parts().collect::<Vec<_>>().join(" ");
         let queries = std::iter::once(positional_query)
@@ -1406,6 +1424,15 @@ fn query_plan(
         .into_iter()
         .map(|path| resolve_from(request.root.as_deref().expect("query root"), Some(&path)))
         .collect();
+    if files {
+        if args.limit.is_some() {
+            return Err(CliError::FilesWithLimit);
+        }
+        return Ok(CliPlan::Files {
+            request: Box::new(managed_rg::files_options(request)),
+            null,
+        });
+    }
     Ok(CliPlan::Query {
         mode,
         home,
@@ -1664,6 +1691,76 @@ mod tests {
             .expect("parse")
             .into_plan_with_terminal(std::env::temp_dir(), terminal)
             .expect("plan")
+    }
+
+    #[test]
+    fn managed_files_plan_uses_all_positionals_as_inputs_and_preserves_filters() {
+        for terminal in [false, true] {
+            for arguments in [
+                vec!["zg", "--rg", "--files"],
+                vec!["zg", "--files", "--rg"],
+                vec!["zg", "--rg", "--files", "--null"],
+            ] {
+                let CliPlan::Files { request, null } = plan(&arguments, terminal) else {
+                    panic!("file discovery plan")
+                };
+                assert!(request.paths.is_empty());
+                assert_eq!(null, arguments.contains(&"--null"));
+            }
+            let CliPlan::Files { request, null } = plan(
+                &[
+                    "zg",
+                    "--iglob",
+                    "*.TS",
+                    "--rg",
+                    "--files",
+                    "src",
+                    "docs",
+                    "-g",
+                    "!*.test.ts",
+                    "-t",
+                    "ts",
+                    "--hidden",
+                    "-0",
+                    "--max-depth",
+                    "2",
+                ],
+                terminal,
+            ) else {
+                panic!("file discovery plan")
+            };
+            assert!(null);
+            assert_eq!(request.paths, [PathBuf::from("src"), PathBuf::from("docs")]);
+            assert_eq!(request.file_types, ["ts"]);
+            assert!(request.hidden);
+            assert_eq!(request.max_depth, Some(2));
+            assert_eq!(request.globs.len(), 2);
+            assert_eq!(request.globs[0].pattern, "*.TS");
+            assert!(request.globs[0].case_insensitive);
+            assert_eq!(request.globs[1].pattern, "!*.test.ts");
+            assert!(!request.globs[1].case_insensitive);
+        }
+    }
+
+    #[test]
+    fn managed_files_rejects_search_limits_and_requires_explicit_rg_mode() {
+        for arguments in [
+            vec!["zg", "--files"],
+            vec!["zg", "--rg", "--files", "--limit", "1"],
+            vec!["zg", "--rg", "--null", "needle"],
+            vec!["zg", "--rg", "--files", "--hybrid", "query"],
+            vec!["zg", "--rg", "--files", "--refresh", "wait"],
+            vec!["zg", "--rg", "--files", "--json"],
+            vec!["zg", "--rg", "--files=true"],
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments.clone())
+                    .expect("query syntax")
+                    .into_plan(std::env::temp_dir())
+                    .is_err(),
+                "{arguments:?}"
+            );
+        }
     }
 
     #[test]

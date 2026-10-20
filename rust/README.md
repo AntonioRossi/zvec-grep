@@ -209,7 +209,32 @@ automatic thread count. Ignore controls include `-u`/`-uu`/`-uuu`,
 `--no-ignore-parent`, and `--no-ignore-vcs`. Managed search still excludes its
 internal directories. The full MCP toolset uses the same argument parser and
 engine. PCRE2, compressed-file search, explicit encoding selection, and native
-ripgrep output-format switches are rejected; Unicode BOM decoding is automatic.
+ripgrep output-format switches other than file listing are rejected; Unicode
+BOM decoding is automatic.
+
+Use `zg --rg --files` for explicit file discovery:
+
+```sh
+zg --rg --files
+zg --rg --files -g 'auth.ts'
+zg --rg --files src -g '*.ts' -g '!*.test.ts'
+zg --rg --files -t rust -0
+```
+
+Every positional argument is an input file or directory, so `auth.ts` by itself
+selects that input path; `-g 'auth.ts'` finds that name throughout the inputs.
+Discovery reuses managed rg's glob, type, ignore, hidden, symlink, depth, size,
+and modification-time filters. It reads filesystem metadata and ignore rules,
+without opening source contents, loading models, or opening an index. All client
+modes run locally. Output contains all selected paths in sorted order, one per
+line or NUL-delimited with `-0`/`--null`, without headings or match metadata.
+Absolute inputs retain absolute output paths; relative inputs retain relative
+paths. `--limit` is rejected to avoid silently truncating the enumeration.
+Exit status is 0 when files are found, 1 for an empty list, and 2 for a discovery
+error; traversal errors go to stderr while accessible paths remain on stdout.
+Like managed content search, recursive discovery skips `.git` and `.zvec-grep`;
+explicit file inputs are still listed.
+This is a CLI entry point; the MCP rg tool retains its content-search contract.
 
 ## Remote embedding authorization
 

@@ -27,7 +27,7 @@ static DAEMON_LOGGING: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             if let Some(error) = error.downcast_ref::<EngineError>() {
                 eprintln!("{}", error.report());
@@ -42,7 +42,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+fn run() -> Result<ExitCode, Box<dyn Error>> {
     let arguments = std::env::args_os().collect::<Vec<_>>();
     let warning = zg_cli::compatibility_warning_for_args(&arguments[1..]);
     let warn = || {
@@ -62,12 +62,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         CliPlan::Help(topic) => {
             warn();
             zg_cli::print_help(topic.as_deref())?;
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         CliPlan::Version => {
             warn();
             println!("{}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         _ => {}
     }
@@ -118,8 +118,9 @@ fn install_darwin_metal_residency_mitigation() -> io::Result<()> {
     Ok(())
 }
 
-async fn execute_plan(plan: CliPlan) -> Result<(), Box<dyn Error>> {
+async fn execute_plan(plan: CliPlan) -> Result<ExitCode, Box<dyn Error>> {
     match plan {
+        CliPlan::Files { request, null } => return Ok(execute_files(*request, null).await),
         CliPlan::Query {
             mode,
             home,
@@ -178,7 +179,7 @@ async fn execute_plan(plan: CliPlan) -> Result<(), Box<dyn Error>> {
             if matches!(args.action, zg_cli::AuthAction::Revoke) {
                 let count = zg_engine::authorization::revoke_all(root)?;
                 zg_cli::write_authorization_revoke_result(io::stdout().lock(), count)?;
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             if matches!(args.action, zg_cli::AuthAction::Grant { .. }) {
                 zg_engine::authorization::grant(
@@ -204,6 +205,36 @@ async fn execute_plan(plan: CliPlan) -> Result<(), Box<dyn Error>> {
         CliPlan::Install(args) => execute_install_plan(&args).await,
         CliPlan::Uninstall(args) => zg_cli::execute_uninstall(&args).map_err(Into::into),
         CliPlan::Help(_) | CliPlan::Version => Ok(()),
+    }?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn execute_files(options: zg_engine::api::files::FilesOptions, null: bool) -> ExitCode {
+    let engine = ZvecGrep::new();
+    let result = engine.files(options).await;
+    engine.close();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("{}", error.report());
+            return ExitCode::from(2);
+        }
+    };
+    for error in &result.errors {
+        eprintln!("Error: {error}");
+    }
+    if let Err(error) = zg_cli::write_file_paths(io::stdout().lock(), &result.paths, null)
+        && error.kind() != io::ErrorKind::BrokenPipe
+    {
+        eprintln!("Error: {error}");
+        return ExitCode::from(2);
+    }
+    if !result.errors.is_empty() {
+        ExitCode::from(2)
+    } else if result.paths.is_empty() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
