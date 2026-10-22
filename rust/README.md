@@ -212,12 +212,13 @@ handling are controlled by the MCP host. For protocol `2026-07-28`, echo the exa
 `requestState` and unchanged tool arguments with `inputResponses.index_setup`;
 each model selection or remote authorization round issues a new, single-use state.
 
-This version indexes text with one embedding model per workspace. Choose it with
-`zg --index --embedding <model>` or set a default with
+This version indexes text and code with one embedding model per workspace. Choose
+it with `zg --index --embedding <model>` or set a default with
 `zg --config model set <model> --default`. Code, documents and structured text use
-that same model. Images and other unsupported sources are reported as skipped;
-multimodal content and per-content model routing are not supported. Changing the
-model requires `zg --index --rebuild --embedding <model>`.
+that same model and retrieval collection. Code has its own content payload kind.
+Images and other unsupported sources are reported as skipped; multimodal content
+and per-content model routing are not supported. Changing the model requires
+`zg --index --rebuild --embedding <model>`.
 
 Each entity stores one complete source content object, its location in the source
 file, metadata, and its fragments. Each text fragment has a unique ID and selects
@@ -396,9 +397,10 @@ The engine provides `content_range` for the exact source coordinates of returned
 content, independently of the entity `range` and matched `excerpt_range`. CLI and
 MCP use these coordinates for source numbering; preview never infers a range from
 the number of content lines. The engine also interprets half-open line bounds.
-The required field changes the internal daemon reply contract. Version 13 also
-adds native ripgrep type filters to query and persisted scan rules. Version 14
-separates case-sensitive and case-insensitive glob updates on the daemon wire.
+The required field changes the internal daemon reply contract. Native ripgrep
+type filters apply to queries; persisted scan rules support path globs and file
+formats using the same filename rules as indexed queries. Version 14 separates
+case-sensitive and case-insensitive glob updates on the daemon wire.
 Version 15 distinguishes complete ordered glob replacement from category updates.
 Restart older resident daemons when updating the CLI; replies without
 `content_range` are rejected during deserialization. Direct and server rendering
@@ -413,16 +415,21 @@ index provenance without verified freshness is conservatively shown as
 Search and index accept `globs` and `insensitiveGlobs` as a string or list;
 case-insensitive string rules follow case-sensitive string rules. Index string
 parameters update only the supplied case category. Typed glob lists and CLI glob
-arguments replace the complete ordered list. `fileTypes` and
+arguments replace the complete ordered list. Search `fileTypes` and
 `excludedFileTypes` use the embedded ripgrep catalog, including `h`, `cpp`, `ts`
-and `py`, independently of extractor `formats`. Index also accepts `follow`.
-Search never changes persisted scan policy: `hidden`, `noIgnore`, `ignoreFiles`,
+and `py`, independently of the engine filename format catalog. Search and index
+accept `includedFormats` and `excludedFormats` from that catalog; index saves
+these restrictions for subsequent scans. Index also accepts `follow`.
+Search never changes persisted scan policy: `includeHidden`, `useDefaultIgnores`, `ignoreFiles`,
 `maxDepth`, `maxFileSizeBytes` and `follow` belong on index requests. Node's
-indexed-search path ignores these options; Rust rejects them explicitly.
+indexed-search path ignores its scanning options; Rust rejects them explicitly.
+`useDefaultIgnores` controls built-in exclusions and discovered ignore files;
+explicit `ignoreFiles` always apply and must exist. Scan rules are validated
+before index mutations, and `maxFileSizeBytes` must be positive when set.
 Unknown search/index fields and public nulls are rejected, except index
 `maxDepth: null` / `maxFileSizeBytes: null`, which clear saved limits.
-Existing typed globs, `formats/categories`, `enum`, `name`, `nestedGit`, diagnostic
-extensions and their compatibility boundaries are recorded in
+Existing typed globs, `includedFormats`/`excludedFormats`, categories, `enum`,
+`name`, `nestedGit`, diagnostic extensions and their compatibility boundaries are recorded in
 [`allowed-differences.toml`](compat/allowed-differences.toml).
 
 Managed rg uses a file/line/context presentation and preserves all requested
