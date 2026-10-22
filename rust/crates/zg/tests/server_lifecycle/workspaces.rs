@@ -85,7 +85,11 @@ fn mcp_workspaces_are_ephemeral_and_ignore_legacy_registries() -> Result<(), Box
             let workspace = &info["persistent"]["workspace_index"];
             assert!(workspace.get("name").is_none(), "{info}");
             assert!(workspace.get("id").is_none(), "{info}");
-            assert_eq!(workspace["root"], json!(root.canonicalize()?), "{info}");
+            assert_eq!(
+                workspace["root"],
+                json!(zg_cli::output_path(&root.canonicalize()?)),
+                "{info}"
+            );
         }
         assert_eq!(runtime_count(&mut bridge)?, 2);
         let deadline = Instant::now() + Duration::from_secs(15);

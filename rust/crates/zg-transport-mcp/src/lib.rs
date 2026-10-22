@@ -31,7 +31,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use zg_cli::parse_managed_rg_args;
+use zg_cli::{output_path, parse_managed_rg_args};
 use zg_engine::{
     EngineError, ErrorReport, ErrorSite, ZvecGrep,
     api::{
@@ -978,11 +978,8 @@ fn scan_diagnostics(
                 .to_owned();
             *counts.entry(reason.clone()).or_default() += 1;
             (index < 100).then(|| SkippedSampleOutput {
-                absolute_path: root.join(&file.path).display().to_string(),
-                relative_path: file
-                    .path
-                    .strip_prefix(root)
-                    .unwrap_or(&file.path)
+                absolute_path: output_path(&root.join(&file.path)).display().to_string(),
+                relative_path: output_path(file.path.strip_prefix(root).unwrap_or(&file.path))
                     .display()
                     .to_string(),
                 reason,
@@ -1192,7 +1189,7 @@ struct FailedFileOutput {
 impl From<&zg_engine::api::info::result::FailedFile> for FailedFileOutput {
     fn from(file: &zg_engine::api::info::result::FailedFile) -> Self {
         Self {
-            path: file.path.display().to_string(),
+            path: output_path(&file.path).display().to_string(),
             reason: file.reason.clone(),
         }
     }
@@ -1777,13 +1774,13 @@ fn validate_scoped_paths(root: &Path, paths: &[PathBuf], kind: &str) -> Result<(
         {
             return Err(format!(
                 "{kind} {} escapes the workspace root",
-                path.display()
+                output_path(path).display()
             ));
         }
         if path.is_absolute() && !path.starts_with(root) {
             return Err(format!(
                 "{kind} {} is outside the workspace root",
-                path.display()
+                output_path(path).display()
             ));
         }
     }
@@ -2051,7 +2048,7 @@ fn request_root(root: Option<&Path>) -> PathBuf {
 
 fn index_operation_to_result(reply: &IndexOperationResult, debug: bool) -> CallToolResult {
     structured_result(IndexOutput {
-        root: reply.root.display().to_string(),
+        root: output_path(&reply.root).display().to_string(),
         job_id: reply.job_id.clone(),
         state: match reply.state {
             IndexOperationState::Queued => IndexJobState::Queued,
@@ -2079,6 +2076,12 @@ fn index_operation_to_result(reply: &IndexOperationResult, debug: bool) -> CallT
         debug: reply.result.as_ref().filter(|_| debug).map(|result| {
             let mut diagnostics = result.clone();
             diagnostics.skipped.truncate(100);
+            for file in &mut diagnostics.skipped {
+                file.path = output_path(&file.path).to_path_buf();
+            }
+            for file in &mut diagnostics.failed_files {
+                file.path = output_path(&file.path).to_path_buf();
+            }
             serde_json::json!(diagnostics)
         }),
     })
@@ -2086,7 +2089,7 @@ fn index_operation_to_result(reply: &IndexOperationResult, debug: bool) -> CallT
 
 fn drop_result_to_index_result(root: &Path, removed: bool) -> CallToolResult {
     structured_result(IndexOutput {
-        root: root.display().to_string(),
+        root: output_path(root).display().to_string(),
         job_id: "drop".to_owned(),
         state: IndexJobState::Succeeded,
         reused: false,
@@ -2101,7 +2104,7 @@ fn drop_result_to_index_result(root: &Path, removed: bool) -> CallToolResult {
 
 fn drop_result_to_result(root: &Path, removed: bool) -> CallToolResult {
     structured_result(IndexDropOutput {
-        root: root.display().to_string(),
+        root: output_path(root).display().to_string(),
         removed,
     })
 }
@@ -2119,8 +2122,8 @@ impl From<InfoResult> for IndexStatusOutput {
     fn from(reply: InfoResult) -> Self {
         let status = reply.index_status().as_str().to_owned();
         let workspace_index = reply.workspace_index.map(|info| WorkspaceIndexOutput {
-            root: info.root.display().to_string(),
-            path: info.path.display().to_string(),
+            root: output_path(&info.root).display().to_string(),
+            path: output_path(&info.path).display().to_string(),
             root_paths: vec![RootSpecOutput::new(&info.root, &info.scan)],
             embedding: info.embedding.map(|embedding| IndexedEmbeddingOutput {
                 provider: embedding.provider,
@@ -2155,7 +2158,7 @@ impl From<InfoResult> for IndexStatusOutput {
             indexed_size_bytes: status.indexed_size_bytes,
         });
         Self {
-            root: reply.root.display().to_string(),
+            root: output_path(&reply.root).display().to_string(),
             indexed: reply.indexed,
             compatibility: reply.compatibility.into(),
             status,
@@ -2166,8 +2169,8 @@ impl From<InfoResult> for IndexStatusOutput {
             }
             .to_owned(),
             persistent: PersistentIndexStatusOutput {
-                home: reply.home.display().to_string(),
-                index_path: reply.index_path.display().to_string(),
+                home: output_path(&reply.home).display().to_string(),
+                index_path: output_path(&reply.index_path).display().to_string(),
                 workspace_index,
                 files,
                 suggestion: reply.suggestion,
@@ -2255,7 +2258,7 @@ fn index_job_error_output(error: &IndexOperationError) -> IndexJobErrorOutput {
 
 fn error_site_output(site: &ErrorSite) -> ErrorSiteOutput {
     ErrorSiteOutput {
-        file: site.file.clone(),
+        file: output_path(Path::new(&site.file)).display().to_string(),
         line: site.line,
         column: site.column,
     }
@@ -2274,7 +2277,7 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
 impl RootSpecOutput {
     fn new(root: &Path, scan: &ScanRules) -> Self {
         Self {
-            absolute_path: root.display().to_string(),
+            absolute_path: output_path(root).display().to_string(),
             recursive: true,
             included_formats: scan
                 .included_formats()
@@ -2305,7 +2308,7 @@ impl RootSpecOutput {
             ignore_files: scan
                 .ignore_files()
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| output_path(path).display().to_string())
                 .collect(),
             max_depth: scan.max_depth(),
             max_file_size_bytes: scan.max_file_size_bytes(),
@@ -2377,7 +2380,10 @@ fn range_label(range: &ContentRange) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use rmcp::ServerHandler;
     use rmcp::model::ContentBlock;
@@ -2723,6 +2729,88 @@ mod tests {
         reply.result = None;
         reply.state = super::IndexOperationState::Queued;
         assert!(output(&reply, true).get("debug").is_none());
+    }
+
+    #[test]
+    fn index_paths_match_in_text_and_structured_outputs() {
+        use zg_engine::api::info::result::WorkspaceIndexInfo;
+
+        for (input, expected) in [
+            (r"\\?\C:\workspace", r"C:\workspace"),
+            (r"\\?\C:\workspace.", r"\\?\C:\workspace."),
+        ] {
+            let expected = if cfg!(windows) { expected } else { input };
+            let root = PathBuf::from(input);
+            let home = root.join(".zvec-grep");
+            let expected_home = PathBuf::from(expected).join(".zvec-grep");
+            let index = super::index_operation_to_result(
+                &super::IndexOperationResult {
+                    root: root.clone(),
+                    job_id: "test".into(),
+                    state: super::IndexOperationState::Queued,
+                    reused: false,
+                    error: None,
+                    result: None,
+                },
+                false,
+            );
+            let status = super::info_result_to_tool_result(
+                super::InfoResult {
+                    root: root.clone(),
+                    index_path: home.join("index"),
+                    home: home.clone(),
+                    indexed: true,
+                    compatibility: super::IndexCompatibility::Compatible { version: 2 },
+                    index_policy: super::WorkspaceIndexPolicy::Enabled,
+                    source: super::InfoSource::Index,
+                    workspace_index: Some(WorkspaceIndexInfo {
+                        root,
+                        path: home,
+                        scan: super::ScanRules::default(),
+                        policy: super::WorkspaceIndexPolicy::Enabled,
+                        embedding: None,
+                        fts: None,
+                        index_version: Some(2),
+                        created_epoch_ms: 1,
+                        updated_epoch_ms: 2,
+                    }),
+                    status: None,
+                    suggestion: None,
+                },
+                None,
+            );
+            let dropped = super::drop_result_to_result(Path::new(input), true);
+            let index_dropped = super::drop_result_to_index_result(Path::new(input), true);
+            for result in [&index, &status, &dropped, &index_dropped] {
+                let structured = result
+                    .structured_content
+                    .as_ref()
+                    .expect("structured output");
+                let ContentBlock::Text(text) = &result.content[0] else {
+                    panic!("text output");
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text.text).expect("JSON text"),
+                    *structured,
+                );
+                assert_eq!(structured["root"], expected);
+            }
+            let status = status.structured_content.expect("status output");
+            assert_eq!(
+                status["persistent"]["home"],
+                expected_home.display().to_string()
+            );
+            assert_eq!(
+                status["persistent"]["index_path"],
+                expected_home.join("index").display().to_string(),
+            );
+            let workspace = &status["persistent"]["workspace_index"];
+            assert_eq!(workspace["root"], expected);
+            assert_eq!(workspace["path"], expected_home.display().to_string());
+            assert_eq!(workspace["root_paths"][0]["absolute_path"], expected);
+            assert!(workspace.get("id").is_none());
+            assert!(workspace.get("name").is_none());
+        }
     }
 
     #[test]
