@@ -11,6 +11,7 @@ mod progress;
 mod render;
 mod setup;
 mod status;
+mod stdio;
 mod terminal;
 mod theme;
 pub use management::{
@@ -24,6 +25,7 @@ pub use setup::{
     prompt_setup_credential,
 };
 pub use status::{write_info_result, write_info_with_options};
+pub use stdio::stdout;
 pub use terminal::{stderr_supports_ansi, stdout_supports_ansi};
 
 use std::{
