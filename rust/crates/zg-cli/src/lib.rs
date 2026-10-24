@@ -5,16 +5,28 @@ mod install;
 mod jsonc;
 mod managed_rg;
 mod management;
+mod path_lookup;
+mod paths;
 mod progress;
 mod render;
+mod setup;
 mod status;
+mod stdio;
+mod terminal;
 mod theme;
 pub use management::{
     write_authorization_revoke_result, write_authorization_status, write_index_drop_result,
     write_index_result, write_index_with_options,
 };
+pub use paths::output_path;
 pub use progress::IndexProgressDisplay;
+pub use setup::{
+    IndexCancellation, ModelSelection, SetupAuthorizationDecision, prompt_setup_authorization,
+    prompt_setup_credential,
+};
 pub use status::{write_info_result, write_info_with_options};
+pub use stdio::stdout;
+pub use terminal::{stderr_supports_ansi, stdout_supports_ansi};
 
 use std::{
     ffi::{OsStr, OsString},
@@ -34,6 +46,7 @@ use zg_engine::api::{
             SymbolType,
         },
     },
+    files::FilesOptions,
     index::{
         IndexOptions,
         options::{Device, EmbeddingModelSpec, GlobRule, ScanRulesUpdate},
@@ -51,9 +64,10 @@ pub use install::{
     resolve_server_url,
 };
 pub use managed_rg::{ManagedRgArgumentError, parse_managed_rg_args};
+pub use path_lookup::write_path_lookup_result;
 pub use render::{
     HelpTopicError, help_text, print_help, write_context_result, write_context_status,
-    write_context_with_options,
+    write_context_with_options, write_file_paths,
 };
 
 #[derive(Debug, Parser)]
@@ -320,8 +334,8 @@ impl ScanArgs {
     fn update(&self) -> ScanRulesUpdate {
         ScanRulesUpdate {
             globs: (!self.glob_rules.is_empty()).then(|| self.glob_rules.clone()),
-            hidden: self.hidden,
-            no_ignore: self.no_ignore,
+            include_hidden: self.hidden,
+            use_default_ignores: self.no_ignore.map(|value| !value),
             nested_git: self.nested_git,
             ignore_files: (!self.ignore_files.is_empty()).then(|| self.ignore_files.clone()),
             max_depth: self.max_depth.map(Some),
@@ -408,7 +422,7 @@ impl QueryFileArgs {
                 return Err(CliError::IndexedScanOptions);
             }
             request.filter.globs.clone_from(&scan.glob_rules);
-            request.filter.formats = parse_formats(&self.file_types)?;
+            request.filter.included_formats = parse_formats(&self.file_types)?;
             request.filter.excluded_formats = parse_formats(&self.excluded_file_types)?;
             request.filter.categories = parse_categories(&self.categories)?;
             request.filter.excluded_categories = parse_categories(&self.excluded_categories)?;
@@ -515,13 +529,38 @@ pub struct QueryArgs {
     pub literal_value_count: usize,
 }
 
+impl QueryArgs {
+    fn positional_query_parts(&self) -> impl Iterator<Item = &str> {
+        self.values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn output_options(&self, terminal: bool) -> OutputOptions {
+        let human = terminal && !self.compact;
+        OutputOptions {
+            debug: self.debug,
+            trace: self.trace,
+            human,
+            preview: self.preview.unwrap_or(if human {
+                PreviewMode::Full
+            } else {
+                PreviewMode::None
+            }),
+            color: if self.no_color {
+                ColorMode::Never
+            } else {
+                self.color.unwrap_or_default()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct IndexArgs {
     pub root: Option<PathBuf>,
-    /// Set or rename the unique workspace name; new workspaces default to the root directory name.
-    #[arg(long, value_name = "NAME")]
-    pub name: Option<String>,
     #[arg(long)]
     pub mode: Option<ClientMode>,
     #[arg(long)]
@@ -557,11 +596,11 @@ pub struct IndexArgs {
     pub allow_remote: bool,
     #[command(flatten)]
     pub files: ScanArgs,
-    /// Include ripgrep file types when scanning the workspace.
-    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    /// Include formats inferred from file names, using the same catalog as indexed queries.
+    #[arg(short = 't', long = "type", value_name = "FORMAT")]
     pub file_types: Vec<String>,
-    /// Exclude ripgrep file types when scanning the workspace.
-    #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
+    /// Exclude formats inferred from file names, taking precedence over included formats.
+    #[arg(short = 'T', long = "type-not", value_name = "FORMAT")]
     pub excluded_file_types: Vec<String>,
 }
 
@@ -638,10 +677,15 @@ pub struct ServerStatusArgs {
 
 #[derive(Debug)]
 pub enum CliPlan {
+    Files {
+        request: Box<FilesOptions>,
+        null: bool,
+    },
     Query {
         mode: ClientMode,
         home: Option<PathBuf>,
         request: Box<ContextOptions>,
+        path_lookup: bool,
         output: OutputOptions,
     },
     Index {
@@ -692,6 +736,10 @@ pub enum ServerPlan {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error(
+        "--limit cannot be combined with --rg --files; use glob or type filters to narrow the file list"
+    )]
+    FilesWithLimit,
     #[error(
         "zg requires text or --hybrid/--fts/--vector routes; use zg --help search for examples"
     )]
@@ -800,6 +848,26 @@ impl Cli {
             _ => {}
         }
         Ok(cli)
+    }
+
+    /// Warns when multiple positional arguments include a phrase that may have
+    /// been intended as a separate query. Shell quote characters are unavailable.
+    #[must_use]
+    pub fn positional_query_warning(&self) -> Option<String> {
+        let Some(CommandLine::Query(args)) = &self.command else {
+            return None;
+        };
+        if args.rg {
+            return None;
+        }
+        let parts = args.positional_query_parts().collect::<Vec<_>>();
+        if parts.len() < 2 || !parts.iter().any(|part| part.contains(char::is_whitespace)) {
+            return None;
+        }
+        Some(format!(
+            "warning: positional query arguments are merged into one query: {:?}. For separate queries, use repeated --hybrid flags, e.g. zg --hybrid \"connection pool\" --hybrid \"socket timeout\".",
+            parts.join(" ")
+        ))
     }
 
     /// Converts terminal arguments into a transport-independent execution plan.
@@ -927,8 +995,7 @@ fn validate_index_concurrency_scope(
 fn management_option_with_value(text: &str) -> bool {
     matches!(
         text,
-        "--name"
-            | "--embedding"
+        "--embedding"
             | "--endpoint"
             | "--index-embedding-concurrency"
             | "--listen"
@@ -1288,33 +1355,23 @@ fn query_plan(
 ) -> Result<CliPlan, CliError> {
     let mode = resolve_query_mode(&args)?;
     validate_query(&args, mode)?;
+    let path_lookup = uses_path_lookup(&args);
     let home = args.home.clone();
-    let human = terminal && !args.compact;
-    let output = OutputOptions {
-        debug: args.debug,
-        trace: args.trace,
-        human,
-        preview: args.preview.unwrap_or(if human {
-            PreviewMode::Full
-        } else {
-            PreviewMode::None
-        }),
-        color: if args.no_color {
-            ColorMode::Never
-        } else {
-            args.color.unwrap_or_default()
-        },
-    };
+    let output = args.output_options(terminal);
+    let mut files = false;
+    let mut null = false;
     let mut request = if args.rg {
         if args.literal_value_count > 0 {
             args.values
                 .insert(args.values.len() - args.literal_value_count, "--".into());
         }
-        parse_managed_rg_args(&args.values)?
+        let parsed = managed_rg::parse_rg_args(&args.values, true)?;
+        files = parsed.files;
+        null = parsed.null;
+        parsed.request
     } else {
-        let queries = args
-            .values
-            .into_iter()
+        let positional_query = args.positional_query_parts().collect::<Vec<_>>().join(" ");
+        let queries = std::iter::once(positional_query)
             .chain(args.hybrid_queries)
             .map(|query| query.trim().to_owned())
             .filter(|query| !query.is_empty())
@@ -1378,12 +1435,49 @@ fn query_plan(
         .into_iter()
         .map(|path| resolve_from(request.root.as_deref().expect("query root"), Some(&path)))
         .collect();
+    if files {
+        if args.limit.is_some() {
+            return Err(CliError::FilesWithLimit);
+        }
+        return Ok(CliPlan::Files {
+            request: Box::new(managed_rg::files_options(request)),
+            null,
+        });
+    }
     Ok(CliPlan::Query {
         mode,
         home,
         request: Box::new(request),
+        path_lookup,
         output,
     })
+}
+
+fn uses_path_lookup(args: &QueryArgs) -> bool {
+    !args.rg
+        && args.hybrid_queries.is_empty()
+        && args.fts.is_empty()
+        && args.vector.is_empty()
+        && !args.fuse
+        && !args.prefer_symbol
+        && !args.trace
+        && args.refresh.is_none()
+        && args.symbol_types.is_empty()
+        && args.values.len() == 1
+        && is_path_query(&args.values[0])
+}
+
+fn is_path_query(query: &str) -> bool {
+    let query = query.trim();
+    !query.is_empty()
+        && !query.chars().any(char::is_whitespace)
+        && !query.contains("://")
+        && !query.contains(['?', '*', '<', '>', '|'])
+        && (query.contains(['/', '\\'])
+            || query.rsplit_once('.').is_some_and(|(_, extension)| {
+                (1..=12).contains(&extension.len())
+                    && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            }))
 }
 
 fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliError> {
@@ -1403,8 +1497,7 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
         ..OutputOptions::default()
     };
     if args.drop {
-        if args.name.is_some()
-            || args.rebuild
+        if args.rebuild
             || args.reset_paths
             || args.embedding.is_some()
             || args.model_cache.is_some()
@@ -1434,9 +1527,12 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
         });
     }
     let mut scan = args.files.update();
-    scan.file_types = (!args.file_types.is_empty()).then_some(args.file_types);
-    scan.excluded_file_types =
-        (!args.excluded_file_types.is_empty()).then_some(args.excluded_file_types);
+    if !args.file_types.is_empty() {
+        scan.included_formats = Some(parse_formats(&args.file_types)?);
+    }
+    if !args.excluded_file_types.is_empty() {
+        scan.excluded_formats = Some(parse_formats(&args.excluded_file_types)?);
+    }
     scan.ignore_files = scan.ignore_files.map(|paths| {
         paths
             .into_iter()
@@ -1455,7 +1551,6 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
         home,
         operation: IndexOperation::Build(Box::new(IndexOptions {
             root: Some(root),
-            name: args.name,
             rebuild: args.rebuild,
             reset_paths: args.reset_paths,
             scan,
@@ -1628,7 +1723,9 @@ pub fn parse_modified_time(value: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, CliPlan, IndexOperation, QueryFilter, parse_byte_size, parse_modified_time};
+    use super::{
+        Cli, CliPlan, FileFormat, IndexOperation, QueryFilter, parse_byte_size, parse_modified_time,
+    };
     use std::path::PathBuf;
 
     fn plan(arguments: &[&str], terminal: bool) -> CliPlan {
@@ -1636,6 +1733,116 @@ mod tests {
             .expect("parse")
             .into_plan_with_terminal(std::env::temp_dir(), terminal)
             .expect("plan")
+    }
+
+    #[test]
+    fn managed_files_plan_uses_all_positionals_as_inputs_and_preserves_filters() {
+        for terminal in [false, true] {
+            for arguments in [
+                vec!["zg", "--rg", "--files"],
+                vec!["zg", "--files", "--rg"],
+                vec!["zg", "--rg", "--files", "--null"],
+            ] {
+                let CliPlan::Files { request, null } = plan(&arguments, terminal) else {
+                    panic!("file discovery plan")
+                };
+                assert!(request.paths.is_empty());
+                assert_eq!(null, arguments.contains(&"--null"));
+            }
+            let CliPlan::Files { request, null } = plan(
+                &[
+                    "zg",
+                    "--iglob",
+                    "*.TS",
+                    "--rg",
+                    "--files",
+                    "src",
+                    "docs",
+                    "-g",
+                    "!*.test.ts",
+                    "-t",
+                    "ts",
+                    "--hidden",
+                    "-0",
+                    "--max-depth",
+                    "2",
+                ],
+                terminal,
+            ) else {
+                panic!("file discovery plan")
+            };
+            assert!(null);
+            assert_eq!(request.paths, [PathBuf::from("src"), PathBuf::from("docs")]);
+            assert_eq!(request.file_types, ["ts"]);
+            assert!(request.hidden);
+            assert_eq!(request.max_depth, Some(2));
+            assert_eq!(request.globs.len(), 2);
+            assert_eq!(request.globs[0].pattern, "*.TS");
+            assert!(request.globs[0].case_insensitive);
+            assert_eq!(request.globs[1].pattern, "!*.test.ts");
+            assert!(!request.globs[1].case_insensitive);
+        }
+    }
+
+    #[test]
+    fn managed_files_rejects_search_limits_and_requires_explicit_rg_mode() {
+        for arguments in [
+            vec!["zg", "--files"],
+            vec!["zg", "--rg", "--files", "--limit", "1"],
+            vec!["zg", "--rg", "--null", "needle"],
+            vec!["zg", "--rg", "--files", "--hybrid", "query"],
+            vec!["zg", "--rg", "--files", "--refresh", "wait"],
+            vec!["zg", "--rg", "--files", "--json"],
+            vec!["zg", "--rg", "--files=true"],
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments.clone())
+                    .expect("query syntax")
+                    .into_plan(std::env::temp_dir())
+                    .is_err(),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ordinary_single_path_queries_enable_file_lookup() {
+        for query in [
+            "auth.ts",
+            "config.timeout",
+            "v1.2",
+            "src/auth.ts",
+            ".\\src\\auth.ts",
+            ".gitignore",
+            "src/auth",
+        ] {
+            let CliPlan::Query { path_lookup, .. } = plan(&["zg", query], false) else {
+                panic!("query plan");
+            };
+            assert!(path_lookup, "{query}");
+        }
+        for args in [
+            vec!["zg", "authentication"],
+            vec!["zg", "find auth.ts"],
+            vec!["zg", "auth.ts", "login"],
+            vec!["zg", "https://example.com/auth.ts"],
+            vec!["zg", "*.ts"],
+            vec!["zg", "auth.ts", "--hybrid", "login"],
+            vec!["zg", "--hybrid", "auth.ts"],
+            vec!["zg", "--fts", "auth.ts"],
+            vec!["zg", "--vector", "auth.ts"],
+            vec!["zg", "auth.ts", "--fuse"],
+            vec!["zg", "auth.ts", "--prefer-symbol"],
+            vec!["zg", "auth.ts", "--trace"],
+            vec!["zg", "auth.ts", "--refresh", "wait"],
+            vec!["zg", "auth.ts", "--symbol-type", "function"],
+            vec!["zg", "--rg", "auth.ts"],
+        ] {
+            let CliPlan::Query { path_lookup, .. } = plan(&args, false) else {
+                panic!("query plan");
+            };
+            assert!(!path_lookup, "{args:?}");
+        }
     }
 
     #[test]
@@ -1659,7 +1866,7 @@ mod tests {
             else {
                 panic!("{word} must not run an action")
             };
-            assert_eq!(request.queries, [word, "second"]);
+            assert_eq!(request.queries, [format!("{word} second")]);
             assert_eq!(request.limit, Some(3));
         }
     }
@@ -1729,9 +1936,7 @@ mod tests {
         };
         assert_eq!(
             request.queries,
-            [
-                "query", "--index", "--status", "--help", "--human", "--json", "-v"
-            ]
+            ["query --index --status --help --human --json -v"]
         );
         let CliPlan::Query { request, .. } = plan(&["zg", "--rg", "--", "--index"], false) else {
             panic!("literal rg")
@@ -2047,7 +2252,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("*.RS", true), ("!test.rs", false), (" notes/** ", false)]
         );
-        assert_eq!(request.filter.formats[0].as_str(), "rust");
+        assert_eq!(request.filter.included_formats[0].as_str(), "rust");
         assert_eq!(request.filter.categories[0].as_str(), "code");
         assert!(request.globs.is_empty() && request.file_types.is_empty());
     }
@@ -2063,49 +2268,89 @@ mod tests {
     }
 
     #[test]
-    fn index_type_filters_reach_scan_request_and_reject_drop() {
+    fn index_type_filters_use_query_formats_in_direct_and_server_requests() {
+        for (mode, expected_mode) in [
+            ("direct", super::ClientMode::Direct),
+            ("server", super::ClientMode::Server),
+        ] {
+            let CliPlan::Index {
+                mode: actual_mode,
+                operation: IndexOperation::Build(request),
+                ..
+            } = Cli::try_parse_from([
+                "zg",
+                "--index",
+                "--mode",
+                mode,
+                "-t",
+                "rust",
+                "--type=typescript",
+                "-T",
+                "json",
+                "--type-not=markdown",
+                "-g",
+                "src/**",
+            ])
+            .expect("index type arguments")
+            .into_plan(std::env::temp_dir())
+            .expect("index plan")
+            else {
+                panic!("index build");
+            };
+            assert_eq!(actual_mode, expected_mode);
+            assert_eq!(
+                request.scan.included_formats,
+                Some(vec![FileFormat::Rust, FileFormat::TypeScript])
+            );
+            assert_eq!(
+                request.scan.excluded_formats,
+                Some(vec![FileFormat::Json, FileFormat::Markdown])
+            );
+            assert_eq!(request.scan.globs, Some(vec!["src/**".into()]));
+            let wire = serde_json::to_value(&request).expect("serialize index request");
+            assert_eq!(
+                wire["scan"]["included_formats"],
+                serde_json::json!(["rust", "typescript"])
+            );
+            assert_eq!(
+                wire["scan"]["excluded_formats"],
+                serde_json::json!(["json", "markdown"])
+            );
+            let restored: zg_engine::api::index::IndexOptions =
+                serde_json::from_value(wire).expect("deserialize index request");
+            assert_eq!(restored.scan, request.scan);
+        }
+    }
+
+    #[test]
+    fn index_type_filters_preserve_omission_and_reject_unknown_formats_and_drop() {
         let CliPlan::Index {
             operation: IndexOperation::Build(request),
             ..
-        } = Cli::try_parse_from([
-            "zg",
-            "--index",
-            "-t",
-            "rust",
-            "--type=go",
-            "-T",
-            "json",
-            "--type-not=toml",
-        ])
-        .expect("index type arguments")
-        .into_plan(std::env::temp_dir())
-        .expect("index plan")
+        } = Cli::try_parse_from(["zg", "--index"])
+            .expect("index arguments")
+            .into_plan(std::env::temp_dir())
+            .expect("index plan")
         else {
             panic!("index build");
         };
-        assert_eq!(
-            request.scan.file_types,
-            Some(vec!["rust".into(), "go".into()])
-        );
-        assert_eq!(
-            request.scan.excluded_file_types,
-            Some(vec!["json".into(), "toml".into()])
-        );
+        assert_eq!(request.scan.included_formats, None);
+        assert_eq!(request.scan.excluded_formats, None);
         let wire = serde_json::to_value(request).expect("serialize index request");
-        assert_eq!(
-            wire["scan"]["file_types"],
-            serde_json::json!(["rust", "go"])
-        );
-        assert_eq!(
-            wire["scan"]["excluded_file_types"],
-            serde_json::json!(["json", "toml"])
-        );
+        assert!(wire["scan"].get("included_formats").is_none());
+        assert!(wire["scan"].get("excluded_formats").is_none());
 
         for option in ["-t", "--type", "-T", "--type-not"] {
-            let parsed = Cli::try_parse_from(["zg", "--index", "--drop", "--yes", option, "rust"])
-                .expect("index drop syntax");
             assert!(matches!(
-                parsed.into_plan(std::env::temp_dir()),
+                Cli::try_parse_from(["zg", "--index", option, "not-a-format"])
+                    .expect("index type syntax")
+                    .into_plan(std::env::temp_dir()),
+                Err(super::CliError::InvalidFileFormat(_))
+            ));
+            assert!(matches!(
+                Cli::try_parse_from(["zg", "--index", "--drop", "--yes", option, "rust"])
+                    .expect("index drop syntax")
+                    .into_plan(std::env::temp_dir()),
                 Err(super::CliError::DropWithIndexOptions)
             ));
         }
@@ -2181,28 +2426,30 @@ mod tests {
 
     #[test]
     fn index_scan_flags_distinguish_false_from_omission() {
-        let CliPlan::Index {
-            operation: IndexOperation::Build(request),
-            ..
-        } = Cli::try_parse_from([
-            "zg",
-            "--index",
-            "--hidden=false",
-            "--follow=false",
-            "--no-ignore=false",
-        ])
-        .expect("valid test fixture")
-        .into_plan(PathBuf::from("/workspace"))
-        .expect("valid test fixture")
-        else {
-            panic!("index");
-        };
-        assert_eq!(request.scan.hidden, Some(false));
-        assert_eq!(request.scan.follow_symlinks, Some(false));
-        assert_eq!(request.scan.no_ignore, Some(false));
-        assert_eq!(request.scan.globs, None);
-        assert_eq!(request.scan.ignore_files, None);
-        assert_eq!(request.scan.max_depth, None);
+        for (ignore_args, expected) in [
+            (vec![], None),
+            (vec!["--no-ignore"], Some(false)),
+            (vec!["--no-ignore=false"], Some(true)),
+        ] {
+            let mut args = vec!["zg", "--index", "--hidden=false", "--follow=false"];
+            args.extend(ignore_args);
+            let CliPlan::Index {
+                operation: IndexOperation::Build(request),
+                ..
+            } = Cli::try_parse_from(args)
+                .expect("valid test fixture")
+                .into_plan(PathBuf::from("/workspace"))
+                .expect("valid test fixture")
+            else {
+                panic!("index");
+            };
+            assert_eq!(request.scan.include_hidden, Some(false));
+            assert_eq!(request.scan.follow_symlinks, Some(false));
+            assert_eq!(request.scan.use_default_ignores, expected);
+            assert_eq!(request.scan.globs, None);
+            assert_eq!(request.scan.ignore_files, None);
+            assert_eq!(request.scan.max_depth, None);
+        }
     }
 
     #[test]
@@ -2307,15 +2554,17 @@ mod tests {
             glob_rules: rules.clone(),
             ..Default::default()
         };
-        let mut scan = zg_engine::api::index::options::ScanRules {
-            globs: vec![super::GlobRule {
+        let scan = zg_engine::api::index::options::ScanRulesUpdate {
+            globs: Some(vec![super::GlobRule {
                 pattern: "!secret/**".to_owned(),
                 case_insensitive: true,
-            }],
+            }]),
             ..Default::default()
-        };
-        args.update().apply(&mut scan);
-        assert_eq!(scan.globs, rules);
+        }
+        .apply(&zg_engine::api::index::options::ScanRules::default())
+        .expect("saved scan rules");
+        let scan = args.update().apply(&scan).expect("updated scan rules");
+        assert_eq!(scan.globs(), rules);
     }
 
     #[test]
@@ -2357,8 +2606,6 @@ mod tests {
             "zg",
             "--index",
             "repo",
-            "--name",
-            "search-engine",
             "--mode",
             "server",
             "--embedding",
@@ -2383,7 +2630,6 @@ mod tests {
             panic!("index build")
         };
         assert_eq!(request.root, Some(PathBuf::from("/workspace/repo")));
-        assert_eq!(request.name.as_deref(), Some("search-engine"));
         assert_eq!(request.embedding_concurrency, Some(4));
         assert_eq!(
             request.scan.globs.as_ref().expect("valid test fixture")[0].pattern,
@@ -2396,7 +2642,7 @@ mod tests {
     }
 
     #[test]
-    fn index_name_defaults_at_the_engine_and_cannot_be_used_with_drop() {
+    fn index_is_addressed_by_root_and_rejects_obsolete_names() {
         let CliPlan::Index {
             operation: IndexOperation::Build(request),
             ..
@@ -2405,15 +2651,10 @@ mod tests {
             .into_plan(PathBuf::from("/workspace"))
             .expect("index plan")
         else {
-            panic!("index build")
+            panic!("index build");
         };
-        assert!(request.name.is_none());
-
-        let error = Cli::try_parse_from(["zg", "--index", "--drop", "--yes", "--name", "repo"])
-            .expect("CLI should parse")
-            .into_plan(PathBuf::from("/workspace"))
-            .expect_err("drop cannot set an index name");
-        assert!(matches!(error, super::CliError::DropWithIndexOptions));
+        assert_eq!(request.root, Some(PathBuf::from("/workspace/repo")));
+        assert!(Cli::try_parse_from(["zg", "--index", "repo", "--name", "docs"]).is_err());
     }
 
     #[test]
@@ -2476,6 +2717,172 @@ mod tests {
             serde_json::json!(request.filter.symbol_types),
             serde_json::json!(types)
         );
+    }
+
+    #[test]
+    fn positional_words_form_one_query_in_every_client_mode() {
+        for mode in ["direct", "server", "auto"] {
+            for (words, expected, warns) in [
+                (
+                    vec!["connection", "pool", "timeout"],
+                    "connection pool timeout",
+                    false,
+                ),
+                (
+                    vec!["connection pool timeout"],
+                    "connection pool timeout",
+                    false,
+                ),
+                (
+                    vec!["connection pool", "timeout"],
+                    "connection pool timeout",
+                    true,
+                ),
+                (
+                    vec!["connection pool", "socket timeout"],
+                    "connection pool socket timeout",
+                    true,
+                ),
+                (
+                    vec!["connection", "pool timeout"],
+                    "connection pool timeout",
+                    true,
+                ),
+                (
+                    vec!["", " connection ", " ", "pool", "timeout "],
+                    "connection pool timeout",
+                    false,
+                ),
+                (
+                    vec![" connection  pool ", " timeout "],
+                    "connection  pool timeout",
+                    true,
+                ),
+                (vec!["连接\t池", "超时"], "连接\t池 超时", true),
+                (vec!["连接\u{3000}池", "超时"], "连接\u{3000}池 超时", true),
+                (vec!["", "connection pool", " "], "connection pool", false),
+            ] {
+                let mut arguments = vec!["zg", "--mode", mode];
+                arguments.extend(words);
+                let cli = Cli::try_parse_from(arguments).expect("query syntax");
+                let warning = cli.positional_query_warning();
+                assert_eq!(warning.is_some(), warns, "{expected}");
+                if let Some(warning) = warning {
+                    assert!(warning.contains(&format!("{expected:?}")), "{warning}");
+                    assert!(
+                        warning.contains(
+                            "zg --hybrid \"connection pool\" --hybrid \"socket timeout\""
+                        ),
+                        "{warning}"
+                    );
+                }
+                let CliPlan::Query { request, .. } =
+                    cli.into_plan(std::env::temp_dir()).expect("query plan")
+                else {
+                    panic!("query")
+                };
+                assert_eq!(request.queries, [expected]);
+            }
+        }
+    }
+
+    #[test]
+    fn positional_merge_preserves_explicit_routes_options_and_literal_separator() {
+        let CliPlan::Query { request, .. } = plan(
+            &[
+                "zg",
+                "connection",
+                "--hybrid",
+                "first query",
+                "pool",
+                "--limit=3",
+                "--hybrid=second query",
+                "--fts",
+                "exact phrase",
+                "--fts=another phrase",
+                "--vector",
+                "semantic intent",
+                "--vector=another intent",
+                "--fuse",
+                "--",
+                "--timeout",
+                "literal words",
+            ],
+            false,
+        ) else {
+            panic!("query")
+        };
+        assert_eq!(
+            request.queries,
+            [
+                "connection pool --timeout literal words",
+                "first query",
+                "second query"
+            ]
+        );
+        assert_eq!(request.limit, Some(3));
+        assert!(request.fuse);
+        assert_eq!(
+            request
+                .routes
+                .iter()
+                .map(|route| (route.mode, route.query.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (super::ContextRouteMode::Fts, "exact phrase"),
+                (super::ContextRouteMode::Fts, "another phrase"),
+                (super::ContextRouteMode::Vector, "semantic intent"),
+                (super::ContextRouteMode::Vector, "another intent"),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_queries_and_non_query_arguments_do_not_trigger_merge_warning() {
+        for arguments in [
+            vec![
+                "zg",
+                "--hybrid",
+                "connection pool",
+                "--hybrid",
+                "socket timeout",
+            ],
+            vec![
+                "zg",
+                "--fts",
+                "connection pool",
+                "--vector",
+                "socket timeout",
+            ],
+            vec!["zg", "connection", "--hybrid", "socket timeout"],
+            vec!["zg", "connection", "pool", "--glob", "path with spaces/**"],
+            vec!["zg", "--rg", "connection pool", "path with spaces"],
+            vec!["zg", "--help", "search"],
+            vec!["zg", "--index", "path with spaces"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("syntax");
+            assert!(cli.positional_query_warning().is_none());
+        }
+        let CliPlan::Query { request, .. } = plan(
+            &[
+                "zg",
+                "",
+                " ",
+                "--hybrid",
+                "connection pool",
+                "--hybrid",
+                "socket timeout",
+            ],
+            false,
+        ) else {
+            panic!("query")
+        };
+        assert_eq!(request.queries, ["connection pool", "socket timeout"]);
+        let error = Cli::try_parse_from(["zg", "--mode", "direct", "", " "])
+            .expect("empty query syntax")
+            .into_plan(std::env::temp_dir())
+            .expect_err("empty query rejected");
+        assert!(matches!(error, super::CliError::MissingQuery));
     }
 
     #[test]

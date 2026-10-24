@@ -12,6 +12,30 @@ use zg_engine::api::context::{
     },
 };
 
+use crate::output_path;
+
+/// Writes only native file paths, separated by newlines or NUL bytes.
+///
+/// # Errors
+/// Returns the underlying writer error.
+pub fn write_file_paths(
+    mut writer: impl Write,
+    paths: &[std::path::PathBuf],
+    null: bool,
+) -> io::Result<()> {
+    for path in paths {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            writer.write_all(path.as_os_str().as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        writer.write_all(path.to_string_lossy().as_bytes())?;
+        writer.write_all(if null { b"\0" } else { b"\n" })?;
+    }
+    writer.flush()
+}
+
 /// Writes a context reply in the stable CLI text layout.
 ///
 /// # Errors
@@ -28,7 +52,7 @@ pub fn write_context_result(mut writer: impl Write, result: &ContextResult) -> i
             if previous_path.is_some() {
                 writeln!(writer)?;
             }
-            writeln!(writer, "{}", item.relative_path.display())?;
+            writeln!(writer, "{}", output_path(&item.relative_path).display())?;
             previous_path = Some(item.relative_path.as_path());
         }
         if let Some(first) = item.content_range.start_line() {
@@ -133,13 +157,18 @@ pub fn write_context_with_options(
         let range = range_label(&item.range);
         let matched_by = serde_json::to_value(item.matched_by).map_err(io::Error::other)?;
         let label = if options.human {
-            format!("{}. {}:{}", item.rank, item.relative_path.display(), range)
+            format!(
+                "{}. {}:{}",
+                item.rank,
+                output_path(&item.relative_path).display(),
+                range
+            )
         } else {
             format!(
                 "#{} matchedBy={} {}:{}",
                 item.rank,
                 matched_by.as_str().unwrap_or_default(),
-                item.relative_path.display(),
+                output_path(&item.relative_path).display(),
                 range
             )
         };
@@ -297,9 +326,10 @@ pub fn help_text(topic: Option<&str>) -> Result<String, HelpTopicError> {
 ///
 /// # Errors
 ///
-/// Returns an error when `topic` is not part of the public help surface.
-pub fn print_help(topic: Option<&str>) -> Result<(), HelpTopicError> {
-    println!("{}", help_text(topic)?);
+/// Returns an error when `topic` is not part of the public help surface or
+/// stdout fails for a reason other than a closed pipe.
+pub fn print_help(topic: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(crate::stdout(), "{}", help_text(topic)?)?;
     Ok(())
 }
 
@@ -330,6 +360,7 @@ Management:
   --version      Print the installed version
 
 Bare words such as query, index, and help are literal search text.
+Positional words are joined into one query; repeat --hybrid for separate queries.
 Terminal searches use human-readable output and full previews; pipes use compact
 output. Use --compact to force compact output.
 
@@ -337,6 +368,7 @@ Examples:
   zg "where authentication is validated"
   zg --fts "AuthService"
   zg --rg -F "AuthService" src
+  zg --rg --files src -g '*.ts'
   zg --index --embedding local/potion-code-16m-v2
   zg --status
   zg --auth status
@@ -360,14 +392,33 @@ const SEARCH_HELP: &str = r#"Usage:
   zg <query> [options]
   zg --hybrid <query> --fts <query> --vector <query> [--fuse]
   zg --rg [rg-options] <pattern> [path...]
+  zg --rg --files [discovery-options] [path...]
 
 Search routes:
-  positional query                  Hybrid FTS and vector search
+  positional words                  File paths use current files and literal text; other words form one hybrid query
   --hybrid <query>                  Add an explicit hybrid query
   --fts <query>                     Add an exact/lexical query
   --vector <query>                  Add a semantic/vector query
   --fuse                            Fuse all query groups into one ranked list
   --rg                              Run exhaustive managed ripgrep
+
+Positional arguments are joined with spaces, even if separately quoted:
+  zg connection pool timeout                 One query: connection pool timeout
+  zg "connection pool" "timeout"             The same query, with a warning
+  zg "connection pool" "socket timeout"      One query, with a warning
+  zg --hybrid "connection pool" --hybrid "socket timeout"
+                                            Two explicit queries
+The warning is written to stderr when multiple nonempty positional arguments
+include one with internal whitespace. Shell quote characters are not available.
+--hybrid, --fts, and --vector remain separate, repeatable queries.
+Managed --rg keeps its pattern and path arguments separate.
+An ordinary single path-shaped query such as auth.ts first matches current file
+names without reading contents. If no name matches, current source is searched
+literally. A complete miss returns No matches., including with a warm index.
+Automatic path lookup prints a warning on stderr; use --hybrid to force
+hybrid search. Explicit query routes, trace, refresh and symbol options bypass it.
+With --files, every positional argument is an input file or directory; no pattern
+is required. Use -g 'auth.ts' to select files by name.
 
 Result options:
   --limit <n>                       Maximum results per group (default: 7)
@@ -404,6 +455,12 @@ Managed --rg uses the embedded Rust regex engine (--engine default).
 Matching: -F, -i/-s/-S, -w/-x, -v, -U, --multiline-dotall, --crlf, -a.
 Bounds: -A/-B/-C, -m/--max-count (per file), -j/--threads (0 = automatic).
 Discovery: -u/-uu/-uuu, --no-ignore-*, --one-file-system, globs and types.
+File listing: --files prints all selected paths without reading their contents;
+-0/--null uses NUL separators. No index or daemon is needed in any client mode.
+The list is sorted and has no headings or result limit. Recursive discovery
+skips .git and .zvec-grep; explicit file inputs are still listed.
+--limit is rejected with --files.
+Exit status for --files: 0 = files found, 1 = no files, 2 = discovery error.
 Patterns preserve whitespace; -e accepts empty patterns and leading "-".
 Unicode BOM decoding is automatic. PCRE2, compressed search, explicit encoding,
 and options that replace rg's output format are not supported.
@@ -423,7 +480,6 @@ const INDEX_HELP: &str = r"Usage:
   zg --index [root] --drop [--yes]
 
 Index options:
-  --name <NAME>                     Set or rename the unique workspace name
   --rebuild                         Rebuild the existing index
   --drop                            Permanently remove the workspace index
   --yes                             Confirm --drop without prompting
@@ -458,8 +514,8 @@ Index embedding concurrency:
 Scan rules:
   -g, --glob <glob>                 Include paths; prefix with ! to exclude; repeatable
   --iglob <glob>                    Case-insensitive path glob; repeatable
-  -t, --type <type>                 Include a ripgrep file type; repeatable
-  -T, --type-not <type>             Exclude a ripgrep file type; repeatable
+  -t, --type <format>               Include an engine format, e.g. rust or markdown; repeatable
+  -T, --type-not <format>           Exclude an engine format; repeatable
   --hidden[=true|false]              Include hidden paths except .git and .zvec-grep
   --no-ignore[=true|false]           Do not apply default or .gitignore rules
   --nested-git[=true|false]          Scan nested Git repositories and submodules
@@ -469,18 +525,23 @@ Scan rules:
   -L, --follow[=true|false]          Follow symbolic links safely
   --reset-paths                     Clear inherited scanning settings
 
+Type filters use the same file-name rules as indexed queries and intersect
+with path globs. Scan rules are saved; omitted options keep their saved values.
+
 Interactive remote indexing asks to allow once, allow for this workspace, or
 cancel. Non-interactive indexing requires --allow-remote or a workspace grant.
 
-A new workspace name defaults to root directory name; use --name if it is taken.
-Names are case-sensitive and unique within the per-user registry. Naming an
-existing workspace renames it while preserving file IDs and active storage.
+Workspaces are identified by their root paths; different roots may share a directory name.
 
 This version indexes text only with one embedding model per workspace.
 Explicit zg --index requires --embedding, ZVEC_GREP_EMBEDDING, or a configured
 default when creating a new index.
-Search automatically creates a missing index with a configured local model or
-local/potion-code-16m-v2, never a remote model.
+Interactive searches prompt to select an embedding model before creating a
+missing index. Local and remote models have separate tabs; downloaded local
+models and configured remote models appear first. Use arrows or Tab to switch,
+Enter to confirm, and Esc to exit. Remote models require data authorization.
+CLI searches wait for the complete index, including in --mode server.
+Non-interactive searches never create an index; run zg --index first.
 Model changes require --rebuild. Failed files are recorded; successful files
 remain searchable after a rebuild. Compatible indexes reuse their stored model.
 Rebuilding an incompatible index uses --embedding or the configured default;
@@ -844,6 +905,16 @@ mod output_tests {
         MatchedBy,
     };
 
+    #[cfg(unix)]
+    #[test]
+    fn file_output_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"file-\xff.ts".to_vec()));
+        let mut output = Vec::new();
+        write_file_paths(&mut output, &[path], true).expect("file output");
+        assert_eq!(output, b"file-\xff.ts\0");
+    }
+
     fn indexed_item() -> ContextItem {
         ContextItem {
             kind: ContextItemKind::IndexedEntity,
@@ -900,6 +971,39 @@ mod output_tests {
             diagnostics: ContextDiagnostics::default(),
             items: vec![indexed_item()],
         }
+    }
+
+    #[test]
+    fn context_formats_paths_without_rewriting_source_content() {
+        let path = r"\\?\D:\workspace\sample.rs";
+        let expected = if cfg!(windows) {
+            r"D:\workspace\sample.rs"
+        } else {
+            path
+        };
+        let mut result = indexed_result();
+        result.items[0].relative_path = path.into();
+        result.items[0].content = path.into();
+        let original = result.clone();
+        for source in [ContextSource::Index, ContextSource::Rg] {
+            result.source = source;
+            let mut bytes = Vec::new();
+            write_context_with_options(
+                &mut bytes,
+                &result,
+                OutputOptions {
+                    preview: PreviewMode::Full,
+                    ..OutputOptions::default()
+                },
+                false,
+            )
+            .expect("context output");
+            let text = String::from_utf8(bytes).expect("UTF-8");
+            assert!(text.contains(expected));
+            assert!(text.contains(&format!("1: {path}")));
+        }
+        result.source = original.source;
+        assert_eq!(result, original);
     }
 
     #[test]
@@ -1071,6 +1175,8 @@ mod output_tests {
                 symbol_name: Some("User".into()),
                 scope: Some("app".into()),
                 signature: None,
+                visibility: None,
+                language: None,
                 documentation: None,
             }));
             let mut buffer = Vec::new();

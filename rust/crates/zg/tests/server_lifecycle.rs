@@ -1,5 +1,10 @@
 #[path = "server_lifecycle/mcp_parity.rs"]
 mod mcp_parity;
+#[path = "server_lifecycle/workspaces.rs"]
+mod workspaces;
+
+#[path = "server_lifecycle/positional_queries.rs"]
+mod positional_queries;
 
 use std::{
     error::Error,
@@ -635,8 +640,11 @@ fn server_on_exposes_only_agent_search_and_off_stops_it() -> Result<(), Box<dyn 
     });
     let response = post_json(port, Some(&session), &call.to_string())?;
     assert!(response.contains("error[ZG.ENGINE.NOT_FOUND]"));
-    assert!(response.contains("workspace index at"));
-    assert!(response.contains("no workspace manifest was found"));
+    assert!(response.contains("No index found"));
+    assert!(
+        response.contains("zg --index --embedding &lt;model&gt;")
+            || response.contains("zg --index --embedding <model>")
+    );
     assert!(response.contains("\"isError\":true"));
 
     // CLI administration uses the typed daemon protocol rather than the
@@ -1091,10 +1099,6 @@ fn search_uses_workspace_runtime(toolset: &str) -> Result<(), Box<dyn Error>> {
     let indexed = Command::new(&binary)
         .current_dir(workspace.path())
         .env("ZVEC_GREP_HOME", home.path())
-        .env(
-            "ZVEC_GREP_WORKSPACE_REGISTRY",
-            home.path().join("workspaces.json"),
-        )
         .env("ZVEC_GREP_API_KEY", "local-test-key")
         .args([
             "--index",
@@ -1129,11 +1133,7 @@ fn search_uses_workspace_runtime(toolset: &str) -> Result<(), Box<dyn Error>> {
     let (mut guard, _) = start_server(&binary, &home, toolset, None, |command| {
         command
             .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key)
-            .env("ZVEC_GREP_API_KEY", "local-test-key")
-            .env(
-                "ZVEC_GREP_WORKSPACE_REGISTRY",
-                home.path().join("workspaces.json"),
-            );
+            .env("ZVEC_GREP_API_KEY", "local-test-key");
     })?;
     let port = guard.listen.parse::<SocketAddr>()?.port();
     let response = post_json(
@@ -1306,10 +1306,7 @@ fn concurrent_stdio_bootstraps_share_one_resident_daemon() -> Result<(), Box<dyn
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Exercise update, rebuild and drop in one resident daemon lifecycle"
-)]
+// Exercise update, rebuild and drop in one resident daemon lifecycle.
 fn direct_writes_retire_daemon_read_sessions() -> Result<(), Box<dyn Error>> {
     let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
@@ -1322,10 +1319,6 @@ fn direct_writes_retire_daemon_read_sessions() -> Result<(), Box<dyn Error>> {
         command
             .current_dir(workspace.path())
             .env("ZVEC_GREP_HOME", home.path())
-            .env(
-                "ZVEC_GREP_WORKSPACE_REGISTRY",
-                home.path().join("workspaces.json"),
-            )
             .env("ZVEC_GREP_API_KEY", "local-test-key")
             .args(["--index", "--mode", "direct"])
             .args(extra);
@@ -1343,12 +1336,7 @@ fn direct_writes_retire_daemon_read_sessions() -> Result<(), Box<dyn Error>> {
     ])?);
     // CLI writers are separate processes, not children of the native cache owner.
     // This also avoids inheriting the native library's open lock descriptors.
-    let (mut guard, _) = start_server(&binary, &home, "full", None, |command| {
-        command.env(
-            "ZVEC_GREP_WORKSPACE_REGISTRY",
-            home.path().join("workspaces.json"),
-        );
-    })?;
+    let (mut guard, _) = start_server(&binary, &home, "full", None, |_| {})?;
     let port = guard.listen.parse::<SocketAddr>()?.port();
     let initialize = json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1434,11 +1422,9 @@ fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Bo
     // Exceed the configured model's input budget while keeping only two source lines.
     let source = format!("# Heading\n{} linenumberprobe\n", "x".repeat(20_000));
     std::fs::write(workspace.path().join("sample.md"), source)?;
-    let registry = home.path().join("workspaces.json");
     let index = Command::new(&binary)
         .current_dir(workspace.path())
         .env("ZVEC_GREP_HOME", home.path())
-        .env("ZVEC_GREP_WORKSPACE_REGISTRY", &registry)
         .env("ZVEC_GREP_API_KEY", "local-test-key")
         .args([
             "--index",
@@ -1452,9 +1438,7 @@ fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Bo
         .arg(format!("http://{}/embeddings", embedding.address))
         .output()?;
     assert_command_success(&index);
-    let (mut guard, _) = start_server(&binary, &home, "full", None, |command| {
-        command.env("ZVEC_GREP_WORKSPACE_REGISTRY", &registry);
-    })?;
+    let (mut guard, _) = start_server(&binary, &home, "full", None, |_| {})?;
     let mut bridge = StdioBridge::spawn(&binary, home.path(), &guard.listen)?;
     bridge.request(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1470,7 +1454,6 @@ fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Bo
             let reply = Command::new(&binary)
                 .current_dir(workspace.path())
                 .env("ZVEC_GREP_HOME", home.path())
-                .env("ZVEC_GREP_WORKSPACE_REGISTRY", &registry)
                 .args([
                     "--mode",
                     mode,
@@ -1629,10 +1612,6 @@ fn index_failures_match_readiness_and_recover(mode: &str) -> Result<(), Box<dyn 
             .env("HOME", home.path())
             .env("USERPROFILE", home.path())
             .env("ZVEC_GREP_HOME", home.path())
-            .env(
-                "ZVEC_GREP_WORKSPACE_REGISTRY",
-                home.path().join("workspaces.json"),
-            )
             .env_remove("DASHSCOPE_API_KEY")
             .env_remove("QWEN_API_KEY");
     };
@@ -1877,15 +1856,55 @@ fn post_json(port: u16, session: Option<&str>, body: &str) -> Result<String, Box
     let session_header = session.map_or_else(String::new, |value| {
         format!("Mcp-Session-Id: {value}\r\nMCP-Protocol-Version: 2025-11-25\r\n")
     });
-    write!(
-        stream,
+    let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{session_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    )?;
+    );
+    stream.write_all(request.as_bytes())?;
     stream.flush()?;
+    Ok(read_http_response(&mut stream)?)
+}
+
+fn read_http_response(reader: &mut impl Read) -> std::io::Result<String> {
     let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    if let Err(error) = reader.read_to_string(&mut response) {
+        // Early HTTP rejection can reset a connection with an unread request body.
+        // Accept the response only when its declared body has already arrived in full.
+        let complete = response
+            .split_once("\r\n\r\n")
+            .is_some_and(|(headers, body)| {
+                headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    == Some(body.len())
+            });
+        if error.kind() != std::io::ErrorKind::ConnectionReset || !complete {
+            return Err(error);
+        }
+    }
     Ok(response)
+}
+
+#[test]
+fn http_test_reader_accepts_reset_only_after_a_complete_response() {
+    struct ResetAfterBytes(std::io::Cursor<Vec<u8>>);
+    impl Read for ResetAfterBytes {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.position() == self.0.get_ref().len() as u64 {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            } else {
+                self.0.read(bytes)
+            }
+        }
+    }
+    for (body, complete) in [("okay", true), ("ok", false)] {
+        let bytes =
+            format!("HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n\r\n{body}").into_bytes();
+        let mut reader = ResetAfterBytes(std::io::Cursor::new(bytes));
+        assert_eq!(read_http_response(&mut reader).is_ok(), complete);
+    }
 }
 
 fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {

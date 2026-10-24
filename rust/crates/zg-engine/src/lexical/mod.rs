@@ -1,5 +1,6 @@
 //! File scanning and matching backed by ripgrep's embedded `grep` crates.
 
+pub(crate) mod files;
 pub(crate) mod types;
 
 use std::{
@@ -97,7 +98,9 @@ impl LexicalSearchService {
             permit = Arc::clone(&self.search_slots).acquire_owned() => permit.map_err(|_| EngineError::internal("lexical search concurrency limiter closed unexpectedly"))?,
         };
         let checked_paths = check_paths(root, &request.paths);
-        if !request.paths.is_empty() && checked_paths.existing.is_empty() {
+        if (request.paths_selected || !request.paths.is_empty())
+            && checked_paths.existing.is_empty()
+        {
             return Ok(empty_reply(root, request, &checked_paths));
         }
 

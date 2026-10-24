@@ -5,9 +5,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(windows)]
-use std::ffi::OsString;
-
 use async_trait::async_trait;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -22,8 +19,8 @@ use crate::{
     },
     models::{
         artifacts::{
-            ArtifactSource, ModelDownloadProgressReporter, ResolveArtifacts,
-            resolve_model_artifacts,
+            ArtifactSource, LocalModelBackend, ModelDownloadProgressReporter, ResolveArtifacts,
+            default_model_cache, resolve_model_artifacts,
         },
         catalog::Model2VecConfig,
         runtime::ModelComputeRuntime,
@@ -78,21 +75,26 @@ impl Model2VecEmbeddingModel {
         let model_cache_dir = options
             .cache_dir
             .or_else(|| env::var_os("ZVEC_GREP_MODEL_CACHE").map(PathBuf::from))
-            .unwrap_or_else(default_model_cache_dir);
+            .unwrap_or_else(|| default_model_cache(LocalModelBackend::Model2Vec));
         Self {
             entry,
-            info: EmbeddingModelInfo {
-                model: ModelInfo {
-                    provider: entry.provider.to_owned(),
-                    name: entry.model.to_owned(),
-                    endpoint: None,
-                },
-                dimension: entry.dimension,
-                metric: entry.metric,
-                max_batch_size: entry.max_batch_size,
-                max_input_tokens: Some(entry.max_input_tokens),
-                max_image_bytes: None,
-            },
+            info: EmbeddingModelInfo::new(
+                ModelInfo::new(
+                    entry.provider.to_owned(),
+                    entry.model.to_owned(),
+                    [
+                        crate::domain::ContentKind::Text,
+                        crate::domain::ContentKind::Code,
+                    ],
+                    entry.max_batch_size,
+                )
+                .expect("valid model metadata"),
+                entry.dimension,
+                entry.metric,
+                Some(entry.max_input_tokens),
+                None,
+            )
+            .expect("valid embedding metadata"),
             model_cache_dir,
             compute_runtime,
             dependencies,
@@ -195,9 +197,7 @@ impl EmbeddingModel for Model2VecEmbeddingModel {
         inputs: &[Vec<Content>],
         options: EmbeddingOptions,
     ) -> Result<EmbeddingResult, ModelError> {
-        validate_inputs(&self.info, inputs, |content| {
-            matches!(content, Content::Text(_))
-        })?;
+        validate_inputs(&self.info, inputs)?;
         let loaded = self
             .ensure_loaded(options.on_progress, options.signal.as_ref())
             .await?;
@@ -505,30 +505,6 @@ fn file_name(path: &str) -> Result<&str, ModelError> {
         .ok_or_else(|| {
             ModelError::storage_failure(format!("Model artifact has no file name: {path}"))
         })
-}
-
-fn default_model_cache_dir() -> PathBuf {
-    env::var_os("ZVEC_GREP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| user_home_dir().map(|home| home.join(".zvec-grep")))
-        .unwrap_or_else(|| PathBuf::from(".zvec-grep"))
-        .join("models")
-}
-
-#[cfg(windows)]
-fn user_home_dir() -> Option<PathBuf> {
-    env::var_os("USERPROFILE").map(PathBuf::from).or_else(|| {
-        let drive = env::var_os("HOMEDRIVE")?;
-        let path = env::var_os("HOMEPATH")?;
-        let mut home = OsString::from(drive);
-        home.push(path);
-        Some(PathBuf::from(home))
-    })
-}
-
-#[cfg(not(windows))]
-fn user_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]
