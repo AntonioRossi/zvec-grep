@@ -2106,43 +2106,47 @@ mod tests {
         }
     }
 
+    fn run_server_option_precedence_children(child: &str) {
+        const HOME: &str = "ZVEC_GREP_HOME";
+        const TOKEN: &str = "ZVEC_GREP_SERVER_TOKEN_FILE";
+        let executable = std::env::current_exe().expect("test executable");
+        let mut failures = Vec::new();
+        for condition in ["both", "home", "absent"] {
+            let mut command = std::process::Command::new(&executable);
+            command
+                .args([
+                    "--exact",
+                    "tests::server_option_precedence_is_independent_of_environment",
+                    "--nocapture",
+                ])
+                .env(child, condition)
+                .env_remove(HOME)
+                .env_remove(TOKEN);
+            if condition != "absent" {
+                command.env(HOME, "environment-home");
+            }
+            if condition == "both" {
+                command.env(TOKEN, "environment-token");
+            }
+            match command.output() {
+                Ok(output) => {
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                    if !output.status.success() {
+                        failures.push(format!("{condition}: {}", output.status));
+                    }
+                }
+                Err(error) => failures.push(format!("{condition}: {error}")),
+            }
+        }
+        assert!(failures.is_empty(), "child failures: {failures:?}");
+    }
+
     #[test]
     fn server_option_precedence_is_independent_of_environment() {
         const CHILD: &str = "ZG_TEST_SERVER_OPTION_PRECEDENCE_CHILD";
-        const HOME: &str = "ZVEC_GREP_HOME";
-        const TOKEN: &str = "ZVEC_GREP_SERVER_TOKEN_FILE";
         let Ok(condition) = std::env::var(CHILD) else {
-            let executable = std::env::current_exe().expect("test executable");
-            let mut failures = Vec::new();
-            for condition in ["both", "home", "absent"] {
-                let mut command = std::process::Command::new(&executable);
-                command
-                    .args([
-                        "--exact",
-                        "tests::server_option_precedence_is_independent_of_environment",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, condition)
-                    .env_remove(HOME)
-                    .env_remove(TOKEN);
-                if condition != "absent" {
-                    command.env(HOME, "environment-home");
-                }
-                if condition == "both" {
-                    command.env(TOKEN, "environment-token");
-                }
-                match command.output() {
-                    Ok(output) => {
-                        print!("{}", String::from_utf8_lossy(&output.stdout));
-                        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-                        if !output.status.success() {
-                            failures.push(format!("{condition}: {}", output.status));
-                        }
-                    }
-                    Err(error) => failures.push(format!("{condition}: {error}")),
-                }
-            }
-            assert!(failures.is_empty(), "child failures: {failures:?}");
+            run_server_option_precedence_children(CHILD);
             return;
         };
         assert!(matches!(condition.as_str(), "both" | "home" | "absent"));
