@@ -651,25 +651,25 @@ pub enum ServerAction {
 pub struct ServerStartArgs {
     #[arg(long)]
     pub listen: Option<String>,
-    #[arg(long, env = "ZVEC_GREP_HOME")]
+    #[arg(long)]
     pub home: Option<PathBuf>,
     #[arg(long, env = "ZVEC_GREP_MCP_TOOLSET", value_enum)]
     pub mcp_toolset: Option<McpToolset>,
-    #[arg(long = "token-file", env = "ZVEC_GREP_SERVER_TOKEN_FILE")]
+    #[arg(long = "token-file")]
     pub token_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct ServerStopArgs {
-    #[arg(long, env = "ZVEC_GREP_HOME")]
+    #[arg(long)]
     pub home: Option<PathBuf>,
-    #[arg(long = "token-file", env = "ZVEC_GREP_SERVER_TOKEN_FILE")]
+    #[arg(long = "token-file")]
     pub token_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct ServerStatusArgs {
-    #[arg(long, env = "ZVEC_GREP_HOME")]
+    #[arg(long)]
     pub home: Option<PathBuf>,
     #[arg(long = "check-ready")]
     pub check_ready: bool,
