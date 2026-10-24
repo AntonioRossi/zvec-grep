@@ -2107,6 +2107,128 @@ mod tests {
     }
 
     #[test]
+    fn server_option_precedence_is_independent_of_environment() {
+        const CHILD: &str = "ZG_TEST_SERVER_OPTION_PRECEDENCE_CHILD";
+        const HOME: &str = "ZVEC_GREP_HOME";
+        const TOKEN: &str = "ZVEC_GREP_SERVER_TOKEN_FILE";
+        let Ok(condition) = std::env::var(CHILD) else {
+            let executable = std::env::current_exe().expect("test executable");
+            let mut failures = Vec::new();
+            for condition in ["both", "home", "absent"] {
+                let mut command = std::process::Command::new(&executable);
+                command
+                    .args([
+                        "--exact",
+                        "tests::server_option_precedence_is_independent_of_environment",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, condition)
+                    .env_remove(HOME)
+                    .env_remove(TOKEN);
+                if condition != "absent" {
+                    command.env(HOME, "environment-home");
+                }
+                if condition == "both" {
+                    command.env(TOKEN, "environment-token");
+                }
+                match command.output() {
+                    Ok(output) => {
+                        print!("{}", String::from_utf8_lossy(&output.stdout));
+                        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                        if !output.status.success() {
+                            failures.push(format!("{condition}: {}", output.status));
+                        }
+                    }
+                    Err(error) => failures.push(format!("{condition}: {error}")),
+                }
+            }
+            assert!(failures.is_empty(), "child failures: {failures:?}");
+            return;
+        };
+        assert!(matches!(condition.as_str(), "both" | "home" | "absent"));
+        let pairs = [
+            ("on", "--home"),
+            ("run", "--home"),
+            ("off", "--home"),
+            ("status", "--home"),
+            ("on", "--token-file"),
+            ("run", "--token-file"),
+            ("off", "--token-file"),
+        ];
+        let forms = [
+            ("before", Some("before-action"), None),
+            ("after", None, Some("after-action")),
+            ("both", Some("before-action"), Some("after-action")),
+            ("none", None, None),
+        ];
+        let mut failures = Vec::new();
+        for (action, option) in pairs {
+            if (condition == "both" && action == "status")
+                || (condition == "home" && action != "status")
+            {
+                continue;
+            }
+            let environment = if condition == "absent" {
+                None
+            } else if option == "--home" {
+                Some("environment-home")
+            } else {
+                Some("environment-token")
+            };
+            for (form, before, after) in forms {
+                let mut arguments = vec!["zg", "--server"];
+                if let Some(value) = before {
+                    arguments.extend([option, value]);
+                }
+                arguments.push(action);
+                if let Some(value) = after {
+                    arguments.extend([option, value]);
+                }
+                let expected = after.or(before).or(environment).map(PathBuf::from);
+                let actual = Cli::try_parse_from(arguments)
+                    .map_err(|error| error.to_string())
+                    .and_then(|cli| {
+                        cli.into_plan(std::env::temp_dir())
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|plan| match plan {
+                        CliPlan::Server(
+                            super::ServerPlan::On(args) | super::ServerPlan::Run(args),
+                        ) => Ok(if option == "--home" {
+                            args.home
+                        } else {
+                            args.token_file
+                        }),
+                        CliPlan::Server(super::ServerPlan::Off(args)) => {
+                            Ok(if option == "--home" {
+                                args.home
+                            } else {
+                                args.token_file
+                            })
+                        }
+                        CliPlan::Server(super::ServerPlan::Status(args)) => Ok(args.home),
+                        _ => Err("unexpected plan".to_owned()),
+                    });
+                let passed = actual.as_ref() == Ok(&expected);
+                let case = format!("{action}/{option}/{form}/{condition}");
+                println!(
+                    "SERVER_OPTION_CASE {}",
+                    serde_json::json!({
+                        "case": case, "action": action, "option": option,
+                        "form": form, "condition": condition,
+                        "expected": expected, "actual": actual,
+                        "passed": passed,
+                    })
+                );
+                if !passed {
+                    failures.push(case);
+                }
+            }
+        }
+        assert!(failures.is_empty(), "case failures: {failures:?}");
+    }
+
+    #[test]
     fn server_options_before_the_action_reach_execution() {
         let plan = Cli::try_parse_from([
             "zg",
