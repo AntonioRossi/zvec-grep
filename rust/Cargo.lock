@@ -4279,6 +4279,7 @@ dependencies = [
  "uuid",
  "winapi-util",
  "zg-engine",
+ "zg-testkit",
 ]
 
 [[package]]
