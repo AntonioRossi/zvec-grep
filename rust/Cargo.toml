@@ -30,6 +30,9 @@ hyper = { version = "1.11.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 ignore = "0.4.33"
 notify = "8.2.0"
+# Keep the published binding's safety fixes while loading the separately pinned
+# ORT 1.21.0 runtime through API 21; do not enable automatic runtime downloads.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-21", "load-dynamic", "std"] }
 rmcp = { version = "3.1.4", features = ["macros", "schemars", "server", "transport-streamable-http-server"] }
 same-file = "1.0.6"
 schemars = "1"
