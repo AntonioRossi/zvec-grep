@@ -6,7 +6,7 @@ x64. `platforms.json` is the single source of truth for package
 names and npm `os`, `cpu`, and `libc` selectors.
 
 The current published targets are macOS ARM64/x64, Linux x64/ARM64 with glibc,
-and Windows x64.
+and Windows x64/ARM64.
 
 After installation, the meta package retains the existing runtime paths. CUDA
 files are present only after successful plugin installation:
@@ -28,8 +28,8 @@ The Linux x64 base package's `plugins.json` references `-ggml-cuda13`, `-ggml-cu
 `-ort-cuda-part1` and `-ort-cuda-part2` packages. Windows x64 references
 `-ggml-cuda13`, `-ggml-cuda12` and `-ort-cuda`. These suffixes extend the base
 platform package name. macOS, Linux ARM64 and deliberate CPU-only builds remain
-single native packages. A default all-platform release contains 13 tarballs:
-five base packages, seven runtime components and the meta package.
+single native packages. A default all-platform release contains 14 tarballs:
+six base packages, seven runtime components and the meta package.
 
 The base package retains the executable and CPU/core libraries, including
 zvec's embedded Jieba dictionary; no external dictionary files are required.
@@ -82,12 +82,12 @@ executable's sibling `lib/`. The binary runs directly, without a JavaScript
 launcher or custom loader environment variables for bundled libraries. Host
 NVIDIA libraries must still be discoverable by the system loader.
 
-Non-CUDA builds enable ORT's upstream `copy-dylibs` feature to stage runtime
-sidecars beside the Cargo executable. npm packaging copies them into `lib/`
-as regular files, including any symlinked libraries. This includes Intel macOS's
-dynamically linked ORT and Windows DirectML's DLL; it does not change the static
-ORT linkage used by the default macOS ARM64 and Linux CPU builds. CUDA bundles
-load ORT dynamically and continue to stage their pinned core/providers explicitly.
+All six targets dynamically load official ORT 1.21.0. The engine build script
+stages verified libraries beside Cargo executables, tests and examples; npm
+copies them and their upstream notices into `lib/`. No target downloads Pyke
+static ORT archives or compiles ORT from source. CPU-only Windows uses the
+DirectML NuGet runtime and its pinned DirectML DLL; CUDA x64 bundles use the
+matching official CPU core/shared provider/CUDA provider from one distribution.
 
 The default `linux-x64-gnu` and `win32-x64-msvc` native packages are CPU/CUDA
 bundles. CUDA libraries remain runtime plugins: compatible NVIDIA libraries
@@ -123,14 +123,15 @@ Published target/backend support is:
 | Linux x64 glibc (Ubuntu 24.04 baseline) | CPU + CUDA 13.1, CUDA 12.4 fallback | CPU + CUDA 12 |
 | Linux ARM64 glibc | CPU | CPU |
 | Windows x64 | CPU + CUDA 13.1, CUDA 12.4 fallback | CPU + CUDA 12 |
+| Windows ARM64 | CPU | CPU + DirectML |
 
 A deliberate CPU-only Windows build retains DirectML. The published Windows
-CUDA bundle uses the official ONNX Runtime 1.28.0 CUDA 12 provider and does not
+CUDA bundle uses the official ONNX Runtime 1.21.0 CUDA 12 provider and does not
 claim DirectML support. ORT requires CUDA 12 runtime/cuBLAS and cuDNN 9 even
 when GGUF uses CUDA 13; the two runtime families can coexist. NVIDIA driver,
 CUDA runtime, cuBLAS and cuDNN remain host dependencies, not bundled libraries.
 macOS keeps its existing ONNX CPU routing because of CoreML regressions.
-Linux musl, Windows ARM64, CUDA on ARM64/macOS and Vulkan packages are not in
+Linux musl, CUDA on ARM64/macOS and Vulkan packages are not in
 the release matrix.
 
 The CUDA 13.1 primary GGUF plugin uses
@@ -226,19 +227,20 @@ Release order:
    CUDA targets also force a registry plugin installation and verify its hashes
    and core identity; CPU fallback must not hide a plugin-fetch failure.
 6. Promote native `latest` tags and then the meta `latest` tag in a separate job,
-   only after all five registry install/update/rollback jobs pass.
+   only after all six registry install/update/rollback jobs pass.
 
 `.github/workflows/rust-publish.yml` builds and packs the selected targets once on
 their native runners in parallel, collects the candidates into a downloadable
 artifact, then checks real installation, CLI startup, managed-rg and daemon IPC.
 The workflow runs only through manual dispatch and does not publish unless
 `publish` is enabled. The manual
-`platform` input defaults to `all`; each of the five target names can be selected
+`platform` input defaults to `all`; each of the six target names can be selected
 individually.
 `publish=true` requires `platform=all`; a subset is a validation-only candidate,
 not a complete release. Manual runs with `publish=false, cuda=false` use ordinary CPU runners;
-they do not allocate GPUs or publish packages. All five package builds require
-the pinned llama-cpp-rs prebuilt SDK. Linux/Windows x64 still produce CUDA-capable
+they do not allocate GPUs or publish packages. All six package builds require
+the pinned llama-cpp-rs prebuilt SDK, including the Windows ARM64 static CPU
+SDK. Linux/Windows x64 still produce CUDA-capable
 bundles, but neither the 13.1 primary nor 12.4 fallback is compiled in zg CI.
 All packaging builds stay on ordinary CPU runners, including when `cuda=true`
 or `publish=true`. Manual `cuda=true` runs add separate Linux/Windows x64 GPU
@@ -251,10 +253,20 @@ CPU checks or remove the candidate, but blocks npm publication.
 Runs use branch-plus-platform concurrency groups, allowing different platform
 selections on the same branch to run concurrently without cancelling an
 in-progress run in the same group.
-Intel macOS no longer gates the other platform builds. Its ONNX Runtime with
-CoreML and zvec SDK are built from
-pinned sources, cached, and bundled with the native package. The Intel release
-targets macOS 14 and later.
+Intel macOS uses the official precompiled ORT 1.21.0 dylib. ORT is not built
+from source on any published target. The Intel release targets macOS 14 and later.
+
+Windows ARM64 uses `windows-11-arm` with ARM64 Node, Rust, and MSVC. It uses
+zvec-rust 0.8.0's automatically selected Windows ARM64 prebuilt SDK instead of
+building zvec from source. The shared DLL is staged by zvec-rust-build and
+bundled in `@zvec/zvec-grep-win32-arm64-msvc`. ONNX Runtime uses the official
+ARM64 DirectML 1.21.0 NuGet runtime and Microsoft.AI.DirectML 1.15.4, with
+SHA-256 verification and a separate archive cache.
+llama-cpp-rs selects the SHA-256-pinned Windows ARM64 static CPU SDK from
+`zvec-0.1.154-cpu-r2`, without running bindgen, CMake, or a C++ compiler.
+No Clang/Ninja overrides are needed during packaging. The installed artifacts
+receive the same CLI, managed-rg, and direct/server daemon IPC checks as the
+other non-CUDA targets.
 
 Build jobs select Cargo/CMake parallelism from the runner's available CPUs and
 total memory, budgeting 3 GiB per job and capping concurrency at 8. The Linux
@@ -264,7 +276,7 @@ both CUDA plugins; no Windows CUDA compiler/MSVC 14.38 fallback setup or second
 Linux CUDA builder is needed. Rust linking and dependency audits remain. The SDK
 cache is keyed separately from Cargo build output and checked by the fork's
 embedded archive/manifest hashes. Native configuration drift fails release CI
-instead of silently rebuilding. ORT and zvec build/download behavior is unchanged.
+instead of silently rebuilding. ORT uses the common pinned-runtime preparer; zvec SDK selection is unchanged.
 Linux x64 mounts the restored Cargo registry and Git caches into its Docker
 builder and returns ownership to the runner before saving them. The host skips
 compiler-library/CMake installation; pinned Rust remains for packaging's
@@ -349,7 +361,7 @@ while these inputs are missing. Both the initial source check and the tarball
 preflight fail before publication when compliance inputs are incomplete.
 
 Publication and promotion explicitly install npm 11.21.0, which supports OIDC
-authentication for `npm dist-tag`. Configure trusted publishing for all 13
+authentication for `npm dist-tag`. Configure trusted publishing for all 14
 packages with repository `zvec-ai/zvec-grep`, workflow filename
 `rust-publish.yml`, and both **Allow npm publish** and **Allow npm dist-tag**.
 The dist-tag permission is independent and disabled by default; `id-token:

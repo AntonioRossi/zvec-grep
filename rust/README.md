@@ -406,6 +406,11 @@ Restart older resident daemons when updating the CLI; replies without
 `content_range` are rejected during deserialization. Direct and server rendering
 consume the same engine contract.
 
+Managed rg results also provide optional `match_ranges` in decoded UTF-8 source
+coordinates. Terminal highlighting uses these actual matches, preserving regex,
+case, whole-word, and pattern-file semantics. Empty ranges are omitted; older
+replies without this field remain readable.
+
 Public search reports `freshness: fresh` or `freshness: possibly_stale`.
 `results: served_from_current_index` describes where results came from, with
 `background_refresh` reported separately. A provider that only reports current
@@ -481,11 +486,14 @@ bash scripts/check.sh
 ## Native and CUDA builds
 
 The safe llama API and the C5 FFI boundary share the same pinned
-`zvec-ai/llama-cpp-rs` revision (`0e2d4b520af769de221c1bf98bbbf1b2accf4ddc`).
+`zvec-ai/llama-cpp-rs` revision (`b55399ac6c2035f2301120547c4c967e741d25d3`),
+from branch `prebuilt/0.1.154-cpu-r2-glibc-2.31`.
 Its sys crate automatically selects a SHA256-pinned SDK when target, features
-and native options match: `zvec-0.1.154-cpu-r1` for CPU-only Linux/Windows x64,
-and `zvec-0.1.154-r1` for the existing five release configurations, including
-CUDA-enabled Linux/Windows x64. Matching builds reuse native
+and native options match. Linux x64 CPU, Linux ARM64 CPU and Linux x64 CUDA use
+`zvec-0.1.154-glibc-2.31-r1`, built on Ubuntu 20.04 and verified against a glibc
+2.31 baseline. Windows x64/ARM64 CPU use `zvec-0.1.154-cpu-r2`; macOS and
+CUDA-enabled Windows x64 use `zvec-0.1.154-r1`. CUDA architecture coverage is
+unchanged. Matching builds reuse native
 libraries and bindings without executing bindgen, CMake, C++ or CUDA compilation;
 Rust application code still compiles normally. CPU-only x64 builds download only
 the static CPU SDK, not the CUDA SDK; CUDA builds retain the shared core, CPU
@@ -523,16 +531,18 @@ Optional backends still use the verified SDK cache or current source backend
 directory; this development output is not a portable distribution.
 Use the npm packaging commands below to assemble a distributable runtime.
 
-CUDA Cargo builds also deploy the pinned official ONNX Runtime CUDA 12 main
-library and its shared/CUDA providers beside the executable, using the same
-SHA-256-verified preparation script as npm packaging (requires Python 3 and
-curl; `PYTHON` can select the interpreter). The archive is reused from
-`target/ort-cuda12` (under the target triple for cross-target builds).
-`CARGO_NET_OFFLINE=true` requires that archive to be cached already. Both
-`--device cpu` and `--device cuda` can then load ORT without `ORT_DYLIB_PATH`
-or `LD_LIBRARY_PATH`; CUDA execution still requires a compatible NVIDIA driver,
-CUDA 12 runtime and cuDNN 9 installed on the host. Non-CUDA Cargo builds retain
-their existing ORT linking behavior and do not download this CUDA runtime.
+All Cargo builds deploy official ONNX Runtime 1.21.0 shared libraries beside
+executables, tests and examples. The engine build script uses the same
+SHA-256-pinned preparation script as npm packaging (Python 3 and curl are
+required; `PYTHON` selects the interpreter). Archives are cached under
+`target/ort-prebuilt` (under the target triple for cross-target builds), or
+`ZG_ORT_CACHE_DIR`. `CARGO_NET_OFFLINE=true` requires verified cached archives.
+CPU builds select CPU/CoreML/DirectML runtimes; x64 CUDA builds select matching
+CUDA 12 core/providers. Both `--device cpu` and `--device cuda` locate packaged
+ORT without loader environment overrides. CUDA execution still requires the
+host NVIDIA driver, CUDA 12 libraries and cuDNN 9. An explicit `ORT_DYLIB_PATH`
+skips automatic preparation and supplies a custom runtime when using ONNX WebGPU.
+Enabling GGUF Vulkan alone does not require a custom ORT library.
 
 ```sh
 npm run build
@@ -559,7 +569,8 @@ Source-mode CUDA 12.4 on Windows requires MSVC 14.38 before running
 `scripts/cuda/build-fallback.py`. Matching SDK builds copy that plugin directly,
 so neither a second CMake build nor the fallback toolchain is needed.
 
-Publish CI requires prebuilt SDKs on all five targets; CUDA Rust CI also requires
+Publish CI requires prebuilt llama SDKs on all six targets, including the
+Windows ARM64 static CPU SDK. CUDA Rust CI also requires
 prebuilt mode instead of recompiling only for its T4 GPU. Linux publish builds
 run on Ubuntu 24.04 without a CUDA compiler. Runtime libraries, driver checks,
 link audits and real CPU/GPU inference gates remain required. Runtime staging
@@ -578,7 +589,7 @@ silently with a prebuilt SDK.
 The package contains `bin/zg[.exe]`, with all shared libraries, plugins and
 dictionaries under `lib/`. GGUF loads the CUDA 13.1 plugin first, then the
 CUDA 12.4 fallback from `lib/cuda12/`; both use the same locked llama.cpp core.
-ONNX uses the hash-verified official ORT 1.28.0 CUDA 12 core/providers.
+ONNX uses the hash-verified official ORT 1.21.0 CUDA 12 core/providers.
 NVIDIA driver, CUDA runtime, cuBLAS and cuDNN 9 remain host dependencies.
 CUDA-enabled x64 builds default to automatic device selection and fall back
 to CPU when a GPU/backend is unavailable. `--device cpu` or
@@ -756,7 +767,7 @@ contains exactly the target executable. It cannot be combined with
 `--binary`, `--lib-dir`, or `--cpu-only`. All payload files are checksummed.
 
 The `Publish Rust packages` workflow builds the selected published native targets
-(all five by default) on matching CPU runners. It runs only through manual
+(all six by default) on matching CPU runners. It runs only through manual
 dispatch. With `publish` left at its default `false`, it produces downloadable
 candidates without publishing to npm. Each CPU artifact-verification runner installs
 its platform and meta tarballs, then runs `zg --version`, checks managed-rg,
@@ -773,8 +784,8 @@ requested GPU jobs then verify the exact collected tarballs, including CLI,
 managed-rg, and daemon IPC checks on every selected platform.
 
 The packaging workflow's manual `platform` input defaults to `all`. Select any
-of `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, or
-`win32-x64-msvc` for an individual build. For example, to validate Linux x64:
+of `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`,
+`win32-x64-msvc`, or `win32-arm64-msvc` for an individual build. For example, to validate Linux x64:
 
 ```sh
 gh workflow run rust-publish.yml --ref <branch> \
@@ -850,16 +861,19 @@ unchanged. Quality, default tests and CUDA builds have separate build caches.
 select `linux` or `windows` to limit test platforms. Optional `ref` selects the
 reviewed source; otherwise the workflow's selected commit is used. All jobs
 check out the same resolved SHA. This workflow does no npm packaging or publishing.
-The current ONNX Runtime prebuilt libraries cannot link against
-Ubuntu 22.04's glibc and C++ runtime, so older Linux distributions are not
-covered by this release workflow.
+Official ORT 1.21 Linux x64/ARM64 runtimes are audited against glibc 2.31,
+including loading the CPU core in Ubuntu 20.04 containers. This is an ORT
+compatibility gate, not a claim that the full CLI or unrelated native SDKs
+already support glibc 2.31; the existing full-package build baseline remains
+Ubuntu 24.04 until those dependencies and the executable are rebuilt and audited.
 Packaging selects Cargo/CMake parallelism from available CPUs and total memory
 with a conservative 3 GiB per-job budget, a minimum of 1 and a maximum of 8.
 The same limits are passed into the Linux builder. This is a resource
 heuristic, not a guarantee against OOM. The existing 180-minute limits remain
 upper bounds, not expected build durations. CUDA 13.1 and 12.4 native compilation
 now belongs to the fork's versioned SDK release, not every zg CI run.
-Intel macOS builds ONNX Runtime 1.28.0 with CoreML from a pinned source revision.
+Intel macOS downloads the official ORT 1.21.0 precompiled dylib, just like
+Apple Silicon; no ORT source checkout, CMake build or dedicated build cache is needed.
 Like the other targets, it lets `zvec-rust-sys` select the prebuilt zvec SDK from
 its locked crate version and Cargo `TARGET`, retaining the upstream source-build
 fallback if SDK acquisition fails. The SDK cache lives under Cargo `OUT_DIR`
@@ -867,9 +881,18 @@ and is covered by the existing `rust/target/release` cache. ONNX Runtime is
 cached separately; both shared libraries are included in the npm payload.
 The Intel release targets macOS 14 and later.
 
+Windows ARM64 builds and tests natively on `windows-11-arm` with ARM64 Node,
+Rust, and MSVC. zvec-rust 0.8.0 automatically downloads its Windows ARM64
+prebuilt SDK and stages `zvec_c_api.dll` for packaging; no local zvec source
+build is needed. ONNX Runtime uses the SHA-256-pinned official 1.21.0 DirectML NuGet runtime
+and the matching Microsoft.AI.DirectML 1.15.4 DLL, selected for ARM64. llama-cpp-rs selects the
+SHA-256-pinned Windows ARM64 static CPU SDK from `zvec-0.1.154-cpu-r2`, without
+running bindgen, CMake or a C++ compiler. No Clang/Ninja overrides are needed. npm selects
+`@zvec/zvec-grep-win32-arm64-msvc` for ARM64 Node on Windows.
+
 For a complete all-platform run, download the `rust-release-<version>` artifact
 from the successful workflow run
-and unzip it. It contains five base platform tarballs, seven CUDA component
+and unzip it. It contains six base platform tarballs, seven CUDA component
 tarballs, the meta tarball,
 `SHA256SUMS`, `release.json` with the source commit, and platform-specific install
 commands. For example, on an ARM64 Mac:
@@ -899,7 +922,7 @@ Failure blocks npm publication; the candidate artifact is kept for diagnosis.
 
 To publish, update the Rust workspace version, tag the release commit on `main`
 as `rust-v<version>`, and manually run the workflow with `publish` enabled. The
-publishing repository must have an npm trusted publisher configured for all 13
+publishing repository must have an npm trusted publisher configured for all 14
 packages with both **Allow npm publish** and the independent **Allow npm
 dist-tag** permission enabled, or provide an eligible `NPM_TOKEN` secret.
 Publishing and promotion install npm 11.21.0 explicitly for OIDC dist-tag support.
@@ -923,7 +946,7 @@ separate from `dist/npm/release/`.
 package last. `release:collect -- --targets linux-x64-gnu,win32-x64-msvc` collects
 only the explicitly selected platform tarballs and their components as a validation-only partial
 candidate; missing or extra tarballs are rejected. The meta package still locks
-all five platform versions, so its installation behavior is unchanged.
+all six platform versions, so its installation behavior is unchanged.
 `release:artifact-smoke` installs the current platform's exact collected native
 component and meta tarballs from `dist/npm/release/tarballs`, verifies the installation and
 CLI/daemon operation, and does not compile, repack or publish anything.

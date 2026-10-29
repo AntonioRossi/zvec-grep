@@ -343,7 +343,6 @@ impl SessionPool {
         device: Option<Device>,
         reporter: &ModelDownloadProgressReporter,
     ) -> Result<Self, ModelError> {
-        #[cfg(feature = "cuda")]
         super::native_runtime::initialize()?;
         let prepacked_weights = PrepackedWeights::new();
         let requested = resolve_execution_provider(device);
@@ -672,7 +671,7 @@ fn load_session(
     provider: TransformersExecutionProvider,
     prepacked_weights: &PrepackedWeights,
 ) -> Result<Session, ModelError> {
-    let builder = Session::builder()
+    let builder = Session::builder(&super::native_runtime::initialize()?)
         .map_err(|error| {
             ModelError::internal("Unable to configure ONNX embedding model").with_cause(error)
         })?
