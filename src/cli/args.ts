@@ -349,10 +349,20 @@ export function parseArgs(args: readonly string[]): ParsedArgs {
         readOptionValue(commandArgs, ++index, arg),
         arg,
       );
-    } else if (arg === "--index-embedding-concurrency") {
+    } else if (
+      arg === "--embedding-concurrency" ||
+      isLongOptionWithValue(arg, "--embedding-concurrency")
+    ) {
+      if (commandInput.command !== "index") {
+        throw new Error(
+          "--embedding-concurrency can only be used with zg --index",
+        );
+      }
       options.embeddingConcurrency = parsePositiveInteger(
-        readOptionValue(commandArgs, ++index, arg),
-        arg,
+        arg === "--embedding-concurrency"
+          ? readOptionValue(commandArgs, ++index, arg)
+          : valueFromLongOption(arg),
+        "--embedding-concurrency",
       );
     } else if (isLongOptionWithValue(arg, "--hybrid")) {
       options.hybridQueries = appendQuery(
@@ -874,11 +884,6 @@ function validateCliShape(
   }
   if (options.rg && options.refresh) {
     throw new Error("--rg cannot be combined with indexed refresh options");
-  }
-  if (options.embeddingConcurrency !== undefined && command !== "index") {
-    throw new Error(
-      "--index-embedding-concurrency can only be used with zg --index",
-    );
   }
   if (!options.rg && (options.rgCompatibilityOptions?.length ?? 0) > 0) {
     const [option] = options.rgCompatibilityOptions!;
