@@ -31,5 +31,6 @@ cached separately.
   First builds and rebuilds prepare an index in `temp/` and publish it after
   storage closes. Interrupted publication can be recovered; a failed rebuild
   before the manifest commits preserves the previous index.
-- **Compatibility.** Rebuild the index when its version does not match the
-  version supported by the engine.
+- **Compatibility.** `indexVersion` remains `2`. Embedding vectors are stored
+  as IEEE binary16. Rebuild indexes with an unsupported version, as well as
+  existing FP32 development indexes, using `zg --index --rebuild`.
