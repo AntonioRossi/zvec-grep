@@ -1504,17 +1504,13 @@ fn model_tables_partition_fragments_and_failed_files_clear_every_partition() {
         "directories".to_owned(),
         "files".to_owned(),
         "entities".to_owned(),
-        "graph".to_owned(),
+        "fragments_438e".to_owned(),
+        "fragments_d020".to_owned(),
     ];
-    expected.extend(
-        multi_model_schema()
-            .iter()
-            .map(super::super::fragments::fragment_collection_name),
-    );
     expected.sort();
     assert_eq!(
         collections, expected,
-        "three canonical collections, one per model, and the graph directory"
+        "three canonical collections and one per model, without a graph directory"
     );
 
     let reader = open(home.path(), true);
@@ -1584,6 +1580,55 @@ fn model_tables_partition_fragments_and_failed_files_clear_every_partition() {
         .expect("removed canonical entities are skipped");
     assert!(loaded.entities.is_empty());
     assert!(loaded.fragments.is_empty());
+}
+
+#[test]
+fn colliding_model_collection_names_are_rejected_before_opening_storage() {
+    let home = tempfile::tempdir().expect("workspace");
+    let embeddings = ["model-188", "model-215"]
+        .into_iter()
+        .map(|name| {
+            let mut metadata = serde_json::to_value(schema()).expect("model metadata");
+            metadata["model"]["name"] = serde_json::json!(name);
+            serde_json::from_value(metadata).expect("valid model metadata")
+        })
+        .collect::<Vec<_>>();
+    let error = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        storage_path: home.path().to_owned(),
+        embeddings: embeddings.clone(),
+    })
+    .err()
+    .expect("colliding collection names");
+    assert_eq!(error.code(), EngineError::INVALID_ARGUMENT);
+    assert!(
+        error
+            .message()
+            .contains("share index collection fragments_ccb7")
+    );
+    assert_eq!(
+        fs::read_dir(home.path())
+            .expect("untouched storage")
+            .count(),
+        0
+    );
+
+    fs::write(
+        home.path().join("schema.json"),
+        serde_json::to_vec(&SchemaRecord::new(&embeddings)).expect("descriptor JSON"),
+    )
+    .expect("write conflicting schema");
+    let error = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+        storage_path: home.path().to_owned(),
+    })
+    .err()
+    .expect("stored collection names also require validation");
+    assert_eq!(error.code(), EngineError::STORAGE_FAILURE);
+    assert!(
+        error
+            .message()
+            .contains("share index collection fragments_ccb7")
+    );
+    assert!(!home.path().join("fragments_ccb7").exists());
 }
 
 #[test]

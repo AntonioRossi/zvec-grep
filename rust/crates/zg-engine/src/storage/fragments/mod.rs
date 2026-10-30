@@ -293,7 +293,7 @@ fn primary_key(namespace: &str, value: &str) -> String {
 
 pub(super) fn fragment_collection_name(embedding: &EmbeddingModelInfo) -> String {
     format!(
-        "fragments_{}",
+        "fragments_{:.4}",
         primary_key(
             "space",
             &format!(

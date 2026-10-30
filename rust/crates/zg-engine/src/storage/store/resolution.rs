@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{IndexStore, StoreState, graph_error};
+use super::{IndexStore, StoreState, graph_disabled, graph_error};
 use crate::{
     EngineError, EngineResult,
     domain::{EntityId, FileId},
@@ -31,7 +31,7 @@ impl IndexStore {
             let mut page = state
                 .graph
                 .as_ref()
-                .expect("writable graph")
+                .ok_or_else(graph_disabled)?
                 .list_pending_refs(limit, cursor)
                 .map_err(graph_error)?;
             let ids = page
@@ -103,7 +103,7 @@ impl IndexStore {
             let refs = state
                 .graph
                 .as_ref()
-                .expect("writable graph")
+                .ok_or_else(graph_disabled)?
                 .get_pending_refs(&ids)
                 .map_err(graph_error)?;
             let endpoints = refs
@@ -129,7 +129,7 @@ impl IndexStore {
             let mut stats = state
                 .graph
                 .as_mut()
-                .expect("writable graph")
+                .ok_or_else(graph_disabled)?
                 .apply_resolutions(&valid)
                 .map_err(graph_error)?;
             stats.stale += resolutions.len() - valid.len();

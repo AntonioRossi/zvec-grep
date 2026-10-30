@@ -25,7 +25,11 @@ struct Snapshot {
 }
 
 fn open(path: &Path, read_only: bool) -> IndexStore {
-    let options = if read_only {
+    IndexStore::open_with_graph(options(path, read_only), true).expect("open combined storage")
+}
+
+fn options(path: &Path, read_only: bool) -> WorkspaceIndexStorageOptions {
+    if read_only {
         WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: path.to_owned(),
         }
@@ -49,8 +53,7 @@ fn open(path: &Path, read_only: bool) -> IndexStore {
                 .expect("embedding model"),
             ],
         }
-    };
-    IndexStore::open(options).expect("open combined storage")
+    }
 }
 
 fn snapshot(store: &IndexStore, path: impl Into<PathBuf>, symbols: &[&str]) -> Snapshot {
@@ -220,6 +223,143 @@ fn stored_entities(store: &IndexStore, entities: &[Entity]) -> HashMap<EntityId,
     store
         .read(|state| state.entities.fetch(&ids))
         .expect("fetch canonical entities")
+}
+
+#[test]
+fn default_storage_skips_graph_io_and_preserves_existing_database() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let home = temporary.path();
+    let store = IndexStore::open(options(home, false)).expect("default writer");
+    let source = snapshot(&store, "source.rs", &["orchard"]);
+    store
+        .replace_file(&source.file, &source.entities, &source.fragments)
+        .expect("write without graph");
+    store.finalize_writes().expect("finalize without graph");
+    store.close().expect("close writer");
+    assert!(!home.join("graph").exists());
+
+    // A foreign database would fail if ordinary indexing tried to open it.
+    let graph_dir = home.join("graph");
+    fs::create_dir(&graph_dir).expect("existing graph directory");
+    let graph_path = graph_dir.join("graph.sqlite");
+    let existing = b"preserve this database without opening it";
+    fs::write(&graph_path, existing).expect("existing graph database");
+
+    let store = IndexStore::open(options(home, false)).expect("ignore existing graph");
+    let replacement = snapshot(&store, "source.rs", &["vineyard"]);
+    store
+        .replace_file(
+            &replacement.file,
+            &replacement.entities,
+            &replacement.fragments,
+        )
+        .expect("update without graph");
+    store.finalize_writes().expect("finalize update");
+    assert!(
+        store
+            .search_fts("orchard", 10, None)
+            .expect("old text")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .search_fts("vineyard", 10, None)
+            .expect("new text")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .search_vector("fixture/graph", &[1.0, 0.0, 0.0], 10, None)
+            .expect("vector search")
+            .len(),
+        1
+    );
+    store
+        .delete_file(source.file.id())
+        .expect("delete without graph");
+    store.close().expect("close update");
+
+    let reader = IndexStore::open(options(home, true)).expect("reopen reader");
+    assert!(reader.list_files().expect("deleted file").is_empty());
+    assert!(
+        reader
+            .search_fts("vineyard", 10, None)
+            .expect("deleted text")
+            .is_empty()
+    );
+    reader.close().expect("close reader");
+    assert_eq!(fs::read(graph_path).expect("preserved database"), existing);
+    assert_eq!(
+        fs::read_dir(graph_dir).expect("no SQLite sidecars").count(),
+        1
+    );
+}
+
+#[test]
+fn disabled_graph_rejects_data_and_resolution_without_changing_files() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let store = IndexStore::open(options(temporary.path(), false)).expect("default writer");
+    let original = snapshot(&store, "source.rs", &["orchard"]);
+    store
+        .replace_file(&original.file, &original.entities, &original.fragments)
+        .expect("original file");
+    let before = store.list_files().expect("original status");
+    let replacement = snapshot(&store, "source.rs", &["vineyard"]);
+    let file_id = format!("f{}", replacement.file.id().get());
+    let mut edge = local_call(&replacement.entities[0], &replacement.entities[0]);
+    edge.source = file_id.clone();
+    edge.target = file_id.clone();
+    let mut pending_ref = reference(&replacement.entities[0]);
+    pending_ref.owner_id = file_id;
+    for graph in [
+        replacement.graph.clone(),
+        FileGraphResult {
+            edges: vec![edge],
+            ..FileGraphResult::default()
+        },
+        FileGraphResult {
+            pending_refs: vec![pending_ref],
+            ..FileGraphResult::default()
+        },
+    ] {
+        let error = store
+            .replace_file_with_graph(
+                &replacement.file,
+                &replacement.entities,
+                &replacement.fragments,
+                &graph,
+            )
+            .expect_err("nonempty graph must not be discarded");
+        assert_eq!(error.code(), EngineError::UNSUPPORTED);
+        assert!(error.message().contains("graph indexing is disabled"));
+    }
+    assert_eq!(
+        store
+            .list_pending_refs(10, 0)
+            .expect_err("disabled resolver")
+            .code(),
+        EngineError::UNSUPPORTED
+    );
+    assert_eq!(
+        store
+            .apply_resolutions(&[])
+            .expect_err("disabled resolver")
+            .code(),
+        EngineError::UNSUPPORTED
+    );
+    assert_eq!(store.list_files().expect("unchanged status"), before);
+    assert_eq!(stored_entities(&store, &original.entities).len(), 1);
+    assert!(stored_entities(&store, &replacement.entities).is_empty());
+    assert_eq!(
+        store
+            .search_fts("orchard", 10, None)
+            .expect("original text")
+            .len(),
+        1
+    );
+    store.close().expect("close writer");
+    assert!(!temporary.path().join("graph").exists());
 }
 
 #[test]

@@ -101,6 +101,7 @@ fn validate_models(embeddings: &[EmbeddingModelInfo]) -> EngineResult<()> {
         ));
     }
     let mut models = std::collections::HashSet::new();
+    let mut collections = HashSet::new();
     for embedding in embeddings {
         if !(1..=20_000).contains(&embedding.dimension()) {
             return Err(EngineError::invalid_argument(
@@ -112,12 +113,27 @@ fn validate_models(embeddings: &[EmbeddingModelInfo]) -> EngineResult<()> {
                 "embedding model references must be unique",
             ));
         }
+        let collection = fragments::fragment_collection_name(embedding);
+        if !collections.insert(collection.clone()) {
+            return Err(EngineError::invalid_argument(format!(
+                "embedding models share index collection {collection}; use different models"
+            )));
+        }
     }
     Ok(())
 }
 
 impl IndexStore {
     pub(crate) fn open(options: WorkspaceIndexStorageOptions) -> EngineResult<Self> {
+        // Graph extraction and resolution are not enabled in this release.
+        // Re-enabling graph indexing requires rebuilding any unmaintained graph.
+        Self::open_with_graph(options, false)
+    }
+
+    fn open_with_graph(
+        options: WorkspaceIndexStorageOptions,
+        graph_enabled: bool,
+    ) -> EngineResult<Self> {
         if let WorkspaceIndexStorageOptions::ReadWrite { embeddings, .. } = &options {
             validate_models(embeddings)?;
         }
@@ -160,7 +176,7 @@ impl IndexStore {
         let entities = Entities::open(&path, read_only)?;
         let fragments = Fragments::open(&path, &schema, read_only)?;
         // Ordinary readers do not depend on the graph's availability.
-        let graph = if read_only {
+        let graph = if read_only || !graph_enabled {
             None
         } else {
             let graph_path = path.join("graph").join("graph.sqlite");
@@ -397,12 +413,11 @@ impl IndexStore {
             state.needs_optimize = true;
             let old_ids = invalidation_entity_ids(state, file_id)?;
             state.files.mark_deleting(file_id)?;
-            state
-                .graph
-                .as_mut()
-                .expect("writable graph")
-                .delete_file_graph(file_id.get(), &old_ids)
-                .map_err(graph_error)?;
+            if let Some(graph) = state.graph.as_mut() {
+                graph
+                    .delete_file_graph(file_id.get(), &old_ids)
+                    .map_err(graph_error)?;
+            }
             state.fragments.delete_file(file_id)?;
             state.entities.delete_file(file_id)?;
             state.files.delete(file_id)
@@ -497,6 +512,11 @@ fn replace_file(
     entries: &[IndexedFragment],
     graph: &FileGraphResult,
 ) -> EngineResult<()> {
+    if state.graph.is_none()
+        && (!graph.nodes.is_empty() || !graph.edges.is_empty() || !graph.pending_refs.is_empty())
+    {
+        return Err(graph_disabled());
+    }
     state.files.validate(file)?;
     state.entities.validate_ownership(entities, file.id())?;
     state.fragments.validate_ownership(entries, file.id())?;
@@ -510,12 +530,11 @@ fn replace_file(
     unfinished.set_index_status(FileIndexStatus::NotIndexed)?;
     state.files.put(&unfinished, &directories)?;
     // zvec writes are durable on success: record retry intent before advancing SQLite.
-    state
-        .graph
-        .as_mut()
-        .expect("writable graph")
-        .write_file_graph(file.id().get(), graph, &old_ids)
-        .map_err(graph_error)?;
+    if let Some(storage) = state.graph.as_mut() {
+        storage
+            .write_file_graph(file.id().get(), graph, &old_ids)
+            .map_err(graph_error)?;
+    }
     state.fragments.delete_file(file.id())?;
     state.entities.delete_file(file.id())?;
     state.entities.write(&entity_docs)?;
@@ -525,18 +544,19 @@ fn replace_file(
 }
 
 fn invalidation_entity_ids(state: &StoreState, file_id: FileId) -> EngineResult<Vec<String>> {
+    let Some(graph) = state.graph.as_ref() else {
+        return Ok(Vec::new());
+    };
     // An empty graph has no incoming relationships to invalidate. Avoid a
     // canonical entity scan on every file while extractors produce no graph.
-    if state
-        .graph
-        .as_ref()
-        .expect("writable graph")
-        .is_empty()
-        .map_err(graph_error)?
-    {
+    if graph.is_empty().map_err(graph_error)? {
         return Ok(Vec::new());
     }
     state.entities.list_ids_for_file(file_id)
+}
+
+fn graph_disabled() -> EngineError {
+    EngineError::unsupported("graph indexing is disabled")
 }
 
 fn graph_error(error: graph::Error) -> EngineError {
