@@ -26,7 +26,16 @@ use zg_engine::{
     authorization::IndexAuthorization,
 };
 
-use crate::{ColorMode, theme::StatusTheme};
+use crate::{
+    ColorMode,
+    theme::{StatusTheme, clean, display_path},
+};
+
+const NO_INDEX_PREFIX: &str = "The directory ";
+const NO_INDEX_SUFFIX: &str = " has not been indexed yet.";
+const COMPACT_NO_INDEX_PREFIX: &str = "Not indexed: ";
+const LOCAL_MODEL_TABS: &str = "  [ Local models ]    Remote models";
+const REMOTE_MODEL_TABS: &str = "    Local models    [ Remote models ]";
 
 struct TerminalSession {
     was_raw: bool,
@@ -56,6 +65,92 @@ fn cancelled(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+fn color_model_tabs(line: &str, theme: StatusTheme) -> String {
+    let Some(start) = line.find('[') else {
+        return theme.muted(line);
+    };
+    let end = line[start..]
+        .find(']')
+        .map_or(line.len(), |offset| start + offset + 1);
+    format!(
+        "{}{}{}",
+        theme.muted(&line[..start]),
+        theme.selected_tab(&line[start..end]),
+        theme.muted(&line[end..])
+    )
+}
+
+fn color_model_row(line: &str, theme: StatusTheme) -> String {
+    if line.trim_start().starts_with('›') {
+        theme.success(line)
+    } else {
+        line.to_owned()
+    }
+}
+
+fn directory_title(root: &Path) -> String {
+    format!(
+        "{NO_INDEX_PREFIX}{}{NO_INDEX_SUFFIX}",
+        clean(&display_path(root))
+    )
+}
+
+fn character_columns(character: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+}
+
+fn title_ranges(title: &str, columns: u16) -> Vec<std::ops::Range<usize>> {
+    let width = usize::from(columns).max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < title.len() {
+        let mut used_columns = 0;
+        let mut end = start;
+        for character in title[start..].chars() {
+            let next_columns = used_columns + character_columns(character);
+            if end > start && next_columns > width {
+                break;
+            }
+            used_columns = next_columns;
+            end += character.len_utf8();
+        }
+        if end < title.len()
+            && let Some(space) = title[start..end].rfind(' ')
+            && title[start..start + space]
+                .chars()
+                .map(character_columns)
+                .sum::<usize>()
+                >= width / 2
+        {
+            end = start + space + 1;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
+fn color_directory_title(title: &str, columns: u16, theme: StatusTheme) -> Vec<String> {
+    let (path_start, path_end) = if title.starts_with(NO_INDEX_PREFIX) {
+        (NO_INDEX_PREFIX.len(), title.len() - NO_INDEX_SUFFIX.len())
+    } else {
+        (COMPACT_NO_INDEX_PREFIX.len().min(title.len()), title.len())
+    };
+    title_ranges(title, columns)
+        .into_iter()
+        .map(|row| {
+            let start = path_start.clamp(row.start, row.end);
+            let end = path_end.clamp(row.start, row.end);
+            format!(
+                "{}{}{}",
+                theme.warning(&title[row.start..start]),
+                theme.path(&title[start..end]),
+                theme.warning(&title[end..row.end])
+            )
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct Screen {
     lines: u16,
@@ -83,11 +178,20 @@ impl Screen {
     }
 
     fn draw(&mut self, lines: &[String], color: ColorMode) -> io::Result<()> {
+        self.draw_with_model_styles(lines, color, false)
+    }
+
+    fn draw_with_model_styles(
+        &mut self,
+        lines: &[String],
+        color: ColorMode,
+        model_selection: bool,
+    ) -> io::Result<()> {
         let columns = terminal::size()
             .map_or(80, |(columns, _)| columns)
             .saturating_sub(1);
         let theme = StatusTheme::new(color, crate::stderr_supports_ansi());
-        let body = render_screen(lines, usize::from(columns), theme);
+        let body = render_screen(lines, usize::from(columns), theme, model_selection);
         if body == self.body {
             return Ok(());
         }
@@ -97,17 +201,43 @@ impl Screen {
         let mut output = io::stderr().lock();
         output.write_all(&frame)?;
         output.flush()?;
-        self.lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        self.lines = u16::try_from(
+            std::str::from_utf8(&body)
+                .expect("rendered UTF-8 screen")
+                .lines()
+                .count(),
+        )
+        .unwrap_or(u16::MAX);
         self.body = body;
         Ok(())
     }
 }
 
-fn render_screen(lines: &[String], columns: usize, theme: StatusTheme) -> Vec<u8> {
+fn render_screen(
+    lines: &[String],
+    columns: usize,
+    theme: StatusTheme,
+    model_selection: bool,
+) -> Vec<u8> {
     let mut body = String::new();
-    for line in lines {
+    for (index, line) in lines.iter().enumerate() {
+        if model_selection && index == 0 {
+            for row in
+                color_directory_title(line, u16::try_from(columns).unwrap_or(u16::MAX), theme)
+            {
+                body.push_str(&row);
+                body.push_str("\r\n");
+            }
+            continue;
+        }
+        let model_tabs =
+            model_selection && matches!(line.as_str(), LOCAL_MODEL_TABS | REMOTE_MODEL_TABS);
         let line = crate::theme::truncate(line, columns);
-        let styled = if let Some(selected) = line.strip_prefix("  ✓ ") {
+        let styled = if model_tabs {
+            color_model_tabs(&line, theme)
+        } else if model_selection && (line.starts_with("  › ") || line.starts_with("    ")) {
+            color_model_row(&line, theme)
+        } else if let Some(selected) = line.strip_prefix("  ✓ ") {
             format!("  {} {selected}", theme.success("✓"))
         } else if let Some(error) = line.strip_prefix("  × ") {
             format!("  {} {error}", theme.danger("×"))
@@ -209,44 +339,54 @@ impl ModelSelection {
         None
     }
 
-    fn lines(&self, root: &Path, height: u16) -> Vec<String> {
+    fn lines(&self, root: &Path, columns: u16, height: u16) -> Vec<String> {
+        let mut title = directory_title(root);
+        let title_budget = usize::from(height.saturating_sub(10).max(1));
+        if title_ranges(&title, columns.saturating_sub(1)).len() > title_budget {
+            // Preserve space for the active model and controls on a short terminal.
+            let width = usize::from(columns.saturating_sub(1));
+            let compact = format!("{COMPACT_NO_INDEX_PREFIX}{}", clean(&display_path(root)));
+            title = format!(
+                "{}{}",
+                crate::theme::truncate(&compact, width.saturating_sub(3)),
+                ".".repeat(width.min(3))
+            );
+        }
+        let title_rows = u16::try_from(title_ranges(&title, columns.saturating_sub(1)).len())
+            .unwrap_or(u16::MAX);
         let mut lines = vec![
-            "Set up workspace index".into(),
-            format!("  {}", crate::theme::display_path(root)),
+            title,
             String::new(),
-            "Select an embedding model".into(),
+            "Choose a model to build the index and continue this search.".into(),
             String::new(),
             if self.tab == 0 {
-                "  [ Local models ]    Remote models"
+                LOCAL_MODEL_TABS
             } else {
-                "    Local models    [ Remote models ]"
+                REMOTE_MODEL_TABS
             }
             .into(),
             String::new(),
         ];
         let choices = self.choices();
-        let visible = usize::from(height.saturating_sub(11)).clamp(1, 12);
+        let visible =
+            usize::from(height.saturating_sub(10_u16.saturating_add(title_rows))).clamp(1, 12);
         let active = self.positions[self.tab];
         let start = active.saturating_sub(visible - 1);
         let width = choices
             .iter()
-            .map(|model| model.reference.len())
+            .map(|model| model.reference.chars().count())
             .max()
             .unwrap_or(0);
         for (index, model) in choices.iter().enumerate().skip(start).take(visible) {
             let status = if model.local {
                 if model.downloaded {
-                    "Downloaded"
+                    "Downloaded".to_owned()
                 } else {
-                    "Download required"
+                    model.download_bytes.map_or_else(
+                        || "Download needed".to_owned(),
+                        |bytes| format!("Download {} MiB", bytes.div_ceil(1024 * 1024)),
+                    )
                 }
-                .to_owned()
-                    + &model
-                        .download_bytes
-                        .filter(|_| !model.downloaded)
-                        .map_or_else(String::new, |bytes| {
-                            format!(" · {} MiB", bytes.div_ceil(1024 * 1024))
-                        })
             } else {
                 if model.credential_available {
                     "Credential available"
@@ -257,7 +397,7 @@ impl ModelSelection {
             };
             lines.push(format!(
                 "  {} {:width$}  {status}",
-                if index == active { "✓" } else { " " },
+                if index == active { "›" } else { " " },
                 model.reference
             ));
         }
@@ -269,8 +409,12 @@ impl ModelSelection {
         }
         lines.push(String::new());
         lines.push(format!(
-            "  ↑/↓ Select · ←/→ Tab Switch · Enter {} · Esc Cancel",
-            if self.tab == 0 { "Build" } else { "Continue" }
+            "  ↑/↓ Select · ←/→ or Tab Switch · Enter {} · Esc Cancel",
+            if self.tab == 0 {
+                "Build & search"
+            } else {
+                "Continue"
+            }
         ));
         if choices.get(active).is_some_and(|model| !model.available()) {
             lines.push("  ! An API Key is required before building.".into());
@@ -285,10 +429,8 @@ impl ModelSelection {
         let _terminal = TerminalSession::new()?;
         let mut screen = Screen::default();
         loop {
-            screen.draw(
-                &self.lines(root, terminal::size().map_or(24, |(_, height)| height)),
-                color,
-            )?;
+            let (columns, height) = terminal::size().unwrap_or((80, 24));
+            screen.draw_with_model_styles(&self.lines(root, columns, height), color, true)?;
             if let Event::Key(key) = event::read()?
                 && let Some(result) = self.key(key)
             {
@@ -520,7 +662,7 @@ mod tests {
         assert!(!missing.credential_available);
         picker.set_provider_credential_available("remote");
         assert_eq!(picker.positions, [1, 0]);
-        let lines = picker.lines(Path::new("/workspace"), 24).join("\n");
+        let lines = picker.lines(Path::new("/workspace"), 80, 24).join("\n");
         assert!(!lines.contains("Missing API credential"));
         assert!(lines.contains("Credential available"));
         picker.key(key(KeyCode::Left));
@@ -541,9 +683,10 @@ mod tests {
         let mut picker = ModelSelection::new(&setup);
         assert_eq!(picker.tab, 0);
         picker.key(key(KeyCode::Down));
-        let lines = picker.lines(Path::new("/workspace"), 12).join("\n");
-        assert!(lines.contains("✓ local/two"));
-        assert!(lines.contains("Select an embedding model"));
+        let lines = picker.lines(Path::new("/workspace"), 80, 11).join("\n");
+        assert!(lines.contains("› local/two"));
+        assert!(lines.contains("The directory /workspace has not been indexed yet."));
+        assert!(lines.contains("Choose a model to build the index and continue this search."));
         assert!(!lines.contains("local/one"));
         assert!(lines.contains("Esc Cancel"));
     }
@@ -561,6 +704,7 @@ mod tests {
             &lines,
             80,
             StatusTheme::new(ColorMode::Never, true),
+            false,
         ))
         .expect("UTF-8 screen");
         assert!(!plain.contains('\x1b'));
@@ -570,6 +714,7 @@ mod tests {
             &lines,
             80,
             StatusTheme::new(ColorMode::Always, true),
+            false,
         ))
         .expect("UTF-8 screen");
         assert!(colored.contains("✓\x1b[0m local/model"));
@@ -583,9 +728,58 @@ mod tests {
             &["  /工作目录/project".into()],
             8,
             StatusTheme::new(ColorMode::Never, true),
+            false,
         );
         let text = String::from_utf8(body).expect("UTF-8 screen");
         assert!(unicode_width::UnicodeWidthStr::width(text.trim_end()) <= 8);
         assert!(!text.contains("project"));
+    }
+
+    #[test]
+    fn model_screen_preserves_wrapped_paths_and_colors_tabs_and_selection() {
+        let title = directory_title(Path::new("/工作目录/project/long-directory"));
+        let rows = color_directory_title(&title, 24, StatusTheme::new(ColorMode::Never, true));
+        assert_eq!(rows.concat(), title);
+        assert!(
+            rows.iter()
+                .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= 24)
+        );
+
+        let lines = vec![
+            title,
+            LOCAL_MODEL_TABS.to_owned(),
+            "  › local/potion-code-16m-v2  Downloaded".to_owned(),
+        ];
+        let colored = String::from_utf8(render_screen(
+            &lines,
+            100,
+            StatusTheme::new(ColorMode::Always, true),
+            true,
+        ))
+        .expect("UTF-8 screen");
+        assert!(colored.contains("\x1b[1;36m[ Local models ]\x1b[0m"));
+        assert!(colored.contains("\x1b[32m  › local/potion-code-16m-v2 "));
+        let plain = render_screen(&lines, 100, StatusTheme::new(ColorMode::Never, true), true);
+        assert!(!plain.contains(&b'\x1b'));
+    }
+
+    #[test]
+    fn long_model_directory_leaves_room_for_selection_and_controls() {
+        let mut setup = setup();
+        setup.default_model = Some("local/one".into());
+        let picker = ModelSelection::new(&setup);
+        let root = format!("/workspace/{}", "long-directory/".repeat(20));
+        let lines = picker.lines(Path::new(&root), 40, 12);
+        let screen = String::from_utf8(render_screen(
+            &lines,
+            39,
+            StatusTheme::new(ColorMode::Never, true),
+            true,
+        ))
+        .expect("UTF-8 screen");
+        assert!(screen.lines().count() < 12);
+        assert!(screen.contains("› local/one"));
+        assert!(screen.contains("↑/↓ Select"));
+        assert!(screen.starts_with("Not indexed: "));
     }
 }

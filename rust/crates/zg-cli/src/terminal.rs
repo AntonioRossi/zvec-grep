@@ -3,32 +3,22 @@ use std::io::{self, IsTerminal};
 #[cfg(windows)]
 use winapi_util::{HandleRef, console};
 
-/// Checks stdout for ANSI support, enabling Windows virtual terminal processing.
+/// Checks stdout for automatic ANSI support, enabling Windows virtual terminal processing.
 #[must_use]
 pub fn stdout_supports_ansi() -> bool {
-    let terminal = io::stdout().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb");
+    let terminal = io::stdout().is_terminal();
     #[cfg(windows)]
-    {
-        terminal && enable_windows_ansi(&HandleRef::stdout())
-    }
-    #[cfg(not(windows))]
-    {
-        terminal
-    }
+    let terminal = terminal && enable_windows_ansi(&HandleRef::stdout());
+    terminal && std::env::var("TERM").as_deref() != Ok("dumb")
 }
 
-/// Checks stderr for ANSI support, enabling Windows virtual terminal processing.
+/// Checks stderr for automatic ANSI support, enabling Windows virtual terminal processing.
 #[must_use]
 pub fn stderr_supports_ansi() -> bool {
-    let terminal = io::stderr().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb");
+    let terminal = io::stderr().is_terminal();
     #[cfg(windows)]
-    {
-        terminal && enable_windows_ansi(&HandleRef::stderr())
-    }
-    #[cfg(not(windows))]
-    {
-        terminal
-    }
+    let terminal = terminal && enable_windows_ansi(&HandleRef::stderr());
+    terminal && std::env::var("TERM").as_deref() != Ok("dumb")
 }
 
 #[cfg(windows)]

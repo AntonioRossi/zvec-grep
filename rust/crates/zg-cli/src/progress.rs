@@ -209,6 +209,7 @@ impl PlainOutput {
 enum Stage {
     Scanning,
     Indexing,
+    FilesProcessed,
     Optimizing,
     Saving,
     Finishing,
@@ -222,6 +223,13 @@ impl Stage {
     fn of(progress: &IndexProgress) -> Self {
         if progress.phase == IndexProgressPhase::Done {
             return Self::Finishing;
+        }
+        if progress.phase == IndexProgressPhase::Finalizing {
+            return if progress.detail.as_deref() == Some(DETAIL_SAVING_INDEX) {
+                Self::Saving
+            } else {
+                Self::Optimizing
+            };
         }
         if let Some(stage) = progress
             .embedding
@@ -239,6 +247,13 @@ impl Stage {
             (_, Some(DETAIL_FINALIZING_INDEX)) => Self::Optimizing,
             (_, Some(DETAIL_SAVING_INDEX)) => Self::Saving,
             (IndexProgressPhase::Scanning, _) => Self::Scanning,
+            (IndexProgressPhase::Indexing, _)
+                if progress.files_total.is_some_and(|total| {
+                    total > 0 && progress.files_indexed.unwrap_or(0) >= total
+                }) =>
+            {
+                Self::FilesProcessed
+            }
             _ => Self::Indexing,
         }
     }
@@ -247,6 +262,7 @@ impl Stage {
         match self {
             Self::Scanning => "Scanning workspace",
             Self::Indexing => "Indexing files",
+            Self::FilesProcessed => "Files processed",
             Self::Optimizing => "Optimizing index",
             Self::Saving => "Saving index",
             Self::Finishing => "Finishing index",
@@ -484,6 +500,10 @@ fn format_terminal_progress(
             percent = Some(value);
             format!("{value:>3}%  {indexed}/{total}")
         }
+        Stage::FilesProcessed => {
+            let total = progress.files_total.unwrap_or(0);
+            format!("{total}/{total}")
+        }
         Stage::Downloading => {
             let embedding = progress.embedding.as_ref();
             let downloaded = embedding
@@ -604,6 +624,7 @@ fn format_progress(progress: &IndexProgress, terminal: bool) -> (String, String)
     }
     let label = match Stage::of(progress) {
         Stage::Scanning => "Scanning",
+        Stage::FilesProcessed => "Files processed",
         Stage::Optimizing => "Optimizing index",
         Stage::Saving => "Saving index",
         Stage::Finishing => "Finishing index",
@@ -1007,8 +1028,9 @@ mod tests {
             Duration::ZERO,
             0,
         );
-        assert!(line.contains("100%"));
-        assert!(!line.contains('░'));
+        assert!(line.contains("Files processed"));
+        assert!(line.contains("1000/1000"));
+        assert!(!line.contains("100%"));
         line.clear();
         format_terminal_progress(
             &mut line,
@@ -1080,6 +1102,7 @@ mod tests {
         }
         for detail in [DETAIL_FINALIZING_INDEX, DETAIL_SAVING_INDEX] {
             reporter.report(IndexProgress {
+                phase: IndexProgressPhase::Finalizing,
                 detail: Some(detail.into()),
                 ..indexing(10_000, 10_000)
             });
@@ -1139,7 +1162,7 @@ mod tests {
         let capture = Capture::default();
         let display = IndexProgressDisplay::terminal(capture.clone(), ColorMode::Never, true);
         display.reporter().report(IndexProgress {
-            detail: Some(DETAIL_FINALIZING_INDEX.into()),
+            phase: IndexProgressPhase::Finalizing,
             ..indexing(10, 10)
         });
         capture.wait_for_frames(3);
@@ -1153,6 +1176,40 @@ mod tests {
         assert!(!text.contains("100%"));
         assert!(!text.contains("\x1b[?25l"));
         assert!(!text.contains("\x1b[?25h"));
+    }
+
+    #[test]
+    fn finalizing_phase_identifies_optimization_and_saving() {
+        for detail in [
+            None,
+            Some(DETAIL_FINALIZING_INDEX),
+            Some(DETAIL_SAVING_INDEX),
+        ] {
+            let progress = IndexProgress {
+                phase: IndexProgressPhase::Finalizing,
+                detail: detail.map(str::to_owned),
+                ..indexing(10, 10)
+            };
+            let expected = if detail == Some(DETAIL_SAVING_INDEX) {
+                Stage::Saving
+            } else {
+                Stage::Optimizing
+            };
+            assert!(Stage::of(&progress) == expected);
+            let mut line = String::new();
+            format_terminal_progress(
+                &mut line,
+                &progress,
+                false,
+                true,
+                100,
+                Duration::from_secs(3),
+                0,
+            );
+            assert!(line.contains(expected.label()));
+            assert!(line.contains("3.0s elapsed"));
+            assert!(!line.contains("100%"));
+        }
     }
 
     #[test]
