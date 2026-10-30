@@ -8,7 +8,11 @@ const source = new URL("../../", import.meta.url);
 const guideName = "09-portable-indexes.md";
 const read = (name) => readFileSync(new URL(name, source), "utf8");
 
-for (const entry of ["README.md", "docs/README.md", "docs/03-mcp.md"]) {
+for (const entry of [
+  "README.md",
+  "docs/README.md",
+  "docs/design/portable-workspace-index.md",
+]) {
   test(`portability discovery: ${entry} links to the move guide`, () => {
     const content = read(entry);
     const links = [...content.matchAll(/\]\(([^)]+)\)/g)].map((m) => m[1]);
