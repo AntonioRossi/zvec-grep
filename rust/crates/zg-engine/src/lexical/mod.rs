@@ -460,7 +460,7 @@ fn build_walker(
         checked_paths
             .existing
             .iter()
-            .map(|path| resolve_path(root, path))
+            .map(|path| resolve_match_path(root, path))
             .collect()
     };
     let mut walker = WalkBuilder::from_iter(paths);
@@ -873,6 +873,52 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+/// Resolves a search path whose descendants are matched against globs and ignore files.
+///
+/// The `ignore` crate strips the workspace root from candidates as a byte
+/// prefix, so `<root>/./src/a.rs` would be matched as `./src/a.rs` and miss
+/// `src/**`. Absolute paths are kept as given, as ripgrep keeps them. A
+/// trailing `/` or `/.` is kept, so a file named as a directory still fails
+/// to walk.
+fn resolve_match_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    // Only the relative input is normalized: the root must keep its exact
+    // spelling (for example a `//` prefix) to match the override root.
+    let relative: PathBuf = path
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    // `.`, `./` and `./.` name the root itself, which needs no trailing marker.
+    if relative.as_os_str().is_empty() {
+        return root.to_path_buf();
+    }
+    let mut resolved = root.join(relative);
+    if !path
+        .components()
+        .any(|component| matches!(component, Component::Normal(_)))
+    {
+        return resolved;
+    }
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let separator_at = |index: usize| {
+        bytes
+            .get(index)
+            .is_some_and(|&byte| std::path::is_separator(byte.into()))
+    };
+    let last = bytes.len() - 1;
+    let marker = if separator_at(last) {
+        std::path::MAIN_SEPARATOR_STR
+    } else if bytes[last] == b'.' && last > 0 && separator_at(last - 1) {
+        if cfg!(windows) { "\\." } else { "/." }
+    } else {
+        ""
+    };
+    resolved.as_mut_os_string().push(marker);
+    resolved
 }
 
 fn is_hard_ignored_path(path: &Path) -> bool {
@@ -1618,6 +1664,46 @@ mod tests {
         unfiltered.options.no_ignore = true;
         let reply = search(&LexicalSearchService::new(), root.path(), &unfiltered).await;
         assert_eq!(reply.matches.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn path_rules_match_search_paths_with_a_current_directory_prefix() {
+        let root = TempDir::new().expect("temp dir");
+        fs::create_dir(root.path().join("src")).expect("src dir");
+        fs::create_dir(root.path().join("docs")).expect("docs dir");
+        fs::write(root.path().join("src/keep.rs"), "needle\n").expect("src fixture");
+        fs::write(root.path().join("docs/drop.rs"), "needle\n").expect("docs fixture");
+        fs::write(root.path().join("custom.ignore"), "docs/*.rs\n").expect("ignore fixture");
+
+        let mut failures = Vec::new();
+        for (paths, rule) in [
+            (&[][..], "src/**"),
+            (&["."][..], "src/**"),
+            (&["./"][..], "src/**"),
+            (&["./."][..], "src/**"),
+            (&["./src"][..], "src/*.rs"),
+            (&["."][..], "!docs/**"),
+            (&["./docs", "./src"][..], "!docs/**"),
+            (&[][..], "--ignore-file custom.ignore"),
+            (&["."][..], "--ignore-file custom.ignore"),
+        ] {
+            let mut filtered = request("needle");
+            filtered.paths = paths.iter().map(PathBuf::from).collect();
+            match rule.strip_prefix("--ignore-file ") {
+                Some(file) => filtered.options.ignore_files = vec![PathBuf::from(file)],
+                None => filtered.options.globs = vec![rule.to_owned()],
+            }
+            let reply = search(&LexicalSearchService::new(), root.path(), &filtered).await;
+            let found = reply
+                .matches
+                .iter()
+                .map(|item| item.relative_path().to_path_buf())
+                .collect::<Vec<_>>();
+            if found != [Path::new("src/keep.rs")] {
+                failures.push(format!("paths {paths:?} {rule}: {found:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }
 

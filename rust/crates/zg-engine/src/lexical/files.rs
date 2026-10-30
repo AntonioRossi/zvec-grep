@@ -190,6 +190,7 @@ fn apply_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::context::options::RgGlob;
 
     #[tokio::test]
     async fn zero_size_limit_excludes_empty_and_explicit_files() {
@@ -221,6 +222,99 @@ mod tests {
                 .expect("file listing with policy");
             assert!(result.paths.is_empty());
             assert!(result.errors.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_inputs_spelled_as_directories_report_errors() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(root.path().join("src")).expect("src dir");
+        std::fs::write(root.path().join("src/keep.rs"), "needle\n").expect("source file");
+        for input in [
+            "src/keep.rs/",
+            "src/keep.rs/.",
+            "./src/keep.rs/",
+            "./src/keep.rs/.",
+        ] {
+            let result = list(FilesOptions {
+                root: Some(root.path().to_path_buf()),
+                paths: vec![PathBuf::from(input)],
+                ..FilesOptions::default()
+            })
+            .await
+            .expect("file listing");
+            assert!(result.paths.is_empty(), "{input}: {:?}", result.paths);
+            assert_eq!(result.errors.len(), 1, "{input}: {:?}", result.errors);
+            assert!(
+                result.errors[0].contains("keep.rs/")
+                    && result.errors[0].contains("Not a directory"),
+                "{input}: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn path_globs_match_inputs_with_a_current_directory_prefix() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(root.path().join("src")).expect("src dir");
+        std::fs::create_dir(root.path().join("docs")).expect("docs dir");
+        std::fs::write(root.path().join("src/keep.rs"), "").expect("src file");
+        std::fs::write(root.path().join("docs/drop.rs"), "").expect("docs file");
+        for input in [".", "./", "./src/"] {
+            let result = list(FilesOptions {
+                root: Some(root.path().to_path_buf()),
+                paths: vec![PathBuf::from(input)],
+                globs: vec![RgGlob {
+                    pattern: "src/**".to_owned(),
+                    case_insensitive: false,
+                }],
+                ..FilesOptions::default()
+            })
+            .await
+            .expect("file listing");
+            assert_eq!(result.paths, [Path::new("./src/keep.rs")], "{input}");
+            assert!(result.errors.is_empty(), "{input}: {:?}", result.errors);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_globs_match_inputs_under_a_double_slash_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("src")).expect("src dir");
+        std::fs::write(workspace.path().join("src/keep.rs"), "").expect("src file");
+        // `std::path::absolute` keeps exactly two leading slashes on Unix.
+        let root = PathBuf::from(format!("/{}", workspace.path().display()));
+        for (input, pattern, expected) in [
+            ("src", "src/**", 1),
+            ("./src", "src/**", 1),
+            ("src", "!src/**", 0),
+            ("./src", "!src/**", 0),
+        ] {
+            let result = list(FilesOptions {
+                root: Some(root.clone()),
+                paths: vec![PathBuf::from(input)],
+                globs: vec![RgGlob {
+                    pattern: pattern.to_owned(),
+                    case_insensitive: false,
+                }],
+                ..FilesOptions::default()
+            })
+            .await
+            .expect("file listing");
+            assert_eq!(
+                result.paths.len(),
+                expected,
+                "{input} {pattern}: {:?}",
+                result.paths
+            );
+            assert!(
+                result.errors.is_empty(),
+                "{input} {pattern}: {:?}",
+                result.errors
+            );
         }
     }
 
