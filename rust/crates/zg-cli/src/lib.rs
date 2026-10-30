@@ -947,33 +947,57 @@ fn action_for_flag(value: &OsStr) -> Option<&'static str> {
 #[must_use]
 pub fn compatibility_warning_for_args(arguments: &[OsString]) -> Option<String> {
     let first = arguments.first()?.to_str()?;
-    if matches!(first, "query" | "search") {
-        return Some(format!(
-            "Warning: \"{first}\" is search text. Omit it to search the remaining words."
-        ));
+    let purpose = match first {
+        "query" | "search" => None,
+        "index" => Some("To build the index"),
+        "status" => Some("To show workspace and index status"),
+        "install" => Some("To install agent integrations"),
+        "uninstall" => Some("To remove agent integrations"),
+        "config" => Some("To manage configuration"),
+        "auth" => Some("To manage workspace authorization"),
+        "server" => Some("To manage the server"),
+        "help" => Some("To display help"),
+        "version" => Some("To display the CLI version"),
+        _ => return None,
+    };
+    let parsed =
+        Cli::try_parse_from(std::iter::once(OsString::from("zg")).chain(arguments.iter().cloned()));
+    if let Ok(cli) = &parsed
+        && !matches!(&cli.command, Some(CommandLine::Query(_)))
+    {
+        return None;
     }
-    if matches!(
-        first,
-        "index"
-            | "status"
-            | "install"
-            | "uninstall"
-            | "config"
-            | "auth"
-            | "server"
-            | "help"
-            | "version"
-    ) {
-        let purpose = if first == "version" {
-            "To display the CLI version"
-        } else {
-            "To run this command"
-        };
-        return Some(format!(
-            "Warning: `zg {first}` is legacy syntax and now searches for \"{first}\".\n         {purpose}, use `zg --{first}`."
-        ));
-    }
-    None
+    let parts = parsed
+        .ok()
+        .and_then(|cli| {
+            let Some(CommandLine::Query(args)) = cli.command else {
+                return None;
+            };
+            validate_query(&args, resolve_query_mode(&args).ok()?).ok()?;
+            // Managed-rg positional arguments include paths, not additional search words.
+            (!args.rg).then(|| {
+                args.positional_query_parts()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_else(|| vec![first.to_owned()]);
+    let text = parts.join(" ");
+    let remaining = parts[1..].join(" ");
+    let full = if purpose.is_none() && !remaining.is_empty() {
+        "full "
+    } else {
+        ""
+    };
+    let warning =
+        format!("Warning: `{first}` is not a subcommand; the {full}search text is {text:?}.");
+    Some(if let Some(purpose) = purpose {
+        format!("{warning}\n         {purpose}, use `zg --{first}`.")
+    } else if !remaining.is_empty() {
+        format!("{warning}\n         To search for {remaining:?} only, use `zg -- {remaining}`.")
+    } else {
+        warning
+    })
 }
 
 fn index_concurrency_flag(text: &str) -> bool {
@@ -1052,10 +1076,12 @@ fn normalize_command(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, clap
     }
     let mut action = None;
     let mut help_requested = false;
+    let mut positional_indices = Vec::new();
     let mut index_concurrency_requested = false;
     let mut index = 1;
     while let Some(argument) = arguments.get(index) {
         if argument == OsStr::new("--") {
+            positional_indices.extend(index + 1..arguments.len());
             break;
         }
         if let Some(command) = action_for_flag(argument)
@@ -1075,6 +1101,9 @@ fn normalize_command(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, clap
             ));
         }
         index_concurrency_requested |= index_concurrency_flag(&text);
+        if !text.starts_with('-') || text == "-" {
+            positional_indices.push(index);
+        }
         index += if query_option_with_value(&text)
             || managed_rg::takes_separate_value(&text)
             || management_option_with_value(&text)
@@ -1085,27 +1114,38 @@ fn normalize_command(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, clap
         };
     }
     validate_index_concurrency_scope(index_concurrency_requested, action)?;
-    let command = if let Some((index, command)) = action {
-        arguments.remove(index);
-        command
-    } else {
-        "query"
-    };
     if help_requested {
+        let topic = if let Some((_, command)) = action {
+            command
+        } else {
+            positional_help_topic(&arguments, &positional_indices).unwrap_or("search")
+        }
+        .to_owned();
         arguments.truncate(1);
         arguments.push("help".into());
-        arguments.push(
-            if command == "query" {
-                "search"
-            } else {
-                command
-            }
-            .into(),
-        );
+        arguments.push(topic.into());
     } else {
+        let command = if let Some((index, command)) = action {
+            arguments.remove(index);
+            command
+        } else {
+            "query"
+        };
         arguments.insert(1, command.into());
     }
     Ok(arguments)
+}
+
+fn positional_help_topic<'a>(
+    arguments: &'a [OsString],
+    positional_indices: &[usize],
+) -> Option<&'a str> {
+    let [index] = positional_indices else {
+        return None;
+    };
+    arguments[*index]
+        .to_str()
+        .filter(|topic| help_text(Some(topic)).is_ok())
 }
 
 fn normalize_query_argument_order(arguments: Vec<OsString>) -> (Vec<OsString>, usize) {
@@ -1726,7 +1766,7 @@ mod tests {
     use super::{
         Cli, CliPlan, FileFormat, IndexOperation, QueryFilter, parse_byte_size, parse_modified_time,
     };
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
     fn plan(arguments: &[&str]) -> CliPlan {
         Cli::try_parse_from(arguments.iter().copied())
@@ -2065,10 +2105,9 @@ mod tests {
             let arguments = [word.into(), "second".into()];
             let warning =
                 super::compatibility_warning_for_args(&arguments).expect("migration warning");
-            if matches!(word, "query" | "search") {
-                assert!(warning.contains(&format!("\"{word}\" is search text.")));
-            } else {
-                assert!(warning.contains(&format!("now searches for \"{word}\".")));
+            assert!(warning.contains(&format!("`{word}` is not a subcommand;")));
+            assert!(warning.contains(&format!("search text is \"{word} second\".")));
+            if !matches!(word, "query" | "search") {
                 assert!(warning.contains(&format!("`zg --{word}`")));
             }
         }
@@ -2076,6 +2115,146 @@ mod tests {
             assert!(
                 super::compatibility_warning_for_args(&[word.into(), "query".into()]).is_none()
             );
+        }
+    }
+
+    #[test]
+    fn query_and_search_warnings_show_the_full_search_text_and_optional_hint() {
+        for word in ["query", "search"] {
+            for suffix in [
+                vec![],
+                vec![""],
+                vec!["--limit", "3"],
+                vec!["--rg", "source.txt"],
+            ] {
+                let arguments = std::iter::once(word)
+                    .chain(suffix)
+                    .map(OsString::from)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    super::compatibility_warning_for_args(&arguments).expect("migration warning"),
+                    format!(
+                        "Warning: `{word}` is not a subcommand; the search text is \"{word}\"."
+                    )
+                );
+            }
+            for (suffix, remaining) in [
+                (vec!["server"], "server"),
+                (vec!["--limit", "3", "server"], "server"),
+                (vec!["server", "--color=never", "--limit", "3"], "server"),
+                (vec!["", " server ", ""], "server"),
+                (vec!["connection", "pool"], "connection pool"),
+                (
+                    vec!["connection pool", "timeout"],
+                    "connection pool timeout",
+                ),
+                (
+                    vec!["as", "--", "--index", "--drop", "--yes"],
+                    "as --index --drop --yes",
+                ),
+            ] {
+                let arguments = std::iter::once(word)
+                    .chain(suffix)
+                    .map(OsString::from)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    super::compatibility_warning_for_args(&arguments).expect("migration warning"),
+                    format!(
+                        "Warning: `{word}` is not a subcommand; the full search text is \"{word} {remaining}\".\n         To search for \"{remaining}\" only, use `zg -- {remaining}`."
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn suggested_search_commands_preserve_literal_management_flags() {
+        for word in ["query", "search"] {
+            let arguments = [word, "as", "--", "--index", "--drop", "--yes"].map(OsString::from);
+            let warning =
+                super::compatibility_warning_for_args(&arguments).expect("migration warning");
+            let command = warning.rsplit('`').nth(1).expect("suggested command");
+            let arguments = command.split_whitespace().collect::<Vec<_>>();
+            let CliPlan::Query { request, .. } = plan(&arguments) else {
+                panic!("the suggested command must search, not run a management action")
+            };
+            assert_eq!(request.queries, ["as --index --drop --yes"]);
+            let arguments = arguments[1..]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            assert!(super::compatibility_warning_for_args(&arguments).is_none());
+        }
+    }
+
+    #[test]
+    fn index_warning_explains_how_to_build_the_index() {
+        for suffix in [vec![], vec!["--limit", "3"], vec!["--drop", "--yes"]] {
+            let arguments = std::iter::once("index")
+                .chain(suffix)
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::compatibility_warning_for_args(&arguments).expect("migration warning"),
+                "Warning: `index` is not a subcommand; the search text is \"index\".\n         To build the index, use `zg --index`."
+            );
+        }
+    }
+
+    #[test]
+    fn management_warnings_show_the_search_text_and_specific_action() {
+        for (word, purpose) in [
+            ("status", "To show workspace and index status"),
+            ("install", "To install agent integrations"),
+            ("uninstall", "To remove agent integrations"),
+            ("config", "To manage configuration"),
+            ("auth", "To manage workspace authorization"),
+            ("server", "To manage the server"),
+            ("help", "To display help"),
+            ("version", "To display the CLI version"),
+        ] {
+            for (suffix, tail) in [
+                (vec![], ""),
+                (vec!["--limit", "3"], ""),
+                (vec!["second", "--limit", "3"], " second"),
+                (vec!["--rg", "source.txt"], ""),
+            ] {
+                let arguments = std::iter::once(word)
+                    .chain(suffix)
+                    .map(OsString::from)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    super::compatibility_warning_for_args(&arguments).expect("migration warning"),
+                    format!(
+                        "Warning: `{word}` is not a subcommand; the search text is \"{word}{tail}\".\n         {purpose}, use `zg --{word}`."
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn action_and_help_flags_do_not_warn_about_search_text() {
+        for word in [
+            "query",
+            "search",
+            "index",
+            "status",
+            "install",
+            "uninstall",
+            "config",
+            "auth",
+            "server",
+            "help",
+            "version",
+        ] {
+            for flag in ["--help", "--status", "--index"] {
+                let arguments = [word.into(), flag.into()];
+                assert!(
+                    super::compatibility_warning_for_args(&arguments).is_none(),
+                    "{arguments:?}"
+                );
+            }
         }
     }
 
@@ -2142,6 +2321,64 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
         }
+    }
+
+    #[test]
+    fn a_single_known_positional_selects_its_help_topic() {
+        for topic in [
+            "search",
+            "index",
+            "status",
+            "config",
+            "auth",
+            "server",
+            "install",
+            "uninstall",
+            "help",
+            "models",
+            "file-types",
+            "environment",
+            "env",
+            "version",
+        ] {
+            for flag in ["--help", "-h"] {
+                for arguments in [
+                    vec!["zg", topic, flag],
+                    vec!["zg", "--mode", "direct", topic, flag],
+                    vec!["zg", topic, "--mode", "server", flag],
+                    vec!["zg", "--limit", "3", topic, flag],
+                ] {
+                    assert!(
+                        matches!(plan(&arguments), CliPlan::Help(Some(actual)) if actual == topic),
+                        "{arguments:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn other_positional_help_requests_keep_the_search_context() {
+        for arguments in [
+            vec!["zg", "asdf", "afsd", "asd", "asdf", "--help"],
+            vec!["zg", "server", "timeout", "--help"],
+            vec!["zg", "server timeout", "--help"],
+            vec!["zg", "query", "--help"],
+            vec!["zg", "--mode", "server", "--help"],
+            vec!["zg", "--mode=server", "--help"],
+            vec!["zg", "--rg", "-e", "server", "--help"],
+            vec!["zg", "--glob", "server", "--help"],
+            vec!["zg", "server", "--help", "--", "timeout"],
+            vec!["zg", "server", "timeout", "-h"],
+        ] {
+            assert!(
+                matches!(plan(&arguments), CliPlan::Help(Some(topic)) if topic == "search"),
+                "{arguments:?}"
+            );
+        }
+        assert!(
+            matches!(plan(&["zg", "models", "--status", "--help"]), CliPlan::Help(Some(topic)) if topic == "status")
+        );
     }
 
     fn server_option_expected(case: &zg_testkit::ServerOptionCase) -> Option<PathBuf> {
