@@ -1,4 +1,4 @@
-use crate::ColorMode;
+use crate::{ColorMode, terminal::terminal_character_width};
 use std::fmt::Write as _;
 use std::{
     io::{self, Write},
@@ -89,6 +89,7 @@ impl IndexProgressDisplay {
                 stage: None,
                 stage_started: Instant::now(),
                 frame: String::with_capacity(512),
+                previous_line: String::new(),
                 visible: false,
                 columns: 80,
                 width_checked: None,
@@ -282,6 +283,7 @@ struct TerminalOutput {
     stage: Option<Stage>,
     stage_started: Instant,
     frame: String,
+    previous_line: String,
     visible: bool,
     columns: usize,
     width_checked: Option<Instant>,
@@ -346,6 +348,7 @@ impl TerminalOutput {
         if !warnings.is_empty() && self.visible {
             self.frame.push_str("\r\x1b[K");
         }
+        let warned = !warnings.is_empty();
         for warning in warnings {
             // Warnings are durable output, never a replaceable animation frame.
             // Keep their complete diagnostic text even on narrow terminals.
@@ -362,7 +365,7 @@ impl TerminalOutput {
                 .width_checked
                 .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
             {
-                self.columns = crossterm::terminal::size()
+                let columns = crossterm::terminal::size()
                     .ok()
                     .map(|(width, _)| usize::from(width))
                     .filter(|width| *width > 0)
@@ -372,14 +375,18 @@ impl TerminalOutput {
                             .and_then(|value| value.parse().ok())
                     })
                     .unwrap_or(80);
+                if self.columns != columns {
+                    self.previous_line.clear();
+                }
+                self.columns = columns;
                 self.width_checked = Some(now);
             }
             // Signals can terminate explicit indexing without running Drop.
             // Preserve cursor visibility; interactive sessions own that state.
             self.visible = true;
-            self.frame.push('\r');
+            let mut line = String::new();
             format_terminal_progress(
-                &mut self.frame,
+                &mut line,
                 progress,
                 self.color,
                 self.unicode,
@@ -387,9 +394,22 @@ impl TerminalOutput {
                 now.duration_since(self.stage_started),
                 self.tick,
             );
-            // Overwrite first, erase only the old tail, and submit one complete
-            // frame. A standalone clear-line write causes visible flicker.
-            self.frame.push_str("\x1b[K");
+            // Overwrite the changed text before clearing the old tail, and
+            // submit one complete frame without a standalone clear-line write.
+            if warned || self.previous_line.is_empty() {
+                self.frame.push('\r');
+                self.frame.push_str(&line);
+                self.frame.push_str("\x1b[K");
+            } else if line != self.previous_line {
+                if let Some((byte, column)) = terminal_change_start(&self.previous_line, &line) {
+                    let _ = write!(self.frame, "\x1b[{}G{}\x1b[K", column + 1, &line[byte..]);
+                } else {
+                    self.frame.push('\r');
+                    self.frame.push_str(&line);
+                    self.frame.push_str("\x1b[K");
+                }
+            }
+            self.previous_line = line;
             self.tick = self.tick.wrapping_add(1);
         }
         if !self.frame.is_empty() {
@@ -413,6 +433,46 @@ impl Drop for TerminalOutput {
     fn drop(&mut self) {
         let _ = self.finish();
     }
+}
+
+fn terminal_change_start(previous: &str, next: &str) -> Option<(usize, usize)> {
+    let mut common = 0;
+    for (left, right) in previous.chars().zip(next.chars()) {
+        if left != right {
+            break;
+        }
+        common += left.len_utf8();
+    }
+    // A completed reset needs no replay because each previous frame ends in the default style.
+    let start = next[..common]
+        .rfind("\x1b[")
+        .filter(|&escape| !next[escape..common].starts_with("\x1b[0m"))
+        .unwrap_or(common);
+    let column = terminal_visible_width(&next[..start])?;
+    (column > 0).then_some((start, column))
+}
+
+fn terminal_visible_width(value: &str) -> Option<usize> {
+    let mut characters = value.chars().peekable();
+    let mut width = 0;
+    while let Some(character) = characters.next() {
+        if character == '\x1b' && characters.peek() == Some(&'[') {
+            characters.next();
+            let mut complete = false;
+            for code in characters.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    complete = true;
+                    break;
+                }
+            }
+            if !complete {
+                return None;
+            }
+        } else {
+            width += terminal_character_width(character)?;
+        }
+    }
+    Some(width)
 }
 
 fn green(value: &str, color: bool) -> String {
@@ -531,7 +591,11 @@ fn format_terminal_progress(
         let _ = write!(suffix, "  {failed} failed");
     }
     let label = stage.label();
-    let glyph = spinner[tick % spinner.len()];
+    let glyph = if stage == Stage::Indexing && progress.files_total.is_some() {
+        spinner[0]
+    } else {
+        spinner[tick % spinner.len()]
+    };
     let prefix_width = 22; // glyph, gap, 18-column label, two spaces
     let bar_width = available
         .saturating_sub(prefix_width + suffix.len() + 2)
@@ -673,6 +737,7 @@ fn clean(value: &str, terminal: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthChar;
     use zg_engine::api::index::progress::IndexEmbeddingProgress;
     #[derive(Clone, Default)]
     struct Capture(Arc<(Mutex<Vec<Vec<u8>>>, Condvar)>);
@@ -723,6 +788,52 @@ mod tests {
             detail: None,
             embedding: None,
         }
+    }
+
+    // Replay the single-row CSI operations emitted by the progress renderer.
+    fn replay_line(frames: &[Vec<u8>], cjk: bool) -> String {
+        let mut cells = vec![' '; 100];
+        let mut column = 0;
+        for frame in frames {
+            let text = std::str::from_utf8(frame).expect("UTF-8 frame");
+            let mut characters = text.chars();
+            while let Some(character) = characters.next() {
+                match character {
+                    '\r' => column = 0,
+                    '\x1b' => {
+                        assert_eq!(characters.next(), Some('['));
+                        let mut parameters = String::new();
+                        let command = loop {
+                            let code = characters.next().expect("complete CSI sequence");
+                            if ('@'..='~').contains(&code) {
+                                break code;
+                            }
+                            parameters.push(code);
+                        };
+                        match command {
+                            'm' => {}
+                            'G' => column = parameters.parse::<usize>().expect("cursor column") - 1,
+                            'K' => cells[column..].fill(' '),
+                            _ => panic!("unexpected CSI command: {command}"),
+                        }
+                    }
+                    value => {
+                        let width = if cjk {
+                            value.width_cjk()
+                        } else {
+                            value.width()
+                        }
+                        .expect("printable progress character");
+                        if width > 0 {
+                            cells[column..column + width].fill(' ');
+                            cells[column] = value;
+                            column += width;
+                        }
+                    }
+                }
+            }
+        }
+        cells.into_iter().collect::<String>().trim_end().to_owned()
     }
 
     fn queued_display() -> IndexProgressDisplay {
@@ -882,6 +993,7 @@ mod tests {
             stage: None,
             stage_started: now,
             frame: String::new(),
+            previous_line: String::new(),
             visible: false,
             columns: 100,
             width_checked: Some(now),
@@ -1045,6 +1157,63 @@ mod tests {
     }
 
     #[test]
+    fn indexing_updates_preserve_counts_with_both_width_policies() {
+        for color in [false, true] {
+            for unicode in [false, true] {
+                let capture = Capture::default();
+                let now = Instant::now();
+                let mut output = TerminalOutput {
+                    writer: Box::new(capture.clone()),
+                    color,
+                    unicode,
+                    latest: None,
+                    stage: None,
+                    stage_started: now,
+                    frame: String::new(),
+                    previous_line: String::new(),
+                    visible: false,
+                    columns: 100,
+                    width_checked: Some(now),
+                    tick: 0,
+                };
+                output
+                    .render(Some(indexing(892, 20_936)), Vec::new(), now, false)
+                    .expect("first progress frame");
+                output
+                    .render(
+                        Some(indexing(893, 20_936)),
+                        Vec::new(),
+                        now + FRAME_INTERVAL,
+                        false,
+                    )
+                    .expect("next progress frame");
+                let frames = capture.frames();
+                assert_eq!(frames.len(), 2);
+                let reference = format!("\r{}\x1b[K", output.previous_line).into_bytes();
+                for cjk in [false, true] {
+                    let actual = replay_line(&frames, cjk);
+                    assert!(
+                        actual.contains("893/20936"),
+                        "color={color}, unicode={unicode}, cjk={cjk}: {actual:?}"
+                    );
+                    assert_eq!(actual, replay_line(std::slice::from_ref(&reference), cjk));
+                }
+                let frame = String::from_utf8_lossy(&frames[1]);
+                if unicode {
+                    assert!(frame.starts_with('\r'), "{frame:?}");
+                    assert!(frame.contains("Indexing files"), "{frame:?}");
+                } else {
+                    assert!(frame.starts_with("\x1b["), "{frame:?}");
+                    assert!(frame.ends_with("3/20936\x1b[K"), "{frame:?}");
+                    assert!(!frame.contains("Indexing files"), "{frame:?}");
+                    assert!(!frame.contains(['#', '-']), "{frame:?}");
+                    assert!(!frame.contains('%'), "{frame:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_blocked_terminal_write_does_not_block_progress_producers() {
         struct BlockedWriter {
             gate: Arc<(Mutex<bool>, Condvar)>,
@@ -1144,10 +1313,11 @@ mod tests {
         assert!(!text.contains("\x1b[?25l"));
         assert!(!text.contains("\x1b[?25h"));
         assert!(!text.contains("\x1b[2K"));
+        assert!(String::from_utf8_lossy(&frames[0]).contains("Indexing files"));
         for frame in &frames[..frames.len() - 1] {
             let frame = String::from_utf8_lossy(frame);
-            assert!(frame.contains("Indexing files"));
             assert!(frame.ends_with("\x1b[K"));
+            assert!(frame.starts_with('\r') || frame.starts_with("\x1b["));
         }
         reporter.report(indexing(10_000, 10_000));
         assert_eq!(

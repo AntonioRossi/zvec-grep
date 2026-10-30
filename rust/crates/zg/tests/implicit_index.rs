@@ -778,6 +778,43 @@ fn incompatible_parent_index_recovery_targets_the_discovered_workspace() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+fn implicit_query_index_progress_does_not_blank_the_live_line() {
+    for (mode, server) in [
+        ("direct", false),
+        ("auto", false),
+        ("server", true),
+        ("auto", true),
+    ] {
+        let mut fixture = Fixture::new();
+        if server {
+            fixture.start_server();
+        }
+        let mut command = fixture.command(&["--mode", mode, "--fts", "needle", "--color", "never"]);
+        command.env_remove("RUST_LOG");
+        let output = success(terminal::run(command, &[("Enter Build", b"\r")]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let (progress, _) = stderr
+            .split_once("Building index")
+            .and_then(|(_, remainder)| remainder.split_once("No indexable files"))
+            .unwrap_or_else(|| panic!("index progress between selection and query: {stderr}"));
+        assert!(
+            progress.contains("Scanning workspace") || progress.contains("Indexing files"),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            !progress.contains("\r\x1b[2K"),
+            "{mode}: index progress clears the live line before repainting it: {stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "No matches.\n",
+            "{mode}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
 fn configured_local_models_follow_environment_then_global_default_precedence() {
     for (configured, environment, expected) in [
         (

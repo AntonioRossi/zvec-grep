@@ -15,7 +15,7 @@ use std::{
 };
 
 use crossterm::{
-    cursor::{Hide, MoveToColumn, MoveUp, Show},
+    cursor::{Hide, MoveDown, MoveToColumn, MoveUp, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     queue,
     terminal::{self, Clear, ClearType},
@@ -63,6 +63,28 @@ impl Drop for TerminalSession {
 fn cancelled(key: KeyEvent) -> bool {
     key.code == KeyCode::Esc
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+struct RenderedLine {
+    text: String,
+    widths: Vec<usize>,
+}
+
+impl RenderedLine {
+    fn wrapped_rows(&self, columns: usize) -> usize {
+        let mut rows = 1;
+        let mut occupied = 0;
+        for &width in &self.widths {
+            let width = width.min(columns);
+            // A wide character wraps early when only the final column remains.
+            if occupied + width > columns {
+                rows += 1;
+                occupied = 0;
+            }
+            occupied += width;
+        }
+        rows
+    }
 }
 
 fn color_model_tabs(line: &str, theme: StatusTheme) -> String {
@@ -153,27 +175,48 @@ fn color_directory_title(title: &str, columns: u16, theme: StatusTheme) -> Vec<S
 
 #[derive(Default)]
 struct Screen {
-    lines: u16,
-    body: Vec<u8>,
+    lines: Vec<RenderedLine>,
+    size: Option<(u16, u16)>,
 }
 
 impl Screen {
-    fn rewind(&self, output: &mut impl Write) -> io::Result<()> {
+    fn rewind(&self, output: &mut impl Write, columns: u16, rows: u16) -> io::Result<()> {
+        let columns = usize::from(columns).max(1);
+        let reflowed = self
+            .size
+            .is_some_and(|(previous, _)| usize::from(previous.saturating_add(1)) != columns);
+        // A width change can reflow printed rows before redraw or exit.
+        let previous_rows = if reflowed {
+            self.lines
+                .iter()
+                .map(|line| line.wrapped_rows(columns))
+                .sum()
+        } else {
+            self.lines.len()
+        };
+        let visible_previous = previous_rows.min(usize::from(rows.saturating_sub(1)));
         queue!(output, MoveToColumn(0))?;
-        if self.lines > 0 {
-            queue!(output, MoveUp(self.lines))?;
+        if visible_previous > 0 {
+            queue!(
+                output,
+                MoveUp(u16::try_from(visible_previous).unwrap_or(u16::MAX))
+            )?;
         }
         queue!(output, Clear(ClearType::FromCursorDown))
     }
 
     fn clear(&mut self) -> io::Result<()> {
+        let (columns, rows) = terminal::size().unwrap_or_else(|_| {
+            self.size.map_or((80, 24), |(columns, rows)| {
+                (columns.saturating_add(1), rows)
+            })
+        });
         let mut frame = Vec::new();
-        self.rewind(&mut frame)?;
+        self.rewind(&mut frame, columns, rows)?;
         let mut output = io::stderr().lock();
         output.write_all(&frame)?;
         output.flush()?;
-        self.lines = 0;
-        self.body.clear();
+        self.lines.clear();
         Ok(())
     }
 
@@ -187,32 +230,72 @@ impl Screen {
         color: ColorMode,
         model_selection: bool,
     ) -> io::Result<()> {
-        let columns = terminal::size()
-            .map_or(80, |(columns, _)| columns)
-            .saturating_sub(1);
-        let theme = StatusTheme::new(color, crate::stderr_supports_ansi());
-        let body = render_screen(lines, usize::from(columns), theme, model_selection);
-        if body == self.body {
-            return Ok(());
-        }
-        let mut frame = Vec::with_capacity(body.len() + 24);
-        self.rewind(&mut frame)?;
-        frame.extend_from_slice(&body);
+        let (columns, rows) = terminal::size().unwrap_or((80, 24));
         let mut output = io::stderr().lock();
-        output.write_all(&frame)?;
-        output.flush()?;
-        self.lines = u16::try_from(
-            std::str::from_utf8(&body)
-                .expect("rendered UTF-8 screen")
-                .lines()
-                .count(),
+        self.draw_to(
+            &mut output,
+            lines,
+            columns.saturating_sub(1),
+            rows,
+            color,
+            model_selection,
         )
-        .unwrap_or(u16::MAX);
-        self.body = body;
+    }
+
+    fn draw_to(
+        &mut self,
+        output: &mut impl Write,
+        lines: &[String],
+        columns: u16,
+        rows: u16,
+        color: ColorMode,
+        model_selection: bool,
+    ) -> io::Result<()> {
+        let theme = StatusTheme::new(color, crate::stderr_supports_ansi());
+        let rendered = render_lines(lines, usize::from(columns), theme, model_selection);
+        let resized = self.size.is_some_and(|size| size != (columns, rows));
+        let previous_len = if resized { 0 } else { self.lines.len() };
+        let mut frame = Vec::new();
+        if resized {
+            self.rewind(&mut frame, columns.saturating_add(1), rows)?;
+        }
+        // Repaint only changed rows so navigation never blanks the whole prompt.
+        for (index, line) in rendered.iter().enumerate().take(previous_len) {
+            if self.lines[index].text == line.text {
+                continue;
+            }
+            let distance = u16::try_from(previous_len - index).unwrap_or(u16::MAX);
+            queue!(frame, MoveToColumn(0), MoveUp(distance))?;
+            write!(frame, "{}", line.text)?;
+            queue!(
+                frame,
+                Clear(ClearType::UntilNewLine),
+                MoveToColumn(0),
+                MoveDown(distance)
+            )?;
+        }
+        for line in rendered.iter().skip(previous_len) {
+            write!(frame, "{}\r\n", line.text)?;
+        }
+        if previous_len > rendered.len() {
+            queue!(
+                frame,
+                MoveToColumn(0),
+                MoveUp(u16::try_from(previous_len - rendered.len()).unwrap_or(u16::MAX)),
+                Clear(ClearType::FromCursorDown)
+            )?;
+        }
+        if !frame.is_empty() {
+            output.write_all(&frame)?;
+            output.flush()?;
+        }
+        self.lines = rendered;
+        self.size = Some((columns, rows));
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn render_screen(
     lines: &[String],
     columns: usize,
@@ -220,45 +303,75 @@ fn render_screen(
     model_selection: bool,
 ) -> Vec<u8> {
     let mut body = String::new();
-    for (index, line) in lines.iter().enumerate() {
-        if model_selection && index == 0 {
-            for row in
-                color_directory_title(line, u16::try_from(columns).unwrap_or(u16::MAX), theme)
-            {
-                body.push_str(&row);
-                body.push_str("\r\n");
-            }
-            continue;
-        }
-        let model_tabs =
-            model_selection && matches!(line.as_str(), LOCAL_MODEL_TABS | REMOTE_MODEL_TABS);
-        let line = crate::theme::truncate(line, columns);
-        let styled = if model_tabs {
-            color_model_tabs(&line, theme)
-        } else if model_selection && (line.starts_with("  › ") || line.starts_with("    ")) {
-            color_model_row(&line, theme)
-        } else if let Some(selected) = line.strip_prefix("  ✓ ") {
-            format!("  {} {selected}", theme.success("✓"))
-        } else if let Some(error) = line.strip_prefix("  × ") {
-            format!("  {} {error}", theme.danger("×"))
-        } else if let Some(warning) = line.strip_prefix("  ! ") {
-            format!("  {} {warning}", theme.warning("!"))
-        } else if line.starts_with("  ↑/↓")
-            || line.starts_with("  Enter ")
-            || line.starts_with("  Workspace  ")
-            || line.starts_with("  Endpoint   ")
-            || line.starts_with("  ~/")
-            || line.starts_with("  /")
-            || line.starts_with("  Type or paste ")
-        {
-            theme.muted(&line)
-        } else {
-            line
-        };
-        body.push_str(&styled);
+    for line in render_lines(lines, columns, theme, model_selection) {
+        body.push_str(&line.text);
         body.push_str("\r\n");
     }
     body.into_bytes()
+}
+
+fn render_lines(
+    lines: &[String],
+    columns: usize,
+    theme: StatusTheme,
+    model_selection: bool,
+) -> Vec<RenderedLine> {
+    let mut rendered = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if model_selection
+            && index == 0
+            && (line.starts_with(NO_INDEX_PREFIX) || line.starts_with(COMPACT_NO_INDEX_PREFIX))
+        {
+            let columns = u16::try_from(columns).unwrap_or(u16::MAX);
+            let styled = color_directory_title(line, columns, theme);
+            for (row, text) in title_ranges(line, columns).into_iter().zip(styled) {
+                rendered.push(RenderedLine {
+                    text,
+                    widths: line[row].chars().map(character_columns).collect(),
+                });
+            }
+        } else {
+            rendered.push(render_line(line, columns, theme, model_selection));
+        }
+    }
+    rendered
+}
+
+fn render_line(
+    value: &str,
+    columns: usize,
+    theme: StatusTheme,
+    model_selection: bool,
+) -> RenderedLine {
+    let model_tabs = model_selection && matches!(value, LOCAL_MODEL_TABS | REMOTE_MODEL_TABS);
+    let line = crate::theme::truncate(value, columns);
+    let widths = line.chars().map(character_columns).collect();
+    let styled = if model_tabs {
+        color_model_tabs(&line, theme)
+    } else if model_selection && (line.starts_with("  › ") || line.starts_with("    ")) {
+        color_model_row(&line, theme)
+    } else if let Some(selected) = line.strip_prefix("  ✓ ") {
+        format!("  {} {selected}", theme.success("✓"))
+    } else if let Some(error) = line.strip_prefix("  × ") {
+        format!("  {} {error}", theme.danger("×"))
+    } else if let Some(warning) = line.strip_prefix("  ! ") {
+        format!("  {} {warning}", theme.warning("!"))
+    } else if line.starts_with("  ↑/↓")
+        || line.starts_with("  Enter ")
+        || line.starts_with("  Workspace  ")
+        || line.starts_with("  Endpoint   ")
+        || line.starts_with("  ~/")
+        || line.starts_with("  /")
+        || line.starts_with("  Type or paste ")
+    {
+        theme.muted(&line)
+    } else {
+        line
+    };
+    RenderedLine {
+        text: styled,
+        widths,
+    }
 }
 
 pub struct ModelSelection {
@@ -354,6 +467,29 @@ impl ModelSelection {
         }
         let title_rows = u16::try_from(title_ranges(&title, columns.saturating_sub(1)).len())
             .unwrap_or(u16::MAX);
+        let choices = self.choices();
+        let active = self.positions[self.tab];
+        if height <= 10 {
+            let selected = choices.get(active).map_or_else(
+                || "  No supported models".to_owned(),
+                |model| format!("  › {}", model.reference),
+            );
+            let mut lines = vec![selected];
+            if height >= 3 {
+                lines.insert(0, title);
+            }
+            if height >= 4 {
+                lines.push(format!(
+                    "  ↑/↓ Select · ←/→ or Tab Switch · Enter {} · Esc Cancel",
+                    if self.tab == 0 {
+                        "Build & search"
+                    } else {
+                        "Continue"
+                    }
+                ));
+            }
+            return lines;
+        }
         let mut lines = vec![
             title,
             String::new(),
@@ -367,10 +503,8 @@ impl ModelSelection {
             .into(),
             String::new(),
         ];
-        let choices = self.choices();
         let visible =
             usize::from(height.saturating_sub(10_u16.saturating_add(title_rows))).clamp(1, 12);
-        let active = self.positions[self.tab];
         let start = active.saturating_sub(visible - 1);
         let width = choices
             .iter()
@@ -689,6 +823,267 @@ mod tests {
         assert!(lines.contains("Choose a model to build the index and continue this search."));
         assert!(!lines.contains("local/one"));
         assert!(lines.contains("Esc Cancel"));
+    }
+
+    #[test]
+    fn redraw_does_not_blank_the_prompt_before_painting() {
+        let mut picker = ModelSelection::new(&setup());
+        let mut screen = Screen::default();
+        screen
+            .draw_to(
+                &mut Vec::new(),
+                &picker.lines(Path::new("/workspace"), 80, 24),
+                79,
+                24,
+                ColorMode::Never,
+                true,
+            )
+            .expect("draw prompt");
+        picker.key(key(KeyCode::Down));
+        let mut output = Vec::new();
+        screen
+            .draw_to(
+                &mut output,
+                &picker.lines(Path::new("/workspace"), 80, 24),
+                79,
+                24,
+                ColorMode::Never,
+                true,
+            )
+            .expect("redraw prompt");
+        let mut erased = Vec::new();
+        queue!(erased, Clear(ClearType::FromCursorDown)).expect("erase sequence");
+        assert!(
+            !output.windows(erased.len()).any(|window| window == erased),
+            "redraw clears the whole prompt before repainting it"
+        );
+        assert!(!output.is_empty(), "selection change must be rendered");
+        let mut unchanged = Vec::new();
+        screen
+            .draw_to(
+                &mut unchanged,
+                &picker.lines(Path::new("/workspace"), 80, 24),
+                79,
+                24,
+                ColorMode::Never,
+                true,
+            )
+            .expect("redraw unchanged prompt");
+        assert!(unchanged.is_empty(), "unchanged prompt must not repaint");
+    }
+
+    #[test]
+    fn shrinking_terminal_repaints_visible_model_from_a_new_origin() {
+        let mut setup = setup();
+        let model = setup
+            .models
+            .iter()
+            .find(|model| model.local)
+            .expect("local model")
+            .clone();
+        setup.models = (0..11)
+            .map(|index| EmbeddingChoice {
+                reference: format!("local/{index:02}"),
+                ..model.clone()
+            })
+            .collect();
+        setup.default_model = Some("local/00".into());
+        let picker = ModelSelection::new(&setup);
+        let mut screen = Screen::default();
+        screen
+            .draw_to(
+                &mut Vec::new(),
+                &picker.lines(Path::new("/workspace"), 80, 30),
+                79,
+                30,
+                ColorMode::Never,
+                true,
+            )
+            .expect("draw tall prompt");
+        let mut resized = Vec::new();
+        screen
+            .draw_to(
+                &mut resized,
+                &picker.lines(Path::new("/workspace"), 80, 12),
+                79,
+                12,
+                ColorMode::Never,
+                true,
+            )
+            .expect("draw short prompt");
+        let frame = String::from_utf8(resized).expect("UTF-8 redraw");
+        assert!(
+            frame.contains("The directory"),
+            "prompt header was not repainted: {frame:?}"
+        );
+        assert!(
+            frame.contains("› local/00"),
+            "selected model was not repainted: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn resizing_a_short_prompt_preserves_output_above_it() {
+        let mut screen = Screen::default();
+        let lines = ["Select an embedding model".into(), "  ✓ local/one".into()];
+        screen
+            .draw_to(&mut Vec::new(), &lines, 79, 30, ColorMode::Never, false)
+            .expect("draw prompt");
+        let mut resized = Vec::new();
+        screen
+            .draw_to(&mut resized, &lines, 79, 20, ColorMode::Never, false)
+            .expect("redraw prompt");
+        let mut expected_prefix = Vec::new();
+        queue!(
+            expected_prefix,
+            MoveToColumn(0),
+            MoveUp(2),
+            Clear(ClearType::FromCursorDown)
+        )
+        .expect("prompt-only clear");
+        assert!(
+            resized.starts_with(&expected_prefix),
+            "resize cleared output above the prompt: {resized:?}"
+        );
+    }
+
+    #[test]
+    fn shrinking_width_rewinds_wrapped_picker_rows() {
+        let mut screen = Screen::default();
+        let lines = ["H".repeat(70), format!("  ✓ {}", "M".repeat(66))];
+        screen
+            .draw_to(&mut Vec::new(), &lines, 79, 30, ColorMode::Always, false)
+            .expect("draw wide prompt");
+        let mut expected_prefix = Vec::new();
+        queue!(
+            expected_prefix,
+            MoveToColumn(0),
+            MoveUp(4),
+            Clear(ClearType::FromCursorDown)
+        )
+        .expect("wrapped prompt clear");
+        let mut cleared = Vec::new();
+        screen
+            .rewind(&mut cleared, 40, 30)
+            .expect("clear after width shrink");
+        assert_eq!(cleared, expected_prefix, "exit left wrapped rows behind");
+        let mut resized = Vec::new();
+        screen
+            .draw_to(&mut resized, &lines, 39, 30, ColorMode::Always, false)
+            .expect("redraw narrow prompt");
+        assert!(
+            resized.starts_with(&expected_prefix),
+            "width shrink left old wrapped picker rows behind: {resized:?}"
+        );
+    }
+
+    #[test]
+    fn shrinking_width_rewinds_cjk_paths_at_odd_columns() {
+        let lines = [
+            "Set up workspace index".into(),
+            format!("  /中/{}", "文".repeat(36)),
+        ];
+        for color in [ColorMode::Never, ColorMode::Always] {
+            let mut screen = Screen::default();
+            screen
+                .draw_to(&mut Vec::new(), &lines, 79, 80, color, false)
+                .expect("draw Chinese workspace path");
+            let mut expected = Vec::new();
+            queue!(
+                expected,
+                MoveToColumn(0),
+                MoveUp(4),
+                Clear(ClearType::FromCursorDown)
+            )
+            .expect("clear all wrapped rows");
+            let mut cleared = Vec::new();
+            screen
+                .rewind(&mut cleared, 39, 80)
+                .expect("exit after width shrink");
+            assert_eq!(cleared, expected, "exit left the old title behind");
+            let mut resized = Vec::new();
+            screen
+                .draw_to(&mut resized, &lines, 38, 80, color, false)
+                .expect("redraw Chinese workspace path");
+            assert!(
+                resized.starts_with(&expected),
+                "redraw left the old title behind"
+            );
+            assert!(
+                String::from_utf8(resized)
+                    .expect("UTF-8 redraw")
+                    .contains("Set up workspace index")
+            );
+            let mut exit = Vec::new();
+            screen.rewind(&mut exit, 39, 80).expect("exit after redraw");
+            let mut expected_exit = Vec::new();
+            queue!(
+                expected_exit,
+                MoveToColumn(0),
+                MoveUp(2),
+                Clear(ClearType::FromCursorDown)
+            )
+            .expect("clear the redrawn prompt");
+            assert_eq!(exit, expected_exit);
+        }
+    }
+
+    #[test]
+    fn compact_picker_keeps_the_selected_model_in_short_terminals() {
+        let mut setup = setup();
+        setup.default_model = Some("local/one".into());
+        let picker = ModelSelection::new(&setup);
+        for height in [3, 8, 10, 11] {
+            let lines = picker.lines(Path::new("/workspace"), 80, height);
+            assert!(lines.len() < usize::from(height), "{height}: {lines:?}");
+            assert!(
+                lines.iter().any(|line| line.contains("› local/one")),
+                "{height}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_model_title_rows_are_cached_for_redraw_and_cleanup() {
+        for color in [ColorMode::Never, ColorMode::Always] {
+            let mut lines = vec![
+                directory_title(Path::new("/workspace/中文目录/多层目录")),
+                LOCAL_MODEL_TABS.to_owned(),
+                "  › local/one  Downloaded".into(),
+            ];
+            let mut screen = Screen::default();
+            let mut initial = Vec::new();
+            screen
+                .draw_to(&mut initial, &lines, 23, 80, color, true)
+                .expect("draw wrapped model title");
+            let rendered_rows = String::from_utf8(initial)
+                .expect("UTF-8 screen")
+                .lines()
+                .count();
+            assert!(rendered_rows > lines.len());
+            assert_eq!(screen.lines.len(), rendered_rows);
+            lines[2] = "  › local/two  Downloaded".into();
+            let mut changed = Vec::new();
+            screen
+                .draw_to(&mut changed, &lines, 23, 80, color, true)
+                .expect("redraw selected model");
+            let mut clear = Vec::new();
+            queue!(clear, Clear(ClearType::FromCursorDown)).expect("clear sequence");
+            assert!(!changed.windows(clear.len()).any(|window| window == clear));
+            let mut exit = Vec::new();
+            screen
+                .rewind(&mut exit, 24, 80)
+                .expect("clear wrapped model title");
+            let mut expected = Vec::new();
+            queue!(
+                expected,
+                MoveToColumn(0),
+                MoveUp(u16::try_from(rendered_rows).expect("visible rows")),
+                Clear(ClearType::FromCursorDown)
+            )
+            .expect("clear every rendered row");
+            assert_eq!(exit, expected);
+        }
     }
 
     #[test]
