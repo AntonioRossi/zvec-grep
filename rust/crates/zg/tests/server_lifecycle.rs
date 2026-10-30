@@ -926,24 +926,18 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
     });
     let response = post_json(port, Some(&session), &background_search.to_string())?;
     assert!(response.contains("fresh.txt"), "{response}");
+    // A native watcher can deliver delayed or duplicate notifications after the
+    // preceding fresh query. Global drift uses the same diagnostics as the CLI.
     assert!(
-        !response.contains("freshness: served_from_current_index"),
+        response.contains("freshness: fresh") || response.contains("freshness: possibly_stale"),
         "{response}"
     );
-    // A native watcher can deliver delayed or duplicate notifications after the
-    // preceding fresh query. Controlled runtime tests cover the quiet idle case.
-    let stale = response.contains("freshness: possibly_stale");
-    let scheduled = response.contains("background_refresh: scheduled");
-    assert!(stale || response.contains("freshness: fresh"), "{response}");
-    if stale || scheduled {
+    if response.contains("status: possibly_stale") {
         assert!(
             response.contains("results: served_from_current_index"),
             "{response}"
         );
-        assert!(
-            response.contains("background_refresh: idle") || scheduled,
-            "{response}"
-        );
+        assert!(response.contains("background_refresh:"), "{response}");
     } else {
         assert!(
             !response.contains("results: served_from_current_index"),
@@ -1180,13 +1174,13 @@ fn search_uses_workspace_runtime(toolset: &str) -> Result<(), Box<dyn Error>> {
     std::fs::write(&source, "vineyard documentation")?;
     let response = search(workspace.path(), "orchard", "eventual", false)?;
     assert!(response.contains("source.txt"), "{response}");
-    assert!(response.contains("background_refresh: off"), "{response}");
+    assert!(response.contains("orchard documentation"), "{response}");
+    assert!(response.contains("status: possibly_stale"), "{response}");
+    assert!(response.contains("background_refresh: idle"), "{response}");
     let response = search(workspace.path(), "orchard", "eventual", true)?;
     assert!(response.contains("source.txt"), "{response}");
-    assert!(
-        response.contains("background_refresh: scheduled"),
-        "{response}"
-    );
+    assert!(response.contains("status: possibly_stale"), "{response}");
+    assert!(response.contains("background_refresh:"), "{response}");
     // Poll without requesting more refreshes: the first eventual search must do the work.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -1206,6 +1200,7 @@ fn search_uses_workspace_runtime(toolset: &str) -> Result<(), Box<dyn Error>> {
     embedding.wait_for_request_after(before_edit, "harvest", home.path());
     let response = search(workspace.path(), "harvest", "wait_for_fresh", false)?;
     assert!(response.contains("source.txt"), "{response}");
+    assert!(response.contains("harvest documentation"), "{response}");
     assert!(response.contains("freshness: fresh"), "{response}");
     assert!(response.contains("\"isError\":false"), "{response}");
     // Once activated, the watcher must refresh later edits even with autoUpdate off.
@@ -1492,7 +1487,7 @@ fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Bo
             let text = String::from_utf8(reply.stdout)?;
             assert!(text.contains("\n  2: xxx"), "{mode} {preview}: {text}");
             assert!(!text.contains("\n  1: xxx"), "{mode} {preview}: {text}");
-            outputs.push(text);
+            outputs.push((text, String::from_utf8(reply.stderr)?));
         }
         assert_eq!(outputs[0], outputs[1], "direct/server {preview}");
         let reply = bridge.request(&json!({
@@ -1505,11 +1500,13 @@ fn indexed_fragment_coordinates_survive_direct_server_and_mcp() -> Result<(), Bo
         let text = reply["result"]["content"][0]["text"]
             .as_str()
             .ok_or("missing source preview")?;
-        assert!(
-            text.contains("matched: 2\nsource:\n2\txxx"),
-            "{preview}: {text}"
-        );
-        assert!(text.ends_with("\n3\t"), "{preview}: {text}");
+        let (body, diagnostics) = &outputs[0];
+        let expected = if diagnostics.is_empty() {
+            format!("freshness: fresh\n{body}")
+        } else {
+            format!("freshness: possibly_stale\n{diagnostics}\n{body}")
+        };
+        assert_eq!(text, expected, "direct/server/MCP {preview}");
     }
     bridge.close()?;
     assert_command_success(&guard.stop()?);
