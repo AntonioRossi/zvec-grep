@@ -10,19 +10,14 @@ use zvec_rust::{
     SearchQuery,
 };
 
-use crate::{EngineError, EngineResult};
+use crate::{EngineError, EngineResult, utils::directory_exists};
 
 pub(super) const WRITE_BATCH: usize = 1024;
 static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub(super) fn initialize() -> EngineResult<()> {
-    match INITIALIZED.get_or_init(|| {
-        let config = zvec_rust::ConfigBuilder::new()
-            .num_threads(2)
-            .memory_limit(512 * 1024 * 1024)
-            .build();
-        zvec_rust::initialize(Some(&config)).map_err(|error| error.to_string())
-    }) {
+    match INITIALIZED.get_or_init(|| zvec_rust::initialize(None).map_err(|error| error.to_string()))
+    {
         Ok(()) => Ok(()),
         Err(message) => Err(EngineError::storage_failure(format!(
             "cannot initialize zvec: {message}"
@@ -35,13 +30,14 @@ pub(super) fn open_collection(
     schema: &CollectionSchema,
     read_only: bool,
 ) -> EngineResult<Collection> {
+    let exists = directory_exists(path)?;
     let text = native_path(path)?;
     let mut options = native(CollectionOptions::new(), "configure collection")?;
     native(
         options.set_read_only(read_only),
         "set collection access mode",
     )?;
-    if path.exists() {
+    if exists {
         native(
             Collection::open(text, Some(&options)),
             &format!("open collection {}", path.display()),

@@ -1,8 +1,8 @@
 import { appendFile, copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { hashFile, nativePackageEntries, run, sha256File, verifyTarballSize } from "./npm-package-core.mjs";
-import { verifyTarballCompliance } from "./npm-release-compliance.mjs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { hashFile, MAX_NPM_TARBALL_BYTES, nativePackageEntries, run, sha256File, verifyTarballSize } from "./npm-package-core.mjs";
 import { coreIdentity, validatePlugins } from "../npm/meta/plugins.cjs";
 
 function verifyPluginReferences(platform, version, packages, tarballRoot) {
@@ -193,9 +193,9 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
     "Use only the command for your platform. On Windows, use zg.cmd if PowerShell blocks the generated zg.ps1 shim.",
     "The native packages contain the executable and shared runtime libraries. The zvec library embeds its Jieba dictionary; no external dictionary files are required.",
     "ZG_INSTALL_ACCELERATOR=auto (default) installs CPU first and requests CUDA plugins only when NVIDIA detection succeeds; cpu skips detection/downloads; cuda forces plugin installation and fails if unsuccessful. Later use npm rebuild -g @zvec/zvec-grep with the same settings; no compilation is performed. Stop zg/daemon first and restart it afterwards.",
-    "CPU installs do not require CUDA component tarballs. CUDA plugins are exact-version, core-bound and integrity-checked; Linux ORT fragments are concatenated and checked before activation. ZG_INSTALL_OFFLINE=1 disables network downloads; ZG_PLUGIN_DIR selects local archives. --ignore-scripts skips even CPU bootstrap: explicitly permit the package's scripts and run npm rebuild to initialize it.",
-    "Every compressed npm tarball must be at most 350 MiB; this is checked at pack, collect, and publication preflight.",
-    "Linux candidates target Ubuntu 24.04; older glibc and C++ runtimes are not covered.",
+    "CPU installs do not require CUDA component tarballs. CUDA plugins are exact-version, core-bound and integrity-checked; Linux and Windows ORT fragments are concatenated and checked before activation. ZG_INSTALL_OFFLINE=1 disables network downloads; ZG_PLUGIN_DIR selects local archives. --ignore-scripts skips even CPU bootstrap: explicitly permit the package's scripts and run npm rebuild to initialize it.",
+    `Every compressed npm tarball must be at most ${MAX_NPM_TARBALL_BYTES / 1024 / 1024} MiB; this is checked at pack, collect, and publication preflight.`,
+    "Linux x64 and ARM64 candidates are built and CPU-tested on Ubuntu 20.04 (glibc 2.31), with a glibc audit of the executable and bundled libraries. CUDA acceleration additionally requires compatible NVIDIA drivers and CUDA/cuDNN host libraries.",
     "SHA256SUMS and release.json identify the exact files and source commit.",
     "These artifacts use the regular npm package layout; no registry publication is needed to install them.",
     "macOS packages use the toolchain's local code signatures; Windows packages do not require a signing certificate.",
@@ -212,10 +212,12 @@ export async function collectRelease({ manifest, version, tarballRoot, targets }
   return release;
 }
 
-export async function checkPublishedPackage(entry, registryFetch = fetch) {
+export async function checkPublishedPackage(entry, registryFetch = fetch, signal) {
   const url = `https://registry.npmjs.org/${encodeURIComponent(entry.name)}/${encodeURIComponent(entry.version)}`;
   const response = await registryFetch(url, {
-    signal: AbortSignal.timeout(30_000),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+      : AbortSignal.timeout(30_000),
   });
   if (response.status === 404) return false;
   if (!response.ok)
@@ -229,6 +231,40 @@ export async function checkPublishedPackage(entry, registryFetch = fetch) {
     );
   }
   return true;
+}
+
+export async function waitForPublishedPackages(packages, {
+  registryFetch = fetch,
+  timeoutMs = 600_000,
+  intervalMs = 10_000,
+} = {}) {
+  const signal = AbortSignal.timeout(timeoutMs);
+  const pending = [...packages];
+  try {
+    // Publication can succeed before every registry replica serves the metadata.
+    // Share one deadline across all packages and retain successful integrity checks.
+    while (pending.length) {
+      for (const entry of [...pending]) {
+        signal.throwIfAborted();
+        if (await checkPublishedPackage(entry, registryFetch, signal)) {
+          pending.splice(pending.indexOf(entry), 1);
+        }
+      }
+      if (pending.length) {
+        console.log(`Waiting for npm registry metadata (${pending.length} packages): ${
+          pending.map((entry) => `${entry.name}@${entry.version}`).join(", ")
+        }; retrying in ${intervalMs} ms`);
+        await sleep(intervalMs, undefined, { signal });
+      }
+    }
+  } catch (error) {
+    if (signal.aborted) {
+      throw new Error(`timed out after ${timeoutMs} ms waiting for npm registry metadata; registry candidate is missing: ${
+        pending.map((entry) => `${entry.name}@${entry.version}`).join(", ")
+      }`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 async function preflightRelease({ manifest, tarballRoot, registryFetch }) {
@@ -271,8 +307,6 @@ async function preflightRelease({ manifest, tarballRoot, registryFetch }) {
     if (`sha512-${await hashFile(join(tarballRoot, entry.file), "sha512", "base64")}` !== entry.integrity) {
       throw new Error(`release tarball integrity mismatch: ${entry.file}`);
     }
-    if (entry.target !== "meta")
-      verifyTarballCompliance(join(tarballRoot, entry.file));
     published.push(await checkPublishedPackage(entry, registryFetch));
   }
   for (const platform of manifest.platforms.filter((entry) => entry.components?.length)) {

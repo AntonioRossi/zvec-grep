@@ -1,6 +1,6 @@
 # Move and reuse an index
 
-[Documentation](./README.md) · [CLI](./02-cli.md) · [MCP](./03-mcp.md)
+[Node fork guide](./README.md) · [MCP requests](#mcp-requests)
 
 A change in workspace location should not require another embedding run for
 unchanged documents. Use a portable index to keep stored vectors when you move
@@ -182,7 +182,49 @@ search and indexing tools can read and update the result. A tool path is a path 
 not necessarily to the agent's computer. An agent must have an explicit user
 request before it creates or changes a persistent index.
 
+### MCP requests
+
+The default `agent` toolset exposes search only. Run
+`zg --server on --mcp-toolset full` to expose all nine tools, including the
+three transfer operations. Confirmation records the caller's intent; it does
+not prove user identity or replace server authentication.
+
+| Tool | Required absolute paths, visible to the server |
+| --- | --- |
+| `zvec_grep_index_migrate` | `sourceHome`: legacy index; `destinationRoot`: receiving workspace |
+| `zvec_grep_index_export` | `sourceHome`: source index; `artifactPath`: new transfer artifact |
+| `zvec_grep_index_import` | `artifactPath`: received artifact; `destinationRoot`: receiving workspace |
+
+Results contain `operation`, `state` and `result`. Migration and import return
+index identity, counts, missing-file information and verification results.
+Export returns identity and counts. Tool failures set `isError: true` and
+`state: "failed"`, with an error code, message and available context. Invalid
+inputs use the standard MCP validation error.
+
+Clients can request progress notifications. Cancellation before publication
+uses reservation cleanup. Publication is the commit boundary: a late
+cancellation does not remove a completed index or artifact.
+Follow the [recovery instructions](#memory-and-failed-operations) for forced exits.
+These operations do not stop another user's indexing job or replace an
+occupied index.
+
+### Index locks
+
+Writers hold a lock below `<workspace>/.zvec-grep/locks/`. Write locks are
+never reclaimed automatically, even when the local owner has exited. Deletion
+can race with a new owner's acquisition. An abandoned write blocks the
+workspace until operator recovery. Reader entries are reclaimed only for a
+verified-dead local owner, with physical ownership checks.
+
+`LOCK.BUSY` reports an alive, dead or unknown owner. Wait for an active
+operation, or cancel it through its owner. For an unknown owner, check activity
+on the recorded host. Do not remove an active or unconfirmed lock. Use the
+[quarantine procedure](#memory-and-failed-operations) for a failed destination.
+
 ## Verify reuse and updates
+
+Remote grants are bound to the absolute workspace root. A relocated workspace
+requires authorization for its new root.
 
 1. Record the source index identity from `.zvec-grep/manifest.json` and the
    source revision. After transfer, compare the destination manifest identity.
