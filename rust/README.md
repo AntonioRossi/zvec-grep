@@ -50,6 +50,22 @@ Rg requests return plain text matches and requested context without parsing code
 or Markdown structure. CLI and MCP rg searches share this behavior; current-file
 path lookup keeps its structural entity grouping.
 
+`zg --status` shows only **Coverage**, **Embedding**, **FTS**, and **Storage**.
+Coverage compares the current scan with unchanged indexed files and includes
+any non-ready state. Missing statistics show `Unavailable`; missing embedding
+or FTS configuration shows `Not configured`. `--check-ready` keeps its existing
+exit-code behavior. The daemon and MCP status APIs retain their full metadata.
+`--debug` also writes the complete structured status snapshot to stderr.
+
+Interactive indexing retains a compact record of each major stage. File counts
+and model downloads update at most eight times per second; optimization, saving,
+and cleanup share a stable "Finalizing index" heading. Fast stages remain in
+scrollback without delaying indexing. Only the final CLI result reports readiness.
+Index progress uses the Node CLI's green gradient and diamond markers; status
+coverage uses the same gradient.
+`NO_COLOR` and `--color never` disable color; redirected or dumb-terminal progress
+remains line-oriented.
+
 Index embedding concurrency is configured with
 `zg --index --embedding-concurrency <n>`.
 The option is rejected outside `--index`. For automatic indexing and
