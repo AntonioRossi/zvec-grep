@@ -9,11 +9,12 @@ use crate::{
         context::{ContextOptions, ContextResult},
         index::{IndexOptions, IndexResult},
         info::{InfoOptions, InfoResult},
+        relationships::{Direction, RelationshipOptions, RelationshipResult},
     },
     models::ModelRuntimeManager,
     pipelines::{
         direct_search::DirectSearchService, indexed_search,
-        indexing::service::WorkspaceIndexService,
+        indexing::service::WorkspaceIndexService, relationships,
     },
     storage::read_session::ReadSessionCache,
 };
@@ -28,6 +29,13 @@ pub(crate) struct EngineService {
 }
 
 impl EngineService {
+    pub(crate) fn enable_server_model_pools(&self) -> Result<(), EngineError> {
+        self.ensure_open()?;
+        self.models
+            .enable_server_mode()
+            .map_err(crate::models::ModelError::into_engine_error)
+    }
+
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
@@ -69,11 +77,7 @@ impl EngineService {
         if options.rg {
             self.direct_search.context(options).await
         } else {
-            let cache = self
-                .read_sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let cache = self.read_session_cache();
             indexed_search::service::context(
                 &self.indexing,
                 &self.models,
@@ -85,6 +89,28 @@ impl EngineService {
         }
     }
 
+    pub(crate) async fn relationships(
+        &self,
+        direction: Direction,
+        options: RelationshipOptions,
+    ) -> Result<RelationshipResult, EngineError> {
+        self.ensure_open()?;
+        relationships::service::query(
+            &self.indexing,
+            &options,
+            self.read_session_cache().as_ref(),
+            direction,
+        )
+        .await
+    }
+
+    fn read_session_cache(&self) -> Option<ReadSessionCache> {
+        self.read_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Creates or refreshes the workspace index.
     ///
     /// # Errors
@@ -93,6 +119,14 @@ impl EngineService {
     pub(crate) async fn index(&self, options: IndexOptions) -> Result<IndexResult, EngineError> {
         self.ensure_open()?;
         self.indexing.index(&self.models, options).await
+    }
+
+    pub(crate) async fn resolve_index_embedding(
+        &self,
+        options: IndexOptions,
+    ) -> Result<crate::api::index::embedding::EmbeddingSelection, EngineError> {
+        self.ensure_open()?;
+        crate::pipelines::indexing::service::resolve_index_embedding(options).await
     }
 
     pub(crate) async fn paths(

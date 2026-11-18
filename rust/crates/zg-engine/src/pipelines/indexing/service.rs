@@ -16,7 +16,9 @@ use crate::{
         index::{
             IndexOptions, IndexResult,
             options::EmbeddingModelSpec,
-            progress::{DETAIL_SAVING_INDEX, IndexProgress},
+            progress::{
+                DETAIL_SAVING_INDEX, IndexProgress, IndexProgressPhase, IndexProgressReporter,
+            },
         },
         info::{
             InfoOptions, InfoResult,
@@ -29,7 +31,7 @@ use crate::{
     },
     models::{
         ModelError, ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest,
-        ResolveEmbeddingReferenceOptions, resolve_embedding_reference, resolve_index_concurrency,
+        resolve_index_concurrency,
     },
     storage::{IndexStore, types::WorkspaceIndexStorageOptions},
     utils::{directory_exists, resolve_directory},
@@ -49,11 +51,13 @@ use crate::{
     },
 };
 
-use super::pipeline::{
-    IndexEmbeddingRuntime, IndexingContext, get_workspace_index_status, index_workspace,
+use super::{
+    embedding_policy,
+    input_budget::embedding_input_budget,
+    pipeline::{
+        IndexEmbeddingRuntime, IndexingContext, get_workspace_index_status, index_workspace,
+    },
 };
-
-const DEFAULT_LOCAL_EMBEDDING: &str = "local/potion-code-16m-v2";
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceIndexService {
@@ -61,6 +65,10 @@ pub(crate) struct WorkspaceIndexService {
     scanner: NativeScanner,
     #[cfg(test)]
     fail_index_completion: bool,
+    #[cfg(test)]
+    fragment_count_reads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    fail_fragment_count: bool,
 }
 
 impl WorkspaceIndexService {
@@ -70,9 +78,17 @@ impl WorkspaceIndexService {
             scanner: NativeScanner::default(),
             #[cfg(test)]
             fail_index_completion: false,
+            #[cfg(test)]
+            fragment_count_reads: Arc::default(),
+            #[cfg(test)]
+            fail_fragment_count: false,
         }
     }
 
+    /// Runs the indexing pipeline in one linear sequence: recovery, model
+    /// resolution, build, and publication are order-dependent, so the steps
+    /// stay visible here instead of behind helpers.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn index(
         &self,
         models: &ModelRuntimeManager,
@@ -110,6 +126,11 @@ impl WorkspaceIndexService {
         } else {
             recover_build(&layout)?;
         }
+        // One workspace setting drives extraction, assembly, and storage. A
+        // flipped switch is a configuration change like a different embedding
+        // model: it is applied only by an explicit rebuild, and a plain refresh
+        // is rejected by the descriptor compatibility check below.
+        let graph_indexing = resolve_graph_indexing(existing.as_ref(), &options);
         let rebuilding =
             options.rebuild || !existing.as_ref().is_some_and(Workspace::index_enabled);
         if options.reset_paths
@@ -118,16 +139,48 @@ impl WorkspaceIndexService {
             // A changed selection can admit files outside a watcher's narrow change scope.
             options.changes.clear();
         }
+        let selection =
+            embedding_policy::select(&requested_root, &scan, existing.as_ref(), &options).await?;
+        if options.embedding.is_none() {
+            if let Some(reporter) = options.on_progress.take() {
+                let explanation = selection.clone();
+                // Daemon clients consume coalesced snapshots. Keep the decision on
+                // every event, including completion, rather than a lossy one-off event.
+                let reporter = IndexProgressReporter::new(move |mut progress| {
+                    progress.embedding.get_or_insert_default().selection =
+                        Some(explanation.clone());
+                    reporter.report(progress);
+                });
+                reporter.report(IndexProgress {
+                    phase: IndexProgressPhase::Scanning,
+                    files_total: None,
+                    files_indexed: None,
+                    files_failed: None,
+                    detail: None,
+                    embedding: None,
+                });
+                options.on_progress = Some(reporter);
+            }
+            // Freeze this operation's choice before acquiring models. Auto device
+            // and absent runtime overrides preserve the saved workspace settings.
+            options.embedding = Some(EmbeddingModelSpec {
+                reference: selection.model,
+                revision: None,
+                cache_dir: None,
+                endpoint: None,
+                device: Device::Auto,
+            });
+        }
         // Resolve only at the shared index boundary; query runtimes never read these overrides.
         options.embedding_concurrency = resolve_index_concurrency(
-            &embedding_reference(existing.as_ref(), options.embedding.as_ref())?,
+            &embedding_reference(existing.as_ref(), &options)?,
             options.embedding_concurrency,
         )
         .map_err(ModelError::into_engine_error)?;
         let IndexModels {
             runtimes: acquired,
             descriptor,
-        } = acquire_index_models(models, existing.as_ref(), &options)?;
+        } = acquire_index_models(models, existing.as_ref(), &options, graph_indexing)?;
         if !rebuilding
             && let Some(previous) = existing
                 .as_ref()
@@ -136,7 +189,11 @@ impl WorkspaceIndexService {
             previous
                 .ensure_index_compatible(&descriptor)
                 .map_err(|error| {
-                    error.with_help("Rebuild the index with `zg --index --rebuild`.")
+                    error.with_help(if descriptor.graph_indexing() {
+                        "Rebuild the index with `zg --index --rebuild --graph`."
+                    } else {
+                        "Rebuild the index with `zg --index --rebuild`."
+                    })
                 })?;
         }
         let mut workspace = index_workspace_state(
@@ -179,6 +236,10 @@ impl WorkspaceIndexService {
         Ok(indexed)
     }
 
+    /// Opens the pass storage, runs the pipeline, sweeps cross-file references,
+    /// and publishes. The steps are order-dependent — storage closes before the
+    /// manifest selects the new generation — so they stay visible in one place.
+    #[allow(clippy::too_many_lines)]
     async fn run_index(
         &self,
         workspace: &Workspace,
@@ -193,8 +254,22 @@ impl WorkspaceIndexService {
             workspace.layout().index_dir()
         };
         let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+            graph_enabled: workspace
+                .index()
+                .descriptor()
+                .is_some_and(IndexDescriptor::graph_indexing),
             storage_path: storage_path.to_path_buf(),
             embeddings: models.iter().map(|model| model.info().clone()).collect(),
+        })
+        .map_err(|mut error| {
+            if let Some(help) = error.help() {
+                let help = format!(
+                    "{help} Run this command in workspace '{}'.",
+                    workspace.source_root().display()
+                );
+                error = error.with_help(help);
+            }
+            error.with_workspace_root(workspace.source_root())
         })?;
         let writer = self.writers.register(
             crate::pipelines::indexed_search::writer::WriterSession::new(
@@ -236,6 +311,42 @@ impl WorkspaceIndexService {
             changes: &options.changes,
         })
         .await;
+        // Cross-file resolution runs once per pass, after every file snapshot is
+        // durable. A failed sweep degrades to "still pending": unresolved
+        // references stay queued for the next pass instead of failing an index
+        // whose zvec side has already been published. The sweep honors the
+        // pass's signal, so a cancelled pass stops resolving, keeps the
+        // remaining references queued, and releases this writer below.
+        let result = result.inspect(|_indexed| {
+            // An incremental pass patches the previous graph: rows it resolved
+            // in an earlier pass are invisible to the sweep, so a changed name
+            // candidate set or import path would never reach them. Requeue
+            // them first. A rebuild writes a fresh graph and has none.
+            if !rebuilding {
+                match writer.session.storage.requeue_stale_resolutions() {
+                    Ok(0) => {}
+                    Ok(requeued) => tracing::debug!(requeued, "requeued stale references"),
+                    Err(error) => {
+                        tracing::warn!(%error, "reference requeue failed; resolutions stay stale");
+                    }
+                }
+            }
+            match super::graph_resolver::resolve_pending(
+                &writer.session.storage,
+                Some(workspace.source_root()),
+                options.signal.as_ref(),
+            ) {
+                Ok(sweep) => tracing::debug!(sweep = ?sweep, "graph resolution sweep"),
+                Err(error) if error.code() == EngineError::CANCELLED => {
+                    // The cancellation itself is reported after storage closes;
+                    // degrading here would double-report a failed sweep.
+                    tracing::debug!(%error, "graph resolution sweep stopped for cancellation");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "graph resolution sweep failed; references stay pending");
+                }
+            }
+        });
         #[cfg(test)]
         let result = result.and_then(|indexed| {
             // Exercise service cleanup when the indexing pipeline fails to finalize storage.
@@ -298,6 +409,10 @@ impl WorkspaceIndexService {
             return Ok(false);
         }
         let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+            graph_enabled: workspace
+                .index()
+                .descriptor()
+                .is_some_and(IndexDescriptor::graph_indexing),
             storage_path: workspace.layout().index_dir().to_path_buf(),
         })?;
         let status =
@@ -353,10 +468,31 @@ impl WorkspaceIndexService {
         let indexed = metadata_indexed && storage_exists;
         let status = if options.include_status && indexed {
             let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+                graph_enabled: workspace
+                    .index()
+                    .descriptor()
+                    .is_some_and(IndexDescriptor::graph_indexing),
                 storage_path: workspace.layout().index_dir().to_path_buf(),
             })?;
             let status =
-                get_workspace_index_status(&workspace, &storage, &self.scanner, None, true).await;
+                get_workspace_index_status(&workspace, &storage, &self.scanner, None, true)
+                    .await
+                    .and_then(|mut status| {
+                        if options.include_counts {
+                            #[cfg(test)]
+                            {
+                                self.fragment_count_reads
+                                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                if self.fail_fragment_count {
+                                    return Err(EngineError::storage_failure(
+                                        "injected fragment count failure",
+                                    ));
+                                }
+                            }
+                            status.fragments_indexed = Some(storage.count_fragments()?);
+                        }
+                        Ok(status)
+                    });
             let close = storage.close();
             let status = status?;
             close?;
@@ -383,7 +519,7 @@ impl WorkspaceIndexService {
             } else {
                 InfoSource::Unindexed
             },
-            workspace_index: Some(WorkspaceIndexInfo::from_workspace(&workspace)),
+            workspace_index: Some(workspace_index_info(&workspace, &options, indexed)),
             status,
             suggestion: workspace_suggestion(&workspace, indexed),
         })
@@ -409,6 +545,18 @@ impl WorkspaceIndexService {
     }
 }
 
+pub(crate) async fn resolve_index_embedding(
+    mut options: IndexOptions,
+) -> Result<crate::api::index::embedding::EmbeddingSelection, EngineError> {
+    let root = resolve_directory(options.root.as_deref())?;
+    let layout = WorkspaceLayout::new(root.join(".zvec-grep"))?;
+    let existing = load_index_workspace(&root, &layout, &options)?;
+    options.scan.normalize_ignore_paths(&root)?;
+    let scan = resolve_scan(existing.as_ref().map(Workspace::scan), &options)?;
+    crate::file_selection::ScanPolicy::new(&root, &scan)?;
+    embedding_policy::select(&root, &scan, existing.as_ref(), &options).await
+}
+
 fn load_index_workspace(
     root: &Path,
     layout: &WorkspaceLayout,
@@ -427,6 +575,16 @@ fn missing_refresh_index(root: &Path) -> EngineError {
         "No index found in {}. Run `zg --index --embedding <model>` to build it before refreshing.",
         root.display()
     ))
+}
+
+/// Resolves the workspace's graph setting: an explicit request wins, and a
+/// workspace saved before the switch existed keeps indexing without a graph.
+fn resolve_graph_indexing(existing: Option<&Workspace>, options: &IndexOptions) -> bool {
+    options.graph_indexing.unwrap_or_else(|| {
+        existing
+            .and_then(|workspace| workspace.index().descriptor())
+            .is_some_and(IndexDescriptor::graph_indexing)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -462,13 +620,14 @@ fn index_workspace_state(
         descriptor.default_embedding_model().clone(),
         descriptor.embedding_routes().clone(),
         configs,
+        descriptor.graph_indexing(),
         descriptor.fts(),
     )?;
     Workspace::new(
         source_root,
         layout.clone(),
         scan,
-        Some(CURRENT_INDEX_VERSION),
+        CURRENT_INDEX_VERSION,
         Some(generation),
         active.map_or(now, Workspace::created_epoch_ms),
         now,
@@ -534,12 +693,14 @@ fn acquire_index_models(
     models: &ModelRuntimeManager,
     existing: Option<&Workspace>,
     options: &IndexOptions,
+    graph_indexing: bool,
 ) -> Result<IndexModels, EngineError> {
     let model = acquire_model(models, existing, options)?;
     let descriptor = IndexDescriptor::new(
         model.info().clone(),
         std::collections::BTreeMap::new(),
         std::collections::BTreeMap::new(),
+        graph_indexing,
         crate::domain::FTS_CONFIG,
     )?;
     if !descriptor
@@ -569,7 +730,7 @@ fn acquire_model(
             "embedding revision overrides are not supported by the catalog-backed runtime",
         ));
     }
-    let reference = embedding_reference(existing, options.embedding.as_ref())?;
+    let reference = embedding_reference(existing, options)?;
     let config = crate::config::read()?;
     let provider = reference.split('/').next().unwrap_or_default();
     let local = provider == "local";
@@ -664,27 +825,15 @@ fn acquire_model(
         .map_err(ModelError::into_engine_error)
 }
 
-pub(crate) fn embedding_reference(
+fn embedding_reference(
     existing: Option<&Workspace>,
-    requested: Option<&EmbeddingModelSpec>,
+    options: &IndexOptions,
 ) -> Result<String, EngineError> {
-    let config = crate::config::read()?;
-    resolve_embedding_reference(ResolveEmbeddingReferenceOptions {
-        explicit: requested.map(|embedding| embedding.reference.clone()),
-        existing: existing
-            .and_then(|workspace| {
-                workspace
-                    .index()
-                    .descriptor()
-                    .map(IndexDescriptor::default_embedding_model)
-            })
-            .map(|embedding| embedding.model().reference()),
-        global_default: crate::config::string(&config, &["defaults", "embedding"]),
-        fallback: Some(DEFAULT_LOCAL_EMBEDDING.to_owned()),
-        ..ResolveEmbeddingReferenceOptions::default()
-    })
-    .map_err(ModelError::into_engine_error)?
-    .ok_or_else(|| EngineError::internal("default embedding model is not configured"))
+    embedding_policy::configured_selection(existing, options)?
+        .map(|selection| selection.model)
+        .ok_or_else(|| {
+            EngineError::internal("index embedding selection must precede model acquisition")
+        })
 }
 
 pub(in crate::pipelines) fn environment_api_key() -> Option<String> {
@@ -780,6 +929,24 @@ fn saved_embedding_config(
     Ok(stored)
 }
 
+fn workspace_index_info(
+    workspace: &Workspace,
+    options: &InfoOptions,
+    indexed: bool,
+) -> WorkspaceIndexInfo {
+    let mut info = WorkspaceIndexInfo::from_workspace(workspace);
+    if options.include_status
+        && options.include_counts
+        && indexed
+        && let (Some(embedding), Some(descriptor)) =
+            (&mut info.embedding, workspace.index().descriptor())
+    {
+        embedding.input_budget =
+            embedding_input_budget(descriptor.default_embedding_model().max_input_tokens());
+    }
+    info
+}
+
 fn unindexed_info(
     source_root: &Path,
     layout: &WorkspaceLayout,
@@ -831,7 +998,7 @@ mod tests {
             },
             info::InfoOptions,
         },
-        domain::{IndexState, Workspace, WorkspaceLayout, model::Device},
+        domain::{IndexDescriptor, IndexState, Workspace, WorkspaceLayout, model::Device},
     };
 
     use super::{ModelRuntimeManager, WorkspaceIndexService};
@@ -953,7 +1120,7 @@ mod tests {
             previous.source_root(),
             previous.layout().clone(),
             previous.scan().clone(),
-            Some(super::CURRENT_INDEX_VERSION - 1),
+            super::CURRENT_INDEX_VERSION - 1,
             previous.storage_generation().map(str::to_owned),
             previous.created_epoch_ms(),
             previous.updated_epoch_ms(),
@@ -988,7 +1155,7 @@ mod tests {
             ..IndexOptions::default()
         };
         let acquired =
-            super::acquire_index_models(&models, None, &options).expect("model metadata");
+            super::acquire_index_models(&models, None, &options, false).expect("model metadata");
         let workspace = super::index_workspace_state(
             directory.path(),
             &layout,
@@ -1044,11 +1211,19 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_index_versions() {
-        crate::workspace::manifest::require_current_index_version(Some(
-            super::CURRENT_INDEX_VERSION,
-        ))
-        .expect("current index");
-        for version in [None, Some(0), Some(1), Some(3), Some(5), Some(u32::MAX)] {
+        crate::workspace::manifest::require_current_index_version(super::CURRENT_INDEX_VERSION)
+            .expect("current index");
+        for version in [
+            0,
+            super::CURRENT_INDEX_VERSION - 1,
+            super::CURRENT_INDEX_VERSION + 1,
+            u32::MAX,
+        ] {
+            assert_ne!(
+                version,
+                super::CURRENT_INDEX_VERSION,
+                "samples must stay incompatible with the current version"
+            );
             let error = crate::workspace::manifest::require_current_index_version(version)
                 .expect_err("incompatible index format");
             assert_eq!(error.code(), crate::EngineError::INDEX_INCOMPATIBLE);
@@ -1075,7 +1250,7 @@ mod tests {
             }
             .apply(&crate::domain::ScanRules::default())
             .expect("scan rules"),
-            None,
+            super::CURRENT_INDEX_VERSION,
             None,
             0,
             0,
@@ -1248,6 +1423,7 @@ mod tests {
             .info(InfoOptions {
                 root: Some(moved.clone()),
                 include_status: true,
+                include_counts: false,
             })
             .await
             .expect("moved workspace info");
@@ -1295,6 +1471,7 @@ mod tests {
                 .drop_index(&InfoOptions {
                     root: Some(directory.path().to_path_buf()),
                     include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect("missing index should be an idempotent no-op")
@@ -1320,6 +1497,7 @@ mod tests {
                 .drop_index(&InfoOptions {
                     root: Some(directory.path().to_path_buf()),
                     include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect_err("reject storage alias");
@@ -1343,6 +1521,7 @@ mod tests {
         let options = InfoOptions {
             root: Some(directory.path().to_path_buf()),
             include_status: false,
+            include_counts: false,
         };
         assert!(!home.join("manifest.json").exists());
         assert!(!layout.has_build_record().expect("build record"));
@@ -1584,6 +1763,7 @@ mod tests {
                 index.default_embedding_model().clone(),
                 index.embedding_routes().clone(),
                 configs,
+                index.graph_indexing(),
                 index.fts(),
             )
             .expect("descriptor");
@@ -1743,7 +1923,8 @@ mod tests {
             service
                 .drop_index(&InfoOptions {
                     root: Some(directory.path().to_path_buf()),
-                    include_status: false
+                    include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect("drop incomplete build")
@@ -1801,6 +1982,74 @@ mod tests {
                 device: Device::Cpu,
             }),
             ..IndexOptions::default()
+        }
+    }
+
+    /// Reads the saved graph switch the way production does: from the published
+    /// index descriptor, which is its only home.
+    fn graph_indexing_enabled(workspace: &Workspace) -> bool {
+        workspace
+            .index()
+            .descriptor()
+            .is_some_and(IndexDescriptor::graph_indexing)
+    }
+
+    #[tokio::test]
+    async fn workspace_setting_controls_graph_writes_and_cached_and_uncached_reads() {
+        use crate::api::relationships::{Direction, RelationshipOptions};
+        for graph_enabled in [false, true] {
+            let directory = tempdir().expect("workspace");
+            let engine = crate::ZvecGrep::new();
+            engine
+                .index(IndexOptions {
+                    graph_indexing: Some(graph_enabled),
+                    ..empty_index_options(directory.path())
+                })
+                .await
+                .expect("index empty workspace");
+            let layout = WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("layout");
+            let workspace = super::read_workspace_manifest(directory.path(), &layout)
+                .expect("manifest")
+                .expect("published index");
+            assert_eq!(
+                workspace
+                    .layout()
+                    .index_dir()
+                    .join("graph/graph.sqlite")
+                    .exists(),
+                graph_enabled
+            );
+            for cached in [false, true] {
+                if cached {
+                    engine.enable_read_session_cache().expect("enable cache");
+                }
+                for direction in [Direction::In, Direction::Out] {
+                    let result = engine
+                        .relationships(
+                            direction,
+                            RelationshipOptions {
+                                root: Some(directory.path().to_path_buf()),
+                                symbol: "missing".into(),
+                                ..RelationshipOptions::default()
+                            },
+                        )
+                        .await;
+                    if graph_enabled {
+                        let result = result.expect("enabled graph read");
+                        assert!(result.matches.is_empty());
+                        assert!(result.suggestions.is_empty());
+                    } else {
+                        let error = result.expect_err("disabled graph read");
+                        assert_eq!(error.code(), crate::EngineError::UNSUPPORTED);
+                        assert!(
+                            error
+                                .help()
+                                .is_some_and(|help| help.contains("zg --index --rebuild --graph"))
+                        );
+                    }
+                }
+            }
+            engine.close();
         }
     }
 
@@ -1879,6 +2128,7 @@ mod tests {
                 .info(InfoOptions {
                     root: Some(root.clone()),
                     include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect("workspace info");
@@ -1918,7 +2168,8 @@ mod tests {
             service
                 .info(InfoOptions {
                     root: Some(child.clone()),
-                    include_status: false
+                    include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect("ancestor info")
@@ -1970,7 +2221,8 @@ mod tests {
             service
                 .info(InfoOptions {
                     root: Some(child.clone()),
-                    include_status: true
+                    include_status: true,
+                    include_counts: false,
                 })
                 .await
                 .expect("child info")
@@ -2024,6 +2276,7 @@ mod tests {
         let options = InfoOptions {
             root: Some(deleted.clone()),
             include_status: false,
+            include_counts: false,
         };
         for _ in 0..2 {
             let error = service
@@ -2060,6 +2313,7 @@ mod tests {
                 .drop_index(&InfoOptions {
                     root: Some(moved.clone()),
                     include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect("drop moved workspace")
@@ -2204,6 +2458,158 @@ mod tests {
         models.close();
     }
 
+    // One workspace has to be walked through reject, apply, reject, apply to
+    // prove the published index survives each rejected switch.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn graph_indexing_switch_requires_an_explicit_rebuild() {
+        let directory = tempdir().expect("workspace");
+        let service = WorkspaceIndexService::new();
+        let models = ModelRuntimeManager::new();
+        let layout = WorkspaceLayout::new(directory.path().join(".zvec-grep")).expect("layout");
+        let published = |layout: &WorkspaceLayout| {
+            super::read_workspace_manifest(
+                layout.storage_dir().parent().expect("source root"),
+                layout,
+            )
+            .expect("manifest read")
+            .expect("published workspace")
+        };
+
+        service
+            .index(&models, empty_index_options(directory.path()))
+            .await
+            .expect("initial index");
+        let initial = published(&layout);
+        assert!(
+            !graph_indexing_enabled(&initial),
+            "graph indexing stays off unless the request asks for it"
+        );
+        assert!(
+            !layout.index_dir().join("graph").exists(),
+            "a graph-free workspace must not create graph storage"
+        );
+
+        // An ordinary refresh keeps the saved setting, so it does not rebuild.
+        service
+            .index(&models, empty_index_options(directory.path()))
+            .await
+            .expect("refresh");
+        let refreshed = published(&layout);
+        assert_eq!(refreshed.storage_generation(), initial.storage_generation());
+        assert!(!graph_indexing_enabled(&refreshed));
+
+        // Flipping the switch is a configuration change, not a refresh: without
+        // an explicit rebuild it is rejected and the published index is kept.
+        let error = service
+            .index(
+                &models,
+                IndexOptions {
+                    graph_indexing: Some(true),
+                    ..empty_index_options(directory.path())
+                },
+            )
+            .await
+            .expect_err("enabling graph indexing needs an explicit rebuild");
+        assert_eq!(error.code(), crate::EngineError::INVALID_ARGUMENT);
+        assert!(
+            error.message().contains("has no code graph"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(
+            error.help(),
+            Some("Rebuild the index with `zg --index --rebuild --graph`.")
+        );
+        let rejected = published(&layout);
+        assert!(
+            !graph_indexing_enabled(&rejected),
+            "the saved switch stays off"
+        );
+        assert_eq!(
+            rejected.storage_generation(),
+            initial.storage_generation(),
+            "a rejected switch must not replace the published index"
+        );
+        assert!(!layout.index_dir().join("graph").exists());
+
+        // The explicit rebuild applies the switch; a graph only describes the
+        // files indexed alongside it, so the generation changes.
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    graph_indexing: Some(true),
+                    rebuild: true,
+                    ..empty_index_options(directory.path())
+                },
+            )
+            .await
+            .expect("enable graph indexing");
+        let enabled = published(&layout);
+        assert!(graph_indexing_enabled(&enabled));
+        assert_ne!(enabled.storage_generation(), initial.storage_generation());
+        assert!(
+            layout.index_dir().join("graph").exists(),
+            "an enabled workspace keeps graph storage"
+        );
+
+        // The reverse direction is rejected the same way and keeps the graph.
+        let error = service
+            .index(
+                &models,
+                IndexOptions {
+                    graph_indexing: Some(false),
+                    ..empty_index_options(directory.path())
+                },
+            )
+            .await
+            .expect_err("disabling graph indexing needs an explicit rebuild");
+        assert_eq!(error.code(), crate::EngineError::INVALID_ARGUMENT);
+        assert!(
+            error.message().contains("stores the code graph"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(
+            error.help(),
+            Some("Rebuild the index with `zg --index --rebuild`.")
+        );
+        let still_enabled = published(&layout);
+        assert!(
+            graph_indexing_enabled(&still_enabled),
+            "the saved switch stays on"
+        );
+        assert_eq!(
+            still_enabled.storage_generation(),
+            enabled.storage_generation(),
+            "a rejected switch must not replace the published index"
+        );
+        assert!(layout.index_dir().join("graph").exists());
+
+        // Disabling with an explicit rebuild drops the stale graph with the
+        // previous generation.
+        service
+            .index(
+                &models,
+                IndexOptions {
+                    graph_indexing: Some(false),
+                    rebuild: true,
+                    ..empty_index_options(directory.path())
+                },
+            )
+            .await
+            .expect("disable graph indexing");
+        let disabled = published(&layout);
+        assert!(!graph_indexing_enabled(&disabled));
+        assert_ne!(disabled.storage_generation(), enabled.storage_generation());
+        assert!(
+            !layout.index_dir().join("graph").exists(),
+            "disabling graph indexing must not leave the old graph behind"
+        );
+        models.close();
+    }
+
     #[tokio::test]
     async fn invalid_scan_rules_do_not_create_index_or_acquire_models() {
         let directory = tempdir().expect("workspace");
@@ -2310,6 +2716,7 @@ mod tests {
                 .drop_index(&InfoOptions {
                     root: Some(directory.path().to_path_buf()),
                     include_status: false,
+                    include_counts: false,
                 })
                 .await
                 .expect("no index to drop")
@@ -2369,6 +2776,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_index_concurrency_is_rejected_for_every_backend() {
+        let service = WorkspaceIndexService::new();
+        for reference in [
+            "local/all-minilm-l6-v2",
+            "local/embeddinggemma-300m",
+            "local/potion-code-16m-v2",
+            "qwen/text-embedding-v4",
+        ] {
+            let directory = tempdir().expect("workspace");
+            let models = ModelRuntimeManager::new();
+            let mut options = empty_index_options(directory.path());
+            let model = options.embedding.as_mut().expect("model");
+            model.reference = reference.into();
+            model.cache_dir = Some(directory.path().join("model-cache"));
+            options.embedding_concurrency = Some(0);
+            let result = service.index(&models, options).await;
+            assert_eq!(
+                result.expect_err("zero concurrency").code(),
+                crate::EngineError::INVALID_ARGUMENT,
+                "{reference}"
+            );
+            assert_eq!(models.snapshot().cached_runtimes, 0);
+            assert!(!directory.path().join("model-cache").exists());
+            models.close();
+        }
+    }
+
+    #[tokio::test]
     async fn index_concurrency_is_ephemeral_and_queries_ignore_refresh_overrides() {
         let directory = tempdir().expect("workspace");
         let service = WorkspaceIndexService::new();
@@ -2425,6 +2860,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_budget_diagnostics_use_saved_limits_without_loading_models_or_changing_metadata()
+    {
+        let directory = tempdir().expect("workspace");
+        let root = directory.path();
+        let cache = root.join("model-cache");
+        let service = WorkspaceIndexService::new();
+        let models = ModelRuntimeManager::new();
+        let mut options = empty_index_options(root);
+        options.embedding.as_mut().expect("model").cache_dir = Some(cache.clone());
+        service.index(&models, options).await.expect("empty index");
+        models.close();
+        assert!(!cache.exists(), "empty indexing must not prepare a model");
+        let layout = WorkspaceLayout::new(root.join(".zvec-grep")).expect("layout");
+        let original = std::fs::read(layout.manifest_path()).expect("saved manifest");
+
+        // A saved limit that differs from the catalog proves that diagnostics
+        // describe this index rather than constructing a new model runtime.
+        for saved_limit in [Some(17), None] {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&original).expect("manifest JSON");
+            manifest["index"]["descriptor"]["defaultEmbeddingModel"]["maxInputTokens"] =
+                serde_json::json!(saved_limit);
+            let bytes = serde_json::to_vec(&manifest).expect("updated metadata");
+            std::fs::write(layout.manifest_path(), &bytes).expect("save test limit");
+            for (include_status, include_counts) in
+                [(true, false), (false, true), (true, true), (true, false)]
+            {
+                let info = service
+                    .info(InfoOptions {
+                        root: Some(root.to_path_buf()),
+                        include_status,
+                        include_counts,
+                    })
+                    .await
+                    .expect("read-only inspection");
+                let budget = info
+                    .workspace_index
+                    .expect("workspace")
+                    .embedding
+                    .expect("embedding")
+                    .input_budget;
+                assert_eq!(
+                    budget,
+                    if include_status && include_counts {
+                        super::embedding_input_budget(saved_limit)
+                    } else {
+                        None
+                    }
+                );
+                if let Some(budget) = budget {
+                    assert_eq!(budget.max_input_tokens, 17);
+                    assert_eq!(budget.normal.max_length, 31);
+                    assert_eq!(budget.normal.overlap, 4);
+                }
+                assert_eq!(
+                    std::fs::read(layout.manifest_path()).expect("manifest"),
+                    bytes
+                );
+                assert!(!cache.exists(), "inspection must not prepare a model");
+            }
+        }
+        std::fs::write(layout.manifest_path(), &original).expect("restore model metadata");
+        std::fs::remove_dir_all(layout.index_dir()).expect("remove test index");
+        let missing = service
+            .info(InfoOptions {
+                root: Some(root.to_path_buf()),
+                include_status: true,
+                include_counts: true,
+            })
+            .await
+            .expect("missing index inspection");
+        assert!(!missing.indexed);
+        assert_eq!(
+            missing
+                .workspace_index
+                .expect("workspace")
+                .embedding
+                .expect("model")
+                .input_budget,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn only_explicit_info_counts_fragments_once_and_isolates_count_failures() {
+        use std::sync::atomic::Ordering;
+
+        let directory = tempdir().expect("workspace");
+        let root = directory.path();
+        let mut service = WorkspaceIndexService::new();
+        let models = ModelRuntimeManager::new();
+        service
+            .index(&models, empty_index_options(root))
+            .await
+            .expect("empty index");
+        assert_eq!(service.fragment_count_reads.load(Ordering::Acquire), 0);
+        let options = InfoOptions {
+            root: Some(root.to_path_buf()),
+            include_status: true,
+            include_counts: false,
+        };
+        for expected in 1..=2 {
+            let plain = service
+                .info(options.clone())
+                .await
+                .expect("ordinary status");
+            assert_eq!(plain.status.expect("status").fragments_indexed, None);
+            assert_eq!(
+                service.fragment_count_reads.load(Ordering::Acquire),
+                expected - 1
+            );
+            let diagnostic = service
+                .info(InfoOptions {
+                    include_counts: true,
+                    ..options.clone()
+                })
+                .await
+                .expect("explicit counts");
+            assert_eq!(
+                diagnostic.status.expect("status").fragments_indexed,
+                Some(0)
+            );
+            assert_eq!(
+                service.fragment_count_reads.load(Ordering::Acquire),
+                expected
+            );
+        }
+
+        service.fail_fragment_count = true;
+        service
+            .info(options.clone())
+            .await
+            .expect("ordinary status skips failed count");
+        let layout = WorkspaceLayout::new(root.join(".zvec-grep")).expect("layout");
+        let wait = super::LockWait::new(None, None).expect("lock wait");
+        assert!(
+            !service
+                .workspace_needs_refresh(root, &layout, &wait, None)
+                .await
+                .expect("freshness skips failed count")
+        );
+        assert_eq!(service.fragment_count_reads.load(Ordering::Acquire), 2);
+        let error = service
+            .info(InfoOptions {
+                include_counts: true,
+                ..options.clone()
+            })
+            .await
+            .expect_err("explicit count failure");
+        assert!(error.message().contains("injected fragment count failure"));
+        assert_eq!(service.fragment_count_reads.load(Ordering::Acquire), 3);
+        let plain = service
+            .info(options)
+            .await
+            .expect("ordinary status after failure");
+        assert_eq!(plain.status.expect("status").fragments_indexed, None);
+        assert_eq!(service.fragment_count_reads.load(Ordering::Acquire), 3);
+        models.close();
+    }
+
+    #[tokio::test]
     async fn composes_workspace_lifecycle_around_the_indexing_pipeline() {
         let directory = tempdir().expect("temporary directory");
         let sources = directory.path().join("sources");
@@ -2445,6 +3041,7 @@ mod tests {
         let info_options = InfoOptions {
             root: Some(directory.path().to_path_buf()),
             include_status: true,
+            include_counts: false,
         };
         let info = service
             .info(info_options.clone())
@@ -2514,7 +3111,7 @@ mod tests {
         )
         .expect("manifest read")
         .expect("manifest");
-        assert_eq!(rebuilt.index_version(), Some(super::CURRENT_INDEX_VERSION));
+        assert_eq!(rebuilt.index_version(), super::CURRENT_INDEX_VERSION);
         assert_eq!(rebuilt.source_root(), manifest.source_root());
         assert_eq!(rebuilt.scan(), manifest.scan());
         assert_eq!(

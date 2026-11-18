@@ -1,0 +1,781 @@
+//! Walk-time state for code graph edge collection.
+//!
+//! Mirrors the TypeScript three-segment collection design:
+//!
+//! 1. `scope_stack` — entity indices on the containment path. A new entity
+//!    pushes its index; `contains` edges are emitted from the stack top, so
+//!    both endpoints are position-known at walk time (no name lookup needed).
+//! 2. `symbols` — name → entity indices, registered as entities are produced.
+//!    The post-walk partition consults it to resolve in-file references
+//!    (forward references included, because partition runs after the walk).
+//! 3. `resolved_edges` / `name_edges` — the two output buffers. Position-based
+//!    edges (`contains`) go straight to `resolved_edges`; name-based references
+//!    (calls/imports/extends/implements) are buffered in `name_edges` because
+//!    their targets are unknown during the walk.
+//!
+//! Unlike the TypeScript original, which mints string entity IDs during the
+//! walk, this context works in *entity-index space*: the indexing pipeline
+//! mints `EntityId`s from `sha256(fileId \0 headFragmentIndex)` and the
+//! extraction layer never sees the file ID. Indices here are per-file entity
+//! ordinals allocated in walk order; `extract_code` appends fragments in the
+//! same order, so each ordinal maps onto its entity's head fragment index
+//! during the append loop, and the pipeline-side assembly resolves that index
+//! into the minted `EntityId`.
+//!
+//! Walker integration: `walk_code_node` threads a `WalkContext` through its
+//! recursion, so every indexed code file buffers its containment edges and
+//! name references during extraction. The post-walk
+//! [`partition`](self::partition::partition_walk) step then splits those
+//! buffers into in-file resolved edges and pending references.
+
+mod collector;
+mod partition;
+mod preprocessor;
+mod vocabulary;
+
+pub(crate) use collector::{
+    alias_target_of, collect_import_edge, collect_inheritance_edges, is_call_scan_barrier,
+    is_import_node, is_unreported_call, scan_binding_declarations, scan_call_edges,
+    scan_return_types,
+};
+pub(crate) use partition::{PartitionedGraph, partition_walk};
+#[cfg(test)]
+pub(crate) use partition::{PendingNameRef, ResolvedNameEdge};
+pub(crate) use preprocessor::scan_preprocessor;
+
+use std::collections::{HashMap, HashSet};
+
+use crate::domain::{GraphEdgeKind, PreprocessorDirective};
+
+/// Owner index standing in for file scope. Import references belong to the
+/// file, not to any entity; the TypeScript original passes the file ID here.
+/// The partition step maps this sentinel onto the file node's ID. Never
+/// allocated by [`WalkContext::next_entity_index`].
+pub(crate) const FILE_SCOPE_INDEX: usize = usize::MAX;
+
+/// An edge whose both endpoints are known at walk time. Only `contains`
+/// qualifies: the target entity is created during the same walk, so its index
+/// is available from the scope stack. Positions use one-based lines and
+/// zero-based columns, matching [`crate::domain::TextRange`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WalkEdge {
+    pub source_index: usize,
+    pub target_index: usize,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// A name-based reference buffered during the walk. The target is only a name
+/// at this point (the definition may live in another file, later in this file,
+/// or not exist at all), so these are partitioned after the walk: in-file
+/// resolvable ones become edges, the rest become pending refs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NameEdge {
+    pub ref_kind: GraphEdgeKind,
+    /// Entity index owning the reference ([`FILE_SCOPE_INDEX`] for imports).
+    pub owner_index: usize,
+    /// Short name of the referenced symbol (last segment for `a.b()`).
+    pub ref_name: String,
+    /// Receiver text for member calls (`a.b()` → `Some("a")`).
+    pub receiver_name: Option<String>,
+    /// Original reference text as written in the source.
+    pub raw_text: Option<String>,
+    /// Declared type of the bound name for `Declares` edges
+    /// (`var x = new X()` → `Some("X")`).
+    pub bound_type: Option<String>,
+    /// Last line the binding stays in effect, for a name a loop scopes
+    /// (`for (Widget w : ws)`): past that line the name means what the rest of
+    /// the body says it means. `None` keeps the binding until the body ends.
+    pub bound_until: Option<usize>,
+    /// Exclusive end of a branch/loop-local binding, in source coordinates.
+    pub scope_end: Option<(usize, usize)>,
+    /// Argument count at the call site, when the reference is a call.
+    pub arity: Option<usize>,
+    /// Where the call stands relative to building a value. A type is a
+    /// legitimate call target at a construction site even though a type is not
+    /// callable in general, and the two forms differ: a language with a
+    /// separate constructor entity builds `new X()` through it.
+    pub constructs: Constructs,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// The construction forms a call site can take.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Constructs {
+    /// An ordinary call.
+    #[default]
+    None,
+    /// A call whose result initializes a value: `auto w = Widget(1)`,
+    /// `x = Widget(1)`. The named type is the target where the language mints
+    /// no separate constructor entity.
+    Value,
+    /// A `new X()` site. Every language here builds through the constructor,
+    /// so a C/C++ type name is not what the source reaches.
+    New,
+}
+
+impl Constructs {
+    /// Whether the site builds a value at all.
+    pub(crate) fn is_some(self) -> bool {
+        self != Self::None
+    }
+
+    /// The metadata spelling the resolver reads back.
+    pub(crate) fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Value => Some("value"),
+            Self::New => Some("new"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BindingScope {
+    bytes: std::ops::Range<usize>,
+    end: Option<(usize, usize)>,
+}
+
+/// Mutable state carried through a single AST walk.
+#[derive(Debug)]
+pub(crate) struct WalkContext {
+    resolved_edges: Vec<WalkEdge>,
+    name_edges: Vec<NameEdge>,
+    scope_stack: Vec<usize>,
+    symbols: HashMap<String, Vec<usize>>,
+    /// Symbols declared at file top level. A bare call may only bind to these
+    /// from the file scope: `symbols` also holds members and nested
+    /// definitions, and a member is not visible to a top-level caller that
+    /// never received a receiver of its container's type.
+    file_symbols: HashMap<String, Vec<usize>>,
+    /// Symbols each containing entity declares directly in its body, the
+    /// innermost-scope shadow table: a call inside `outer` that names
+    /// `work` binds the nested `outer::work` before any file-level name.
+    scoped_symbols: HashMap<usize, HashMap<String, usize>>,
+    /// Names each entity takes for itself without necessarily binding them to
+    /// an indexable target: parameters, and locals whose type the index cannot
+    /// spell. A bare call through such a name reaches the local value, never
+    /// the file-level symbol of the same name.
+    shadowed_names: HashMap<usize, HashSet<String>>,
+    /// Names a class body imports from another scope (`using First<T>::Run;`).
+    /// A bare call of such a name inside that class reaches the imported
+    /// member, so the file's own namesake cannot answer it.
+    borrowed_names: HashMap<usize, HashSet<String>>,
+    /// Names a declaration makes another spelling of an existing value
+    /// (`const dispatch = send`): a bare call through the bound name reaches
+    /// the aliased one. Grouped by owner like the shadow table, and keyed
+    /// [`FILE_SCOPE_INDEX`] for a declaration written at the file's top level,
+    /// which every body of the file can see.
+    value_aliases: HashMap<(usize, String), String>,
+    seen_name_edges: HashSet<(GraphEdgeKind, usize, Option<String>, String, usize, usize)>,
+    /// Factory return types this file spells: `Some` answers a bare-call
+    /// initializer (`x = makeX()`), `None` marks a name registered with two
+    /// different types whose factory answer is ambiguous.
+    return_types: HashMap<String, Option<String>>,
+    /// C/C++ preprocessor directives in source order. The resolver replays
+    /// them to decide whether a call site's name was already a macro.
+    preprocessor: Vec<PreprocessorDirective>,
+    /// Declaration scopes for assignment lookup, prepared once from the AST.
+    /// This is walk-only state; only the existing `scope_end` travels with edges.
+    binding_scopes: HashMap<String, Vec<BindingScope>>,
+    entity_counter: usize,
+    /// False when the workspace does not keep a graph: every collector
+    /// returns immediately and no buffer is ever filled.
+    collecting: bool,
+}
+
+impl Default for WalkContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WalkContext {
+    pub(crate) fn new() -> Self {
+        Self::with_collection(true)
+    }
+
+    /// A context that records nothing. Extraction builds it for workspaces
+    /// without graph storage so the graph scans do only a flag check.
+    pub(crate) fn disabled() -> Self {
+        Self::with_collection(false)
+    }
+
+    fn with_collection(collecting: bool) -> Self {
+        Self {
+            resolved_edges: Vec::new(),
+            name_edges: Vec::new(),
+            scope_stack: Vec::new(),
+            symbols: HashMap::new(),
+            file_symbols: HashMap::new(),
+            scoped_symbols: HashMap::new(),
+            shadowed_names: HashMap::new(),
+            borrowed_names: HashMap::new(),
+            value_aliases: HashMap::new(),
+            seen_name_edges: HashSet::new(),
+            return_types: HashMap::new(),
+            preprocessor: Vec::new(),
+            binding_scopes: HashMap::new(),
+            entity_counter: 0,
+            collecting,
+        }
+    }
+
+    /// False when this walk records no graph state.
+    pub(crate) fn is_collecting(&self) -> bool {
+        self.collecting
+    }
+
+    /// Records the file's preprocessor directives, in source order.
+    pub(crate) fn register_preprocessor(&mut self, directives: Vec<PreprocessorDirective>) {
+        if self.collecting {
+            self.preprocessor = directives;
+        }
+    }
+
+    /// Allocates the next per-file entity ordinal. Ordinals follow walk order,
+    /// so they are stable for unchanged file content.
+    pub(crate) fn next_entity_index(&mut self) -> usize {
+        let index = self.entity_counter;
+        self.entity_counter += 1;
+        index
+    }
+
+    /// Index of the innermost containing entity, or `None` at file top level.
+    pub(crate) fn current_scope_index(&self) -> Option<usize> {
+        self.scope_stack.last().copied()
+    }
+
+    /// Enters an entity's scope; must be paired with [`Self::pop_scope`].
+    pub(crate) fn push_scope(&mut self, index: usize) {
+        self.scope_stack.push(index);
+    }
+
+    /// Leaves the innermost entity scope.
+    pub(crate) fn pop_scope(&mut self) {
+        self.scope_stack.pop();
+    }
+
+    /// Registers a symbol so partition can resolve in-file references to it.
+    /// Absent and empty names are skipped, mirroring the TypeScript guard.
+    /// The registration also records whether the symbol is file-level: the
+    /// walk calls this before pushing the entity's own scope, so an empty
+    /// scope stack means a top-level declaration.
+    pub(crate) fn register_symbol(&mut self, name: Option<&str>, index: usize) {
+        if !self.collecting {
+            return;
+        }
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return;
+        };
+        self.symbols.entry(name.to_owned()).or_default().push(index);
+        if self.current_scope_index().is_none() {
+            self.file_symbols
+                .entry(name.to_owned())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    /// Registers a nested entity under its containing entity's local name
+    /// table: inside that entity's body the nested spelling shadows any
+    /// file-level name. The registration is a no-op at file top level.
+    pub(crate) fn register_scoped_symbol(&mut self, name: Option<&str>, index: usize) {
+        if !self.collecting {
+            return;
+        }
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return;
+        };
+        let Some(owner) = self.current_scope_index() else {
+            return;
+        };
+        self.scoped_symbols
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned(), index);
+    }
+
+    /// Records that `owner`'s body takes `name` for a local value or
+    /// parameter. The name is taken whether or not the local's type is
+    /// known: a parameter annotated `() => void` hides an imported function
+    /// of the same name just as surely as a typed one does.
+    pub(crate) fn register_shadowed_name(&mut self, owner: usize, name: &str) {
+        if !self.collecting || name.is_empty() {
+            return;
+        }
+        self.shadowed_names
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned());
+    }
+
+    /// Records that `owner`'s class body imports `name` from another scope
+    /// (`using First<T>::Run;`). A bare call of that name written in the
+    /// class's bodies reaches the imported member, so the file's own namesake
+    /// cannot answer it.
+    pub(crate) fn register_borrowed_name(&mut self, owner: usize, name: &str) {
+        if !self.collecting || name.is_empty() {
+            return;
+        }
+        self.borrowed_names
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned());
+    }
+
+    /// Records that `owner` declares `name` as another spelling of `target`
+    /// (`const dispatch = send`). Kept apart from the type bindings: a value
+    /// alias answers "which function does this call reach", while a bound type
+    /// answers "which class does this receiver hold", and one rule must never
+    /// read the other's evidence as its own.
+    pub(crate) fn register_value_alias(&mut self, owner: usize, name: &str, target: &str) {
+        if !self.collecting || name.is_empty() || target.is_empty() {
+            return;
+        }
+        self.value_aliases
+            .insert((owner, name.to_owned()), target.to_owned());
+    }
+
+    #[allow(dead_code)]
+    /// The per-entity local name tables partition consults before the
+    /// file-level one.
+    pub(crate) fn scoped_symbols(&self) -> &HashMap<usize, HashMap<String, usize>> {
+        &self.scoped_symbols
+    }
+
+    /// Entity indices in this file that declare `name`, if any.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn lookup_symbol(&self, name: &str) -> Option<&[usize]> {
+        self.symbols.get(name).map(Vec::as_slice)
+    }
+
+    /// True when exactly one entity in this file declares `name`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_unique_symbol(&self, name: &str) -> bool {
+        self.symbols
+            .get(name)
+            .is_some_and(|indices| indices.len() == 1)
+    }
+
+    /// Emits a `contains` edge from the innermost scope. Top-level entities
+    /// produce no walk-time edge; the graph assembly links them to the file
+    /// node once it is materialized.
+    pub(crate) fn add_contains_edge(&mut self, target_index: usize, line: usize, column: usize) {
+        if !self.collecting {
+            return;
+        }
+        let Some(source_index) = self.current_scope_index() else {
+            return;
+        };
+        self.resolved_edges.push(WalkEdge {
+            source_index,
+            target_index,
+            line,
+            column,
+        });
+    }
+
+    /// Buffers a name-based reference, deduplicating repeated collection at the
+    /// same source position. Calls at different positions remain distinct.
+    pub(crate) fn add_name_edge(&mut self, edge: NameEdge) {
+        if !self.collecting {
+            return;
+        }
+        // Containment uses its own buffer ([`Self::add_contains_edge`]); every
+        // name reference is a call, import, inheritance clause, or binding.
+        debug_assert_ne!(
+            edge.ref_kind,
+            GraphEdgeKind::Contains,
+            "name references never carry containment"
+        );
+        // The site coordinates close the key: two calls of one shape at
+        // different sites are distinct evidence (`x.foo()` before and after
+        // `x = new Y()` bind different types), while a twice-collected site
+        // still collapses.
+        let key = (
+            edge.ref_kind,
+            edge.owner_index,
+            edge.receiver_name.clone(),
+            edge.ref_name.clone(),
+            edge.line,
+            edge.column,
+        );
+        if !self.seen_name_edges.insert(key) {
+            return;
+        }
+        self.name_edges.push(edge);
+    }
+
+    /// Convenience wrapper for buffered call references.
+    // Mirrors the NameEdge fields callers already have in hand; folding them
+    // into a struct would only relocate the verbosity to every call site.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_call_edge(
+        &mut self,
+        owner_index: usize,
+        ref_name: &str,
+        receiver_name: Option<&str>,
+        raw_text: Option<&str>,
+        arity: Option<usize>,
+        line: usize,
+        column: usize,
+    ) {
+        self.add_call_site(
+            owner_index,
+            ref_name,
+            receiver_name,
+            raw_text,
+            arity,
+            line,
+            column,
+            Constructs::None,
+        );
+    }
+
+    /// Buffers a call that constructs a value (`new X()`, `auto x = X(1)`).
+    /// The construction site is the one place a type name is a correct call
+    /// target, so the form travels with the reference to the resolver.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_construction_edge(
+        &mut self,
+        owner_index: usize,
+        ref_name: &str,
+        receiver_name: Option<&str>,
+        raw_text: Option<&str>,
+        arity: Option<usize>,
+        line: usize,
+        column: usize,
+        constructs: Constructs,
+    ) {
+        self.add_call_site(
+            owner_index,
+            ref_name,
+            receiver_name,
+            raw_text,
+            arity,
+            line,
+            column,
+            constructs,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_call_site(
+        &mut self,
+        owner_index: usize,
+        ref_name: &str,
+        receiver_name: Option<&str>,
+        raw_text: Option<&str>,
+        arity: Option<usize>,
+        line: usize,
+        column: usize,
+        constructs: Constructs,
+    ) {
+        self.add_name_edge(NameEdge {
+            ref_kind: GraphEdgeKind::Calls,
+            owner_index,
+            ref_name: ref_name.to_owned(),
+            receiver_name: receiver_name.map(str::to_owned),
+            raw_text: raw_text.map(str::to_owned),
+            bound_type: None,
+            bound_until: None,
+            scope_end: None,
+            arity,
+            constructs,
+            line,
+            column,
+        });
+    }
+
+    /// Buffers a variable/parameter type binding (`var x = new X()`,
+    /// `caller(Left a)`): the owner declares that `name`'s receiver type is
+    /// `bound_type`. Always pending — the type entity may live in another
+    /// file — and consumed by the resolver when a call names `name` as its
+    /// receiver at or after this line. `until` bounds the binding to the
+    /// statement that scopes it (`for (Widget w : ws)`).
+    pub(crate) fn add_declare_binding(
+        &mut self,
+        owner_index: usize,
+        name: &str,
+        bound_type: &str,
+        line: usize,
+        column: usize,
+        until: Option<usize>,
+    ) {
+        if !self.collecting {
+            return;
+        }
+        // Bindings bypass the name-edge dedup: rebinding one name to a
+        // different type is exactly the evidence the resolver orders by
+        // line, and identical redeclarations collapse harmlessly at
+        // resolution time.
+        self.name_edges.push(NameEdge {
+            ref_kind: GraphEdgeKind::Declares,
+            owner_index,
+            ref_name: name.to_owned(),
+            receiver_name: None,
+            raw_text: None,
+            bound_type: Some(bound_type.to_owned()),
+            bound_until: until,
+            scope_end: None,
+            arity: None,
+            constructs: Constructs::None,
+            line,
+            column,
+        });
+    }
+
+    pub(crate) fn add_scoped_binding(
+        &mut self,
+        owner: usize,
+        name: &str,
+        ty: &str,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) {
+        if !self.collecting {
+            return;
+        }
+        self.add_declare_binding(owner, name, ty, start.0, start.1, None);
+        if let Some(binding) = self.name_edges.last_mut() {
+            binding.scope_end = Some(end);
+        }
+    }
+
+    pub(super) fn register_binding_scope(
+        &mut self,
+        name: &str,
+        bytes: std::ops::Range<usize>,
+        end: Option<(usize, usize)>,
+    ) {
+        if !self.collecting {
+            return;
+        }
+        self.binding_scopes
+            .entry(name.to_owned())
+            .or_default()
+            .push(BindingScope { bytes, end });
+    }
+
+    pub(super) fn assignment_scope_end(&self, name: &str, at: usize) -> Option<(usize, usize)> {
+        let root = name.split('.').next().unwrap_or(name);
+        self.binding_scopes
+            .get(root)?
+            .iter()
+            .filter(|scope| scope.bytes.contains(&at))
+            .min_by_key(|scope| scope.bytes.end - scope.bytes.start)
+            .and_then(|scope| scope.end)
+    }
+
+    /// Registers one function's factory return type: the signature's
+    /// annotation, or the type its `return` construction spells. A name
+    /// registered with two different types (same-named methods, overloads)
+    /// becomes ambiguous and stops answering factory lookups.
+    pub(crate) fn register_return_type(&mut self, name: &str, return_type: &str) {
+        if !self.collecting {
+            return;
+        }
+        let entry = self.return_types.entry(name.to_owned()).or_insert(None);
+        match entry {
+            None => *entry = Some(return_type.to_owned()),
+            Some(existing) if existing == return_type => {}
+            Some(_) => *entry = None,
+        }
+    }
+
+    /// The factory return type a bare call (`makeX()`) resolves to, as
+    /// registered by this file's function signatures and return bodies.
+    pub(crate) fn factory_return_of(&self, name: &str) -> Option<&str> {
+        self.return_types.get(name)?.as_deref()
+    }
+
+    /// Convenience wrapper for buffered import references. The owner is the
+    /// file scope: imports belong to the file, not to any entity.
+    pub(crate) fn add_import_edge(
+        &mut self,
+        module_path: &str,
+        raw_text: Option<&str>,
+        line: usize,
+        column: usize,
+    ) {
+        self.add_name_edge(NameEdge {
+            ref_kind: GraphEdgeKind::Imports,
+            owner_index: FILE_SCOPE_INDEX,
+            ref_name: module_path.to_owned(),
+            receiver_name: None,
+            raw_text: raw_text.map(str::to_owned),
+            bound_type: None,
+            bound_until: None,
+            scope_end: None,
+            arity: None,
+            constructs: Constructs::None,
+            line,
+            column,
+        });
+    }
+
+    /// Convenience wrapper for buffered `extends`/`implements` references.
+    pub(crate) fn add_inheritance_edge(
+        &mut self,
+        ref_kind: GraphEdgeKind,
+        owner_index: usize,
+        ref_name: &str,
+        raw_text: Option<&str>,
+        line: usize,
+        column: usize,
+    ) {
+        debug_assert!(matches!(
+            ref_kind,
+            GraphEdgeKind::Extends | GraphEdgeKind::Implements
+        ));
+        self.add_name_edge(NameEdge {
+            ref_kind,
+            owner_index,
+            ref_name: ref_name.to_owned(),
+            receiver_name: None,
+            raw_text: raw_text.map(str::to_owned),
+            bound_type: None,
+            bound_until: None,
+            scope_end: None,
+            arity: None,
+            constructs: Constructs::None,
+            line,
+            column,
+        });
+    }
+
+    /// Walk-time resolved (`contains`) edges collected so far. Consumed by the
+    /// post-walk partition and by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolved_edges(&self) -> &[WalkEdge] {
+        &self.resolved_edges
+    }
+
+    /// Buffered name references collected so far. Consumed by the post-walk
+    /// partition and by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn name_edges(&self) -> &[NameEdge] {
+        &self.name_edges
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocates_entity_indices_in_walk_order() {
+        let mut context = WalkContext::new();
+        assert_eq!(context.next_entity_index(), 0);
+        assert_eq!(context.next_entity_index(), 1);
+        assert_eq!(context.next_entity_index(), 2);
+    }
+
+    #[test]
+    fn contains_edges_follow_the_scope_stack() {
+        let mut context = WalkContext::new();
+        let outer = context.next_entity_index();
+        context.push_scope(outer);
+        let inner = context.next_entity_index();
+        context.add_contains_edge(inner, 10, 4);
+        context.pop_scope();
+        let top_level = context.next_entity_index();
+        context.add_contains_edge(top_level, 20, 0);
+        // Top-level entities are linked to the file node during assembly, so
+        // they produce no walk-time edge.
+        assert_eq!(
+            context.resolved_edges(),
+            &[WalkEdge {
+                source_index: outer,
+                target_index: inner,
+                line: 10,
+                column: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn registers_and_looks_up_symbols() {
+        let mut context = WalkContext::new();
+        context.register_symbol(None, 0);
+        context.register_symbol(Some(""), 1);
+        context.register_symbol(Some("helper"), 2);
+        context.register_symbol(Some("helper"), 3);
+        context.register_symbol(Some("unique"), 4);
+        assert_eq!(context.lookup_symbol("helper"), Some(&[2, 3][..]));
+        assert_eq!(context.lookup_symbol("missing"), None);
+        assert!(context.is_unique_symbol("unique"));
+        assert!(!context.is_unique_symbol("helper"));
+        assert!(!context.is_unique_symbol("missing"));
+    }
+
+    #[test]
+    fn collapses_duplicate_name_edges() {
+        let mut context = WalkContext::new();
+        context.add_call_edge(0, "helper", None, None, None, 3, 1);
+        // Same site: the twice-collected call collapses even when the
+        // decorative evidence (raw text, arity) differs.
+        context.add_call_edge(0, "helper", None, Some("helper()"), Some(0), 3, 1);
+        // The same shape at another site is distinct evidence: `x.foo()`
+        // before and after `x = new Y()` bind different declarations.
+        context.add_call_edge(0, "helper", None, None, None, 9, 8);
+        // A distinct receiver binds independently: `this.helper()` can
+        // resolve to another declaration than a bare `helper()`.
+        context.add_call_edge(
+            0,
+            "helper",
+            Some("this"),
+            Some("this.helper()"),
+            Some(0),
+            10,
+            9,
+        );
+        context.add_call_edge(1, "helper", None, None, None, 4, 2);
+        context.add_call_edge(0, "other", None, None, None, 5, 3);
+        assert_eq!(context.name_edges().len(), 5);
+    }
+
+    #[test]
+    fn buffers_call_import_and_inheritance_references() {
+        let mut context = WalkContext::new();
+        let owner = context.next_entity_index();
+        context.add_call_edge(
+            owner,
+            "bark",
+            Some("dog"),
+            Some("dog.bark()"),
+            Some(2),
+            7,
+            11,
+        );
+        context.add_import_edge("./utils.js", Some("import './utils.js'"), 1, 0);
+        context.add_inheritance_edge(GraphEdgeKind::Extends, owner, "Animal", None, 2, 5);
+        context.add_inheritance_edge(GraphEdgeKind::Implements, owner, "Runnable", None, 2, 5);
+
+        let edges = context.name_edges();
+        assert_eq!(
+            edges[0],
+            NameEdge {
+                ref_kind: GraphEdgeKind::Calls,
+                owner_index: owner,
+                ref_name: "bark".to_owned(),
+                receiver_name: Some("dog".to_owned()),
+                raw_text: Some("dog.bark()".to_owned()),
+                bound_type: None,
+                bound_until: None,
+                scope_end: None,
+                arity: Some(2),
+                constructs: Constructs::None,
+                line: 7,
+                column: 11,
+            }
+        );
+        assert_eq!(edges[1].ref_kind, GraphEdgeKind::Imports);
+        assert_eq!(edges[1].owner_index, FILE_SCOPE_INDEX);
+        assert_eq!(edges[1].ref_name, "./utils.js");
+        assert_eq!(edges[2].ref_kind, GraphEdgeKind::Extends);
+        assert_eq!(edges[3].ref_kind, GraphEdgeKind::Implements);
+    }
+}

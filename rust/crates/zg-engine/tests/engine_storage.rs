@@ -19,15 +19,252 @@ use zg_engine::{
     api::{
         context::{
             ContextOptions,
-            options::{ContextRoute, ContextRouteMode, QueryFilter, SymbolType},
+            options::{ContextRoute, ContextRouteMode, QueryFilter, RefreshPolicy, SymbolType},
             result::{ContextItemStatus, EntityMetadata},
         },
         index::{IndexOptions, options::WorkspaceChange},
         info::InfoOptions,
+        relationships::RelationshipOptions,
     },
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[tokio::test]
+async fn unowned_callback_content_survives_reopen_for_fts_and_vector_search() -> TestResult {
+    let server = EmbeddingServer::start()?;
+    for extension in ["js", "ts"] {
+        for graph_enabled in [false, true] {
+            let temporary = tempdir()?;
+            let root = temporary.path();
+            configure_remote_model(root, server.address)?;
+            let path = root.join(format!("callbacks.{extension}"));
+            fs::write(
+                &path,
+                "function helper() {}\n\
+                 suite('case', () => { const expected = 'callbackneedle'; });\n\
+                 function run() { helper(); }\n",
+            )?;
+            let engine = ZvecGrep::new();
+            let indexed = engine
+                .index(IndexOptions {
+                    graph_indexing: Some(graph_enabled),
+                    rebuild: true,
+                    ..index_options(root)
+                })
+                .await?;
+            assert_eq!((indexed.files_added, indexed.files_failed), (1, 0));
+            engine.close();
+            fs::remove_file(&path)?;
+            let engine = ZvecGrep::new();
+            for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+                let result = engine
+                    .context(ContextOptions {
+                        root: Some(root.to_path_buf()),
+                        routes: vec![ContextRoute {
+                            mode,
+                            query: "callbackneedle".into(),
+                        }],
+                        auto_update: false,
+                        allow_remote: true,
+                        limit: Some(20),
+                        ..ContextOptions::default()
+                    })
+                    .await?;
+                assert!(
+                    result.items.iter().any(|item| {
+                        item.content.contains("callbackneedle") && item.metadata.is_none()
+                    }),
+                    "{extension} graph={graph_enabled} {mode:?}: {result:?}"
+                );
+            }
+            if graph_enabled {
+                let relationships = engine
+                    .callees(RelationshipOptions {
+                        root: Some(root.to_path_buf()),
+                        symbol: "run".into(),
+                        ..RelationshipOptions::default()
+                    })
+                    .await?;
+                assert_eq!(relationships.matches.len(), 1);
+                assert_eq!(relationships.matches[0].edges.len(), 1);
+                assert_eq!(
+                    relationships.matches[0].edges[0]
+                        .symbol
+                        .as_ref()
+                        .map(|s| s.name.as_str()),
+                    Some("helper")
+                );
+            }
+            engine.close();
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexed_calls_preserve_distinct_source_positions() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    fs::write(
+        root.join("calls.rs"),
+        "fn target() {}\nfn caller() {\n    target(); target();\n    target();\n}\n",
+    )?;
+    let engine = ZvecGrep::new();
+    let indexed = engine
+        .index(IndexOptions {
+            graph_indexing: Some(true),
+            rebuild: true,
+            ..index_options(root)
+        })
+        .await?;
+    assert_eq!((indexed.files_added, indexed.files_failed), (1, 0));
+    engine.close();
+    let engine = ZvecGrep::new();
+    let options = RelationshipOptions {
+        root: Some(root.to_path_buf()),
+        symbol: "caller".into(),
+        limit: Some(3),
+        ..RelationshipOptions::default()
+    };
+    let result = engine.callees(options.clone()).await?;
+    assert_eq!(result.matches.len(), 1);
+    let matched = &result.matches[0];
+    assert_eq!(matched.edges.len(), 3);
+    assert!(!matched.truncated);
+    let positions = matched
+        .edges
+        .iter()
+        .map(|edge| (edge.line, edge.column))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        positions,
+        BTreeSet::from([(Some(3), Some(4)), (Some(3), Some(14)), (Some(4), Some(4))])
+    );
+    let limited = engine
+        .callees(RelationshipOptions {
+            limit: Some(1),
+            ..options
+        })
+        .await?;
+    assert_eq!(limited.matches[0].edges.len(), 1);
+    assert!(limited.matches[0].truncated);
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_graph_requires_rebuild_and_restores_unchanged_relationships() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    for (path, source) in [
+        (
+            "changed.rs",
+            "fn changed_target() {}\nfn changed_caller() { changed_target(); }\n",
+        ),
+        (
+            "stable.rs",
+            "fn stable_target() {}\nfn stable_caller() { stable_target(); }\n",
+        ),
+    ] {
+        fs::write(root.join(path), source)?;
+    }
+    let options = |symbol: &str| RelationshipOptions {
+        root: Some(root.to_path_buf()),
+        symbol: symbol.into(),
+        ..RelationshipOptions::default()
+    };
+    let rebuild_options = IndexOptions {
+        graph_indexing: Some(true),
+        rebuild: true,
+        ..index_options(root)
+    };
+    let engine = ZvecGrep::new();
+    let indexed = engine.index(rebuild_options.clone()).await?;
+    assert_eq!((indexed.files_added, indexed.files_failed), (2, 0));
+    let outgoing = engine.callees(options("stable_caller")).await?;
+    let callers = engine.callers(options("stable_target")).await?;
+    assert_eq!(outgoing.matches[0].edges.len(), 1);
+    assert_eq!(callers.matches[0].edges.len(), 1);
+    engine.close();
+
+    let graph_path = root.join(".zvec-grep/index/graph/graph.sqlite");
+    fs::remove_file(&graph_path)?;
+    fs::write(
+        root.join("changed.rs"),
+        "fn changed_target() {}\nfn changed_caller() { changed_target(); changed_target(); }\n",
+    )?;
+    let manifest_path = root.join(".zvec-grep/manifest.json");
+    let manifest = fs::read(&manifest_path)?;
+    let embedded = server.inputs.load(Ordering::Acquire);
+    let nested = root.join("nested");
+    fs::create_dir(&nested)?;
+    let workspace_root = fs::canonicalize(root)?;
+    let engine = ZvecGrep::new();
+    engine.enable_read_session_cache()?;
+    let search = ContextOptions {
+        root: Some(root.to_path_buf()),
+        routes: vec![ContextRoute {
+            mode: ContextRouteMode::Fts,
+            query: "stable_caller".into(),
+        }],
+        refresh: Some(RefreshPolicy::Off),
+        ..ContextOptions::default()
+    };
+    assert!(!engine.context(search.clone()).await?.items.is_empty());
+    for error in [
+        engine
+            .callers(options("stable_target"))
+            .await
+            .expect_err("missing graph"),
+        engine
+            .callees(options("stable_caller"))
+            .await
+            .expect_err("missing graph"),
+        engine
+            .index(index_options(root))
+            .await
+            .expect_err("incremental indexing cannot recreate a graph"),
+        engine
+            .context(ContextOptions {
+                root: Some(nested.clone()),
+                refresh: Some(RefreshPolicy::Wait),
+                allow_remote: true,
+                ..search.clone()
+            })
+            .await
+            .expect_err("nested refresh must report the parent workspace's missing graph"),
+    ] {
+        assert_missing_graph_error(&error, &workspace_root);
+        assert!(!nested.join(".zvec-grep").exists());
+        assert!(!graph_path.exists());
+        assert_eq!(fs::read(&manifest_path)?, manifest);
+    }
+    assert_eq!(server.inputs.load(Ordering::Acquire), embedded);
+    assert!(!engine.context(search).await?.items.is_empty());
+
+    let rebuilt = engine.index(rebuild_options).await?;
+    assert_eq!((rebuilt.files_added, rebuilt.files_failed), (2, 0));
+    assert_eq!(engine.callees(options("stable_caller")).await?, outgoing);
+    assert_eq!(engine.callers(options("stable_target")).await?, callers);
+    let changed = engine.callees(options("changed_caller")).await?;
+    assert_eq!(changed.matches[0].edges.len(), 2);
+    assert!(graph_path.is_file());
+    engine.close();
+    Ok(())
+}
+
+fn assert_missing_graph_error(error: &EngineError, root: &Path) {
+    assert_eq!(error.code(), EngineError::NOT_FOUND);
+    let help = error.help().expect("rebuild guidance");
+    assert!(help.contains("zg --index --rebuild --graph"));
+    assert!(help.contains(root.to_string_lossy().as_ref()));
+    assert_eq!(error.report().workspace_root.as_deref(), Some(root));
+}
 
 #[tokio::test]
 async fn extensionless_scripts_preserve_outline_language_across_reopen() -> TestResult {
@@ -45,16 +282,24 @@ async fn extensionless_scripts_preserve_outline_language_across_reopen() -> Test
             "node-tool",
             "#!/usr/bin/env node\nclass Probe {\n    outline_probe() { return stored_call(); }\n}\n",
         ),
+        (
+            "uv-tool",
+            "#!/usr/bin/env -S uv run --script\n# /// script\n# requires-python = \">=3.12\"\n# dependencies = []\n# ///\nclass Probe:\n    def outline_probe(self):\n        return stored_call()\n",
+        ),
+        (
+            "uv-options-tool",
+            "#!/usr/bin/env -S uv run --no-project --python 3.12 --with requests --script\nclass Probe:\n    def outline_probe(self):\n        return stored_call()\n",
+        ),
     ] {
         fs::write(root.join("bin").join(name), source)?;
     }
     let engine = ZvecGrep::new();
     let indexed = engine.index(index_options(root)).await?;
-    assert_eq!((indexed.files_added, indexed.files_failed), (2, 0));
+    assert_eq!((indexed.files_added, indexed.files_failed), (4, 0));
     engine.close();
 
     // Both language and outline must describe stored source, not current files.
-    for name in ["python-tool", "node-tool"] {
+    for name in ["python-tool", "node-tool", "uv-tool", "uv-options-tool"] {
         fs::write(root.join("bin").join(name), "#!/bin/sh\necho changed\n")?;
     }
     let engine = ZvecGrep::new();
@@ -67,11 +312,16 @@ async fn extensionless_scripts_preserve_outline_language_across_reopen() -> Test
             }],
             auto_update: false,
             allow_remote: true,
-            limit: Some(10),
+            limit: Some(20),
             ..ContextOptions::default()
         })
         .await?;
-    for (name, language) in [("python-tool", "python"), ("node-tool", "javascript")] {
+    for (name, language) in [
+        ("python-tool", "python"),
+        ("node-tool", "javascript"),
+        ("uv-tool", "python"),
+        ("uv-options-tool", "python"),
+    ] {
         for (kind, symbol, summary) in [
             (SymbolType::Function, "outline_probe", "calls: stored_call"),
             (SymbolType::Class, "Probe", "members:"),
@@ -91,6 +341,111 @@ async fn extensionless_scripts_preserve_outline_language_across_reopen() -> Test
             );
         }
     }
+    engine.drop_index(info_options(root)).await?;
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_extensions_are_indexed_and_searchable_as_text() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let server = EmbeddingServer::start()?;
+    configure_remote_model(root, server.address)?;
+    let sources = [
+        (
+            "module.bsl",
+            "Процедура ОбработатьЗаказ()\n    Сообщить(\"orchardguide\");\nКонецПроцедуры\n",
+        ),
+        (
+            "bom.bsl",
+            "\u{feff}Процедура Проверка()\n    Сообщить(\"orchardguide\");\nКонецПроцедуры\n",
+        ),
+        ("thing.custom", "orchardguide custom text"),
+        ("settings.conf", "orchardguide configuration"),
+        ("Caddyfile", "orchardguide server configuration"),
+        ("noext", "orchardguide extensionless text"),
+    ];
+    for (name, content) in sources {
+        fs::write(root.join(name), content)?;
+    }
+    fs::write(root.join("binary.bsl"), [0, 1, 2, 255])?;
+    // NUL is a Windows device name even with a file extension.
+    fs::write(root.join("embedded-nul.bsl"), b"orchardguide\0binary")?;
+    fs::write(root.join("empty.bsl"), "")?;
+    let expected = sources
+        .map(|(name, _)| PathBuf::from(name))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let engine = ZvecGrep::new();
+    for rebuild in [false, true] {
+        let indexed = engine
+            .index(IndexOptions {
+                rebuild,
+                ..index_options(root)
+            })
+            .await?;
+        assert_eq!(
+            (indexed.files_added, indexed.files_failed),
+            (6, 0),
+            "{indexed:?}"
+        );
+        assert_eq!(indexed.skipped_counts["unsupported"], 2);
+        assert_eq!(indexed.skipped_counts["empty"], 1);
+        for mode in [ContextRouteMode::Fts, ContextRouteMode::Vector] {
+            let result = engine
+                .context(ContextOptions {
+                    root: Some(root.to_path_buf()),
+                    routes: vec![ContextRoute {
+                        mode,
+                        query: "orchardguide".into(),
+                    }],
+                    auto_update: false,
+                    allow_remote: true,
+                    limit: Some(20),
+                    ..ContextOptions::default()
+                })
+                .await?;
+            assert_eq!(
+                result
+                    .items
+                    .iter()
+                    .map(|item| item.relative_path.clone())
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            assert!(result.items.iter().all(|item| item.metadata.is_none()));
+        }
+    }
+    let info = engine.info(info_options(root)).await?;
+    let entities = native_documents(&info.index_path.join("entities"))?;
+    assert_eq!(entities.len(), sources.len());
+    for entity in entities {
+        let payload: Value =
+            serde_json::from_str(&entity.get_string("payload")?.expect("payload"))?;
+        assert_eq!(payload["content"]["kind"], "text");
+    }
+    let inputs = server.inputs.load(Ordering::Acquire);
+    let unchanged = engine.index(index_options(root)).await?;
+    assert_eq!((unchanged.files_unchanged, unchanged.files_failed), (6, 0));
+    assert_eq!(server.inputs.load(Ordering::Acquire), inputs);
+    engine.close();
+
+    let engine = ZvecGrep::new();
+    fs::write(root.join("module.bsl"), "Сообщить(\"replacementguide\");\n")?;
+    let updated = engine.index(index_options(root)).await?;
+    assert_eq!(
+        (
+            updated.files_modified,
+            updated.files_deleted,
+            updated.files_failed
+        ),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        fts_paths(&engine, root, "replacementguide").await?,
+        [PathBuf::from("module.bsl")]
+    );
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
@@ -521,35 +876,52 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
             .await?;
         assert_eq!(result.items.len(), 1);
         let item = &result.items[0];
-        let Some(zg_engine::api::context::result::ContentRange::Text {
-            start_line,
-            end_line,
+        let zg_engine::api::context::result::ContentRange::Text {
             start_byte_offset,
             end_byte_offset,
-            start_byte_column,
-            end_byte_column,
-        }) = &item.excerpt_range
+            ..
+        } = &item.content_range
         else {
-            panic!("text source excerpt");
+            panic!("text source content");
         };
-        assert_eq!(Some(&item.content_range), item.excerpt_range.as_ref());
         assert_eq!(
             source.get(*start_byte_offset..*end_byte_offset),
             Some(item.content.as_str())
         );
-        for (offset, line, column) in [
-            (*start_byte_offset, *start_line, *start_byte_column),
-            (*end_byte_offset, *end_line, *end_byte_column),
+        assert!(*start_byte_offset == 0 || source.as_bytes()[start_byte_offset - 1] == b'\n');
+        assert!(
+            *end_byte_offset == source.len() || source.as_bytes()[end_byte_offset - 1] == b'\n'
+        );
+        for range in [
+            &item.content_range,
+            item.excerpt_range.as_ref().expect("matched fragment"),
         ] {
-            let prefix = &source[..offset];
-            assert_eq!(
-                line,
-                prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
-            );
-            assert_eq!(
-                column,
-                prefix.rfind('\n').map_or(offset, |last| offset - last - 1)
-            );
+            let zg_engine::api::context::result::ContentRange::Text {
+                start_line,
+                end_line,
+                start_byte_offset: matched_start,
+                end_byte_offset: matched_end,
+                start_byte_column,
+                end_byte_column,
+            } = range
+            else {
+                panic!("text source range");
+            };
+            assert!(start_byte_offset <= matched_start && matched_end <= end_byte_offset);
+            for (offset, line, column) in [
+                (*matched_start, *start_line, *start_byte_column),
+                (*matched_end, *end_line, *end_byte_column),
+            ] {
+                let prefix = &source[..offset];
+                assert_eq!(
+                    line,
+                    prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+                );
+                assert_eq!(
+                    column,
+                    prefix.rfind('\n').map_or(offset, |last| offset - last - 1)
+                );
+            }
         }
         assert_eq!(
             item.content_role,
@@ -692,12 +1064,10 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
 
     let engine = ZvecGrep::new();
     let initial = engine.index(index_options(root)).await?;
-    assert_eq!(initial.files_added, 2, "{initial:?}");
-    assert!(
-        initial
-            .skipped
-            .iter()
-            .any(|file| file.path == root.join("tmp"))
+    assert_eq!(initial.files_added, 3, "{initial:?}");
+    assert_eq!(
+        fts_paths(&engine, root, "memorandum").await?,
+        [PathBuf::from("tmp")]
     );
     assert_eq!(initial.files_failed, 0);
     let info = engine.info(info_options(root)).await?;
@@ -712,7 +1082,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
         .expect("FTS info");
     assert_eq!(fts.tokenizer, "jieba");
     assert_eq!(fts.filters, ["lowercase"]);
-    assert_eq!(info.status.as_ref().expect("status").files_indexed, 2);
+    assert_eq!(info.status.as_ref().expect("status").files_indexed, 3);
     assert_eq!(
         fts_paths(&engine, root, "orchard").await?,
         [PathBuf::from("auth.rs")]
@@ -739,7 +1109,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
     );
     let calls = server.requests.load(Ordering::Acquire);
     let unchanged = engine.index(index_options(root)).await?;
-    assert_eq!(unchanged.files_unchanged, 2);
+    assert_eq!(unchanged.files_unchanged, 3);
     assert_eq!(server.requests.load(Ordering::Acquire), calls);
     engine.close();
     assert_eq!(
@@ -813,7 +1183,7 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
             ..index_options(root)
         })
         .await?;
-    assert_eq!(rebuilt.files_added, 2);
+    assert_eq!(rebuilt.files_added, 3);
     let after_rebuild = engine.info(info_options(root)).await?;
     assert_eq!(
         after_rebuild

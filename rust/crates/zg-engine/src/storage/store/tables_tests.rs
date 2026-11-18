@@ -34,6 +34,7 @@ fn model() -> EmbeddingModelInfo {
 
 fn metadata_store(path: &Path) -> IndexStore {
     IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
         storage_path: path.to_owned(),
         embeddings: vec![model()],
     })
@@ -126,6 +127,16 @@ fn metadata_fragments(
             visibility: None,
             language: None,
             documentation: Some("Produces the seasonal crop.".into()),
+            arity: None,
+            is_exported: false,
+            is_declaration: false,
+            package: None,
+            has_internal_linkage: false,
+            declares_type: false,
+            alias_of: None,
+            object_members: Vec::new(),
+            overwritten_by: None,
+            exported_as: Vec::new(),
         })),
         vec![
             EntityFragment {
@@ -183,6 +194,75 @@ fn assert_projection(store: &IndexStore, entry: &IndexedFragment) {
             "function"
         );
     }
+}
+
+#[test]
+fn counts_live_fragments_across_models_and_read_only_reopens() {
+    let temporary = tempfile::tempdir().expect("temporary storage");
+    let mut other = serde_json::to_value(model()).expect("model metadata");
+    other["model"]["name"] = serde_json::json!("other");
+    let embeddings = vec![
+        model(),
+        serde_json::from_value(other).expect("second model"),
+    ];
+    let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
+        storage_path: temporary.path().to_owned(),
+        embeddings: embeddings.clone(),
+    })
+    .expect("two model storage");
+    assert_eq!(store.count_fragments().expect("empty count"), 0);
+
+    for (id, name) in ["fixture", "other"].into_iter().enumerate() {
+        let (source, entities, mut entries) =
+            metadata_fragments(u32::try_from(id).expect("fixture ID"), name);
+        let source = FileRecord::new(
+            source.id(),
+            SourcePath::new(format!("{name}.rs")).expect("source path"),
+            source.snapshot().clone(),
+            source.index_status().clone(),
+        )
+        .expect("file record");
+        for entry in &mut entries {
+            entry.model = format!("fixture/{name}");
+        }
+        store
+            .apply_fixture_records(&source, &entities, &entries)
+            .expect("write one entity with two fragments");
+    }
+    assert_eq!(store.count_fragments().expect("fragment count"), 4);
+    assert_eq!(
+        store
+            .list_files()
+            .expect("files")
+            .iter()
+            .map(|file| file.index_status().entity_count())
+            .sum::<u64>(),
+        2
+    );
+    store.close().expect("close writer");
+    let reader = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+        graph_enabled: false,
+        storage_path: temporary.path().to_owned(),
+    })
+    .expect("read-only storage");
+    assert_eq!(reader.count_fragments().expect("persisted count"), 4);
+    reader.close().expect("close reader");
+
+    let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
+        storage_path: temporary.path().to_owned(),
+        embeddings,
+    })
+    .expect("reopen writer");
+    store
+        .delete_file(FileId::new(0))
+        .expect("delete first file");
+    assert_eq!(store.count_fragments().expect("remaining count"), 2);
+    store
+        .delete_file(FileId::new(1))
+        .expect("delete second file");
+    assert_eq!(store.count_fragments().expect("empty count"), 0);
 }
 
 #[test]
@@ -406,6 +486,7 @@ fn entity_content_is_canonical_and_fragments_have_one_model() {
         other = serde_json::from_value(metadata).expect("valid model metadata");
     }
     let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
         storage_path: home.path().to_owned(),
         embeddings: vec![text, other],
     })
@@ -489,6 +570,7 @@ fn fragment_ids_cannot_be_reused_by_another_file_in_a_different_model_table() {
         second = serde_json::from_value(metadata).expect("valid model metadata");
     }
     let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        graph_enabled: false,
         storage_path: home.path().to_owned(),
         embeddings: vec![first, second],
     })
@@ -762,6 +844,7 @@ fn maximum_u32_directory_id_survives_reopen_and_filters_both_retrieval_collectio
         .expect("optimize tables");
     store.close().expect("close writer");
     let reader = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
+        graph_enabled: true,
         storage_path: temporary.path().to_owned(),
     })
     .expect("reopen");

@@ -36,12 +36,12 @@ use crate::{
     domain::{
         Content, ContentKind, Entity, EntityFragment, EntityId, EntityMetadata, FileCategory,
         FileFormat, FileGraphResult, FileId, FileIndexStatus, FileRecord, FileSnapshot, FragmentId,
-        Range, SourcePath, Workspace,
+        IndexDescriptor, Range, SourcePath, Workspace,
         model::{EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult},
     },
     extraction::{
-        ExtractedEntity, SourceKind, TextSource, extract_for_indexing, source_kind,
-        vector_content_for_fragment,
+        ExtractedEntity, SourceKind, TextSource, extract_for_indexing, extract_without_graph,
+        source_kind, vector_content_for_fragment,
     },
     file_selection::ScanPolicy,
     models::{
@@ -52,7 +52,9 @@ use crate::{
     utils::{collapse_whitespace, decode_index_text, sha256_hex},
 };
 
-use super::{input_budget::index_chunk_options, model_progress, storage::IndexStorage};
+use super::{
+    graph_assembly, input_budget::index_chunk_options, model_progress, storage::IndexStorage,
+};
 
 const MAX_SKIPPED_FILE_SAMPLES: usize = 20;
 // All default file-size limits are at least this large.
@@ -72,6 +74,10 @@ pub(crate) trait IndexEmbeddingRuntime: Send + Sync {
 
     fn concurrency_defaults(&self) -> EmbeddingConcurrencyDefaults;
 
+    fn batch_concurrency(&self, requested: Option<usize>) -> Option<usize> {
+        crate::models::batch_concurrency(&self.info().model().reference(), requested)
+    }
+
     async fn prepare(
         &self,
         options: EmbeddingPrepareOptions,
@@ -88,6 +94,9 @@ pub(crate) trait IndexEmbeddingRuntime: Send + Sync {
 
 #[async_trait]
 impl IndexEmbeddingRuntime for ModelRuntimeLease {
+    fn batch_concurrency(&self, requested: Option<usize>) -> Option<usize> {
+        self.index_batch_concurrency(requested)
+    }
     fn info(&self) -> &EmbeddingModelInfo {
         self.info()
     }
@@ -261,6 +270,7 @@ pub(crate) async fn get_workspace_index_status(
             .iter()
             .map(|file| file.index_status().entity_count())
             .sum(),
+        fragments_indexed: None,
         indexed_size_bytes: indexed_files
             .iter()
             .map(|file| file.snapshot().size_bytes)
@@ -937,7 +947,7 @@ fn commit_file(
             return Ok(format!("failed {}", file.file.relative_path().display()));
         }
         return Err(EngineError::storage_failure(format!(
-            "replace file {}: {error}",
+            "cannot store index data for {}: {error}",
             file.file.relative_path().display()
         )));
     }
@@ -984,7 +994,7 @@ async fn prepare_candidate(
         .ok_or_else(|| EngineError::internal("index candidate must have a detected format"))?;
     if !matches!(source_kind(formats), Some(SourceKind::Text)) {
         return Err(EngineError::unsupported(format!(
-            "this version only indexes text content: {}",
+            "cannot index {}: only text and code files are supported",
             file.relative_path().display()
         )));
     }
@@ -1001,7 +1011,16 @@ async fn prepare_candidate(
         formats: formats.clone(),
         text: source_text.into_owned(),
     };
-    let extracted = extract_for_indexing(&text, chunk_options)?;
+    let extracted = if context
+        .workspace
+        .index()
+        .descriptor()
+        .is_some_and(IndexDescriptor::graph_indexing)
+    {
+        extract_for_indexing(&text, chunk_options)?
+    } else {
+        extract_without_graph(&text, chunk_options)?
+    };
     let entities = bind_entities(file.id(), extracted.fragments)?;
     let owners = entities
         .iter()
@@ -1019,12 +1038,51 @@ async fn prepare_candidate(
     for fragment in &mut fragments {
         fragment.model = owners[&fragment.entity_id].clone();
     }
+    // A store without graph storage rejects any non-empty graph write, so the
+    // walk-time graph is only assembled when the store would accept it.
+    let graph = if context.storage.graph_enabled() {
+        extracted
+            .graph
+            .as_ref()
+            .map(|graph| {
+                graph_assembly::assemble_file_graph(
+                    &file.id().get().to_string(),
+                    graph_language(formats),
+                    graph,
+                    &entities,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        FileGraphResult::default()
+    };
     Ok(PreparedCandidate::File(Box::new(PreparedFile {
         file,
         entities,
         fragments,
-        graph: extracted.graph.unwrap_or_default(),
+        graph,
     })))
+}
+
+/// Picks the language that owns walk-time graph collection for a source path.
+fn graph_language(formats: &[FileFormat]) -> FileFormat {
+    formats
+        .iter()
+        .copied()
+        .find(|format| {
+            matches!(
+                format,
+                FileFormat::Rust
+                    | FileFormat::TypeScript
+                    | FileFormat::JavaScript
+                    | FileFormat::Python
+                    | FileFormat::Go
+                    | FileFormat::Java
+                    | FileFormat::C
+                    | FileFormat::Cpp
+            )
+        })
+        .unwrap_or(FileFormat::Unknown)
 }
 
 fn model_for_content<'a>(
@@ -1032,9 +1090,10 @@ fn model_for_content<'a>(
     kind: ContentKind,
 ) -> Result<&'a dyn IndexEmbeddingRuntime, EngineError> {
     if !matches!(kind, ContentKind::Text | ContentKind::Code) {
-        return Err(EngineError::unsupported(
-            "this version only supports text embedding",
-        ));
+        return Err(EngineError::unsupported(format!(
+            "cannot embed {kind} content: this index stores text and code vectors only",
+            kind = kind.as_str(),
+        )));
     }
     let index =
         context.workspace.index().descriptor().ok_or_else(|| {
@@ -1147,7 +1206,7 @@ fn append_contents(output: &mut String, contents: &[Content]) {
     }
 }
 
-fn bind_entities(
+pub(super) fn bind_entities(
     file_id: FileId,
     extracted: Vec<ExtractedEntity>,
 ) -> Result<Vec<Entity>, EngineError> {
@@ -1599,7 +1658,7 @@ fn resolve_index_batch_policy(
         return resolve_embedding_policy(requested, model.concurrency_defaults());
     }
     resolve_embedding_policy(
-        crate::models::batch_concurrency(&model.info().model().reference(), requested),
+        model.batch_concurrency(requested),
         model.concurrency_defaults(),
     )
 }
@@ -1994,7 +2053,7 @@ fn scanned_files(
     Ok(scanned)
 }
 
-fn default_file_size_limit(formats: &[FileFormat]) -> u64 {
+pub(super) fn default_file_size_limit(formats: &[FileFormat]) -> u64 {
     let has_category = |category| {
         formats
             .iter()
@@ -2205,7 +2264,10 @@ fn task_control(signal: Option<CancellationToken>) -> TaskControl {
     TaskControl::new(signal.unwrap_or_default())
 }
 
-fn throw_if_cancelled(signal: Option<&CancellationToken>) -> Result<(), EngineError> {
+/// Reports the pass's cancellation as the engine's cancellation error. Every
+/// phase that can run for a while — extraction batches, embedding queues, and
+/// the cross-file resolution sweep — calls this at its own boundaries.
+pub(crate) fn throw_if_cancelled(signal: Option<&CancellationToken>) -> Result<(), EngineError> {
     if signal.is_some_and(CancellationToken::is_cancelled) {
         Err(EngineError::cancelled("indexing was cancelled"))
     } else {
@@ -2474,6 +2536,129 @@ mod tests {
         fail_replacements_once: Mutex<HashSet<FileId>>,
         fail_snapshot_updates: AtomicBool,
         snapshot_update_failed: Notify,
+        graph_enabled: bool,
+    }
+
+    impl MemoryStorage {
+        /// A store that accepts walk-time graphs, mirroring a production store
+        /// opened with graph storage enabled.
+        fn with_graph() -> Self {
+            Self {
+                graph_enabled: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_assembly_follows_the_workspace_graph_setting() {
+        let directory = tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "fn caller() { callee(); }\nfn callee() {}\n",
+        )
+        .expect("source");
+        let plain_workspace = workspace(directory.path());
+        assert!(
+            !plain_workspace
+                .index()
+                .descriptor()
+                .is_some_and(IndexDescriptor::graph_indexing),
+            "graph indexing stays off until a workspace opts in"
+        );
+        let model = ConcurrentModel::new();
+
+        // A store without graph storage accepts the file and records nothing.
+        let disabled = MemoryStorage::default();
+        index_once(&plain_workspace, &disabled, &model).await;
+        assert_empty_graph(&disabled, "a store without graph storage");
+
+        // The workspace setting, not the store's capability, decides: a
+        // graph-capable store still receives nothing while the switch is off.
+        let capable_but_off = MemoryStorage::with_graph();
+        index_once(&plain_workspace, &capable_but_off, &model).await;
+        assert_empty_graph(
+            &capable_but_off,
+            "a graph-capable store while the setting is off",
+        );
+
+        // Only an opted-in workspace walks for a graph and stores it.
+        let enabled = MemoryStorage::with_graph();
+        let graph_workspace = with_graph_indexing(&workspace(directory.path()), true);
+        index_once(&graph_workspace, &enabled, &model).await;
+        let stored = enabled.graphs.lock().expect("stored graphs");
+        let graph = stored.values().next().expect("committed file graph");
+        assert_ne!(
+            graph,
+            &FileGraphResult::default(),
+            "walk-time graph must reach a store that accepts graphs"
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("callee")),
+            "the walk must report the called symbol as a node: {graph:?}"
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.kind == crate::domain::GraphEdgeKind::Calls)
+                || graph
+                    .pending_refs
+                    .iter()
+                    .any(|reference| reference.ref_name == "callee"),
+            "the walk must report the call to callee as an edge or a pending ref: {graph:?}"
+        );
+    }
+
+    async fn index_once(
+        workspace: &Workspace,
+        storage: &MemoryStorage,
+        model: &dyn IndexEmbeddingRuntime,
+    ) {
+        index_workspace(&IndexingContext {
+            workspace,
+            storage,
+            scanner: &RecordingScanner::new(),
+            embedding_models: &[model],
+            embedding_concurrency: None,
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        })
+        .await
+        .expect("index workspace");
+    }
+
+    /// Asserts the file was indexed but no graph reached the store.
+    fn assert_empty_graph(storage: &MemoryStorage, store: &str) {
+        assert_eq!(
+            storage.files.lock().expect("stored files").len(),
+            1,
+            "{store}: a graph-free workspace still indexes every file"
+        );
+        assert!(
+            !storage
+                .entries
+                .lock()
+                .expect("stored entries")
+                .values()
+                .all(Vec::is_empty),
+            "{store}: graph-free indexing must still store code fragments"
+        );
+        assert_eq!(
+            storage
+                .graphs
+                .lock()
+                .expect("stored graphs")
+                .values()
+                .next()
+                .expect("committed file graph"),
+            &FileGraphResult::default(),
+            "{store}: no graph may be stored"
+        );
     }
 
     #[test]
@@ -2576,6 +2761,10 @@ mod tests {
     }
 
     impl IndexStorage for MemoryStorage {
+        fn graph_enabled(&self) -> bool {
+            self.graph_enabled
+        }
+
         fn is_read_only(&self) -> bool {
             false
         }
@@ -3063,7 +3252,7 @@ mod tests {
             root,
             crate::domain::WorkspaceLayout::new(root.join(".zvec-grep")).expect("layout"),
             crate::domain::ScanRules::default(),
-            Some(crate::workspace::CURRENT_INDEX_VERSION),
+            crate::workspace::CURRENT_INDEX_VERSION,
             Some(uuid::Uuid::new_v4().to_string()),
             1,
             1,
@@ -3089,10 +3278,32 @@ mod tests {
                     .expect("valid embedding metadata"),
                     std::collections::BTreeMap::new(),
                     std::collections::BTreeMap::new(),
+                    false,
                     crate::domain::FTS_CONFIG,
                 )
                 .expect("index descriptor"),
             )),
+        )
+        .expect("workspace")
+    }
+
+    /// Rebuilds a workspace whose published descriptor records the graph switch.
+    fn with_graph_indexing(workspace: &Workspace, enabled: bool) -> Workspace {
+        let mut descriptor = workspace
+            .index()
+            .descriptor()
+            .expect("workspace index descriptor")
+            .clone();
+        descriptor.set_graph_indexing(enabled);
+        Workspace::new(
+            workspace.source_root(),
+            workspace.layout().clone(),
+            workspace.scan().clone(),
+            workspace.index_version(),
+            workspace.storage_generation().map(str::to_owned),
+            workspace.created_epoch_ms(),
+            workspace.updated_epoch_ms(),
+            crate::domain::IndexState::Enabled(Box::new(descriptor)),
         )
         .expect("workspace")
     }
@@ -3585,6 +3796,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_status_does_not_count_stored_fragments() {
+        let directory = tempdir().expect("workspace");
+        let workspace = workspace(directory.path());
+        let scanner = NativeScanner::default();
+        let storage = MemoryStorage::default();
+        let empty = get_workspace_index_status(&workspace, &storage, &scanner, None, true)
+            .await
+            .expect("empty status");
+        assert_eq!(empty.files_scanned, 0);
+        assert_eq!(empty.entities_indexed, 0);
+        assert_eq!(empty.fragments_indexed, None);
+
+        std::fs::write(
+            directory.path().join("harvest.rs"),
+            format!("fn harvest() {{\n{}}}\n", "    let value = 1;\n".repeat(40)),
+        )
+        .expect("source");
+        let model = ConcurrentModel::new();
+        let context = IndexingContext {
+            workspace: &workspace,
+            storage: &storage,
+            scanner: &scanner,
+            embedding_models: &[&model],
+            embedding_concurrency: None,
+            on_progress: None,
+            signal: None,
+            changes: &[],
+        };
+        index_workspace(&context).await.expect("index source");
+        let stored = storage
+            .entries
+            .lock()
+            .expect("stored entries")
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        assert!(stored > 1, "one code entity must have multiple fragments");
+        let status = get_workspace_index_status(&workspace, &storage, &scanner, None, true)
+            .await
+            .expect("indexed status");
+        assert_eq!(status.files_unchanged, 1);
+        assert_eq!(status.entities_indexed, 1);
+        assert_eq!(status.fragments_indexed, None);
+    }
+
+    #[tokio::test]
     async fn unchanged_content_updates_snapshot_and_lightweight_status_skips_reads() {
         let directory = tempdir().expect("workspace");
         std::fs::write(directory.path().join("file.txt"), "unchanged source").expect("source");
@@ -3619,11 +3876,13 @@ mod tests {
             .await
             .expect("lightweight status");
         assert_eq!(light.files_modified, 1);
+        assert_eq!(light.fragments_indexed, None);
         assert_eq!(scanner.reads.load(Ordering::Acquire), reads);
         let detailed = get_workspace_index_status(&workspace, &storage, &scanner, None, true)
             .await
             .expect("detailed status");
         assert_eq!(detailed.files_modified, 0);
+        assert_eq!(detailed.fragments_indexed, None);
         assert_eq!(scanner.reads.load(Ordering::Acquire), reads + 1);
 
         let result = index_workspace(&context).await.expect("refresh snapshot");
@@ -3662,6 +3921,7 @@ mod tests {
                         first.info.clone(),
                         BTreeMap::from([(ContentKind::Image, second.info.clone())]),
                         std::collections::BTreeMap::new(),
+                        false,
                         crate::domain::FTS_CONFIG,
                     )
                     .expect("index descriptor"),
@@ -3670,13 +3930,7 @@ mod tests {
                     workspace.source_root(),
                     workspace.layout().clone(),
                     workspace.scan().clone(),
-                    if matches!(index, crate::domain::IndexState::Enabled(_)) {
-                        workspace
-                            .index_version()
-                            .or(Some(crate::workspace::CURRENT_INDEX_VERSION))
-                    } else {
-                        None
-                    },
+                    workspace.index_version(),
                     if matches!(index, crate::domain::IndexState::Enabled(_)) {
                         workspace.storage_generation().map(str::to_owned)
                     } else {
@@ -3725,6 +3979,7 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(status.files_added, 1);
+        assert_eq!(status.fragments_indexed, None);
         assert!(storage.identities.lock().expect("catalog").is_empty());
         let model = ConcurrentModel::new();
         let context = IndexingContext {
@@ -3889,6 +4144,7 @@ mod tests {
         assert_eq!(status.files_failed, 1);
         assert_eq!(status.indexed_size_bytes, 0);
         assert_eq!(status.entities_indexed, 0);
+        assert_eq!(status.fragments_indexed, None);
     }
 
     #[tokio::test]
@@ -4164,7 +4420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexes_catalog_sources_and_shebang_scripts_only() {
+    async fn indexes_catalog_sources_readable_text_and_shebang_scripts() {
         let directory = tempdir().expect("temporary directory");
         std::fs::write(directory.path().join("readable"), "ordinary text 中文 😀").expect("text");
         std::fs::write(directory.path().join("known.txt"), "ordinary text 中文 😀")
@@ -4201,12 +4457,33 @@ mod tests {
         })
         .await
         .expect("index supported sources");
-        assert_eq!(result.files_added, 2);
+        assert_eq!(result.files_added, 4);
         let files = storage.list_files().expect("files");
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 4);
         assert!(files.iter().all(|file| file.index_status().is_indexed()));
-        assert_eq!(storage.identities.lock().expect("catalog").len(), 2);
-        assert_eq!(result.skipped.len(), 5);
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.relative_path().to_path_buf())
+                .collect::<HashSet<_>>(),
+            ["readable", "known.txt", "script", "encoded"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        );
+        assert_eq!(storage.identities.lock().expect("catalog").len(), 4);
+        assert_eq!(result.skipped.len(), 3);
+        assert_eq!(
+            result
+                .skipped
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<HashSet<_>>(),
+            ["database", "unrecognized", "document.pdf"]
+                .into_iter()
+                .map(|name| workspace.source_root().join(name))
+                .collect()
+        );
     }
 
     #[tokio::test]
@@ -4422,7 +4699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_unchanged_extensionless_text_is_skipped_after_classification() {
+    async fn large_unchanged_extensionless_text_is_retained_after_classification() {
         let directory = tempdir().expect("temporary directory");
         let workspace = workspace(directory.path());
         let size = MIN_DEFAULT_FILE_SIZE_BYTES + 1;
@@ -4460,9 +4737,15 @@ mod tests {
         )
         .await
         .expect("text classification");
-        assert!(scanned.is_empty());
-        assert_eq!(skipped[0].reason, SkippedFileReason::Unsupported);
-        assert_eq!(compute_diff(scanned, &[stored]).deleted.len(), 1);
+        assert_eq!(scanned.len(), 1);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            scanned[0].formats.as_deref(),
+            Some([FileFormat::Text].as_slice())
+        );
+        let diff = compute_diff(scanned, &[stored]);
+        assert_eq!(diff.unchanged, 1);
+        assert!(diff.deleted.is_empty());
     }
 
     #[test]

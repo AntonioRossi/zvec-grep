@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EngineError, EngineResult,
-    domain::{Entity, FileId, FileIndexStatus, FileRecord},
+    domain::{Entity, EntityMetadata, FileId, FileIndexStatus, FileRecord, Language},
     utils::{
         atomic_write as write_record, directory_exists, ensure_directory, file_exists,
         reject_symlink, sync_directory,
@@ -29,12 +29,15 @@ use super::{
         IndexedFragment, StorageSearchFilter, StorageSearchHit, StoredEntity, StoredFileAttributes,
         StoredSearchData, WorkspaceIndexStorageOptions,
     },
-    zvec::{corrupt, initialize},
+    zvec::{WAL_RECOVERY_REQUIRED, corrupt, initialize, recover_collection},
 };
 use crate::domain::FileGraphResult;
 use crate::domain::model::EmbeddingModelInfo;
 
+mod read_view;
 mod resolution;
+pub(crate) use read_view::ReadView;
+pub(crate) use resolution::ResolutionSnapshot;
 
 type StoreRegistry = Mutex<HashMap<PathBuf, Weak<SharedStore>>>;
 static STORES: OnceLock<StoreRegistry> = OnceLock::new();
@@ -43,6 +46,7 @@ struct SharedStore {
     state: Mutex<StoreState>,
     schema: Vec<EmbeddingModelInfo>,
     read_only: bool,
+    graph_enabled: bool,
     // The native handles must close before the operating-system lock is released.
     _lock: File,
 }
@@ -52,7 +56,8 @@ struct StoreState {
     directories: Directories,
     entities: Entities,
     fragments: Fragments,
-    graph: Option<SqliteGraphStorage>,
+    // A failed graph reader must not prevent canonical text/vector reads.
+    graph: Result<SqliteGraphStorage, crate::ErrorReport>,
     optimize_marker: PathBuf,
     needs_optimize: bool,
     closed: bool,
@@ -124,16 +129,13 @@ fn validate_models(embeddings: &[EmbeddingModelInfo]) -> EngineResult<()> {
 }
 
 impl IndexStore {
-    pub(crate) fn open(options: WorkspaceIndexStorageOptions) -> EngineResult<Self> {
-        // Graph extraction and resolution are not enabled in this release.
-        // Re-enabling graph indexing requires rebuilding any unmaintained graph.
-        Self::open_with_graph(options, false)
+    /// Whether indexing can persist extracted graphs in this store.
+    pub(crate) fn graph_enabled(&self) -> bool {
+        self.read(|state| Ok(state.graph.is_ok())).unwrap_or(false)
     }
 
-    fn open_with_graph(
-        options: WorkspaceIndexStorageOptions,
-        graph_enabled: bool,
-    ) -> EngineResult<Self> {
+    pub(crate) fn open(options: WorkspaceIndexStorageOptions) -> EngineResult<Self> {
+        let graph_enabled = options.graph_enabled();
         if let WorkspaceIndexStorageOptions::ReadWrite { embeddings, .. } = &options {
             validate_models(embeddings)?;
         }
@@ -158,7 +160,7 @@ impl IndexStore {
             .map_err(|error| io_error("locate index directory", home, &error))?;
         let mut registry = registry()?;
         if let Some(shared) = registry.get(&path).and_then(Weak::upgrade) {
-            if read_only && shared.read_only {
+            if read_only && shared.read_only && graph_enabled == shared.graph_enabled {
                 return Ok(Self {
                     shared: Mutex::new(Some(shared)),
                     read_only,
@@ -168,24 +170,43 @@ impl IndexStore {
                 "workspace storage is already open",
             ));
         }
-        let (lock, schema) = prepare_storage(&path, options)?;
+        let (mut lock, mut schema, new_storage) = prepare_storage(&path, options.clone())?;
         let optimize_marker = path.join("optimize.pending");
         let needs_optimize = file_exists(&optimize_marker)?;
-        let files = Files::open(&path, read_only)?;
-        let directories = Directories::open(&path, read_only)?;
-        let entities = Entities::open(&path, read_only)?;
-        let fragments = Fragments::open(&path, &schema, read_only)?;
-        // Ordinary readers do not depend on the graph's availability.
-        let graph = if read_only || !graph_enabled {
-            None
+        let graph_path = path.join("graph").join("graph.sqlite");
+        let graph = if graph_enabled {
+            let mode = if read_only {
+                OpenMode::ReadOnly
+            } else if new_storage {
+                OpenMode::Create
+            } else {
+                OpenMode::ReadWrite
+            };
+            let graph = open_graph(&graph_path, mode);
+            if read_only {
+                // Graph failures do not prevent canonical text/vector reads.
+                graph
+            } else {
+                // Existing files will skip extraction when unchanged, so an empty
+                // replacement graph cannot restore their missing relationships.
+                let graph = graph?;
+                if new_storage {
+                    sync_directory(&path.join("graph"))?;
+                }
+                Ok(graph)
+            }
         } else {
-            let graph_path = path.join("graph").join("graph.sqlite");
-            // Current extractors produce no graph, so pre-graph indexes can
-            // initialize an empty database without rebuilding canonical data.
-            let graph =
-                SqliteGraphStorage::open(&graph_path, OpenMode::ReadWrite).map_err(graph_error)?;
-            sync_directory(&path.join("graph"))?;
-            Some(graph)
+            Err(graph_disabled())
+        }
+        .map_err(EngineError::into_report);
+        let tables = open_tables(&path, &schema, read_only);
+        let (files, directories, entities, fragments) = match tables {
+            Err(error) if read_only && error.code() == WAL_RECOVERY_REQUIRED => {
+                // open_tables has dropped every partial native reader.
+                (lock, schema) = recover_wal(&path, options, lock)?;
+                open_tables(&path, &schema, true)?
+            }
+            result => result?,
         };
         if !read_only {
             directories.load()?;
@@ -210,6 +231,7 @@ impl IndexStore {
             }),
             schema,
             read_only,
+            graph_enabled,
             _lock: lock,
         });
         registry.insert(path, Arc::downgrade(&shared));
@@ -282,6 +304,10 @@ impl IndexStore {
         self.read(|state| state.files.list())
     }
 
+    pub(crate) fn count_fragments(&self) -> EngineResult<u64> {
+        self.read(|state| state.fragments.count())
+    }
+
     pub(crate) fn list_file_paths(&self) -> EngineResult<Vec<(FileId, PathBuf)>> {
         self.read(|state| state.files.list_paths())
     }
@@ -311,13 +337,7 @@ impl IndexStore {
         limit: usize,
         filter: Option<&StorageSearchFilter>,
     ) -> EngineResult<Vec<StorageSearchHit>> {
-        self.read(|state| {
-            if limit == 0 || fragments::empty_filter(filter) {
-                return Ok(Vec::new());
-            }
-            let filter = fragments::build_filter(filter, &|path| state.directories.get(path))?;
-            state.fragments.search_fts(query, limit, filter.as_deref())
-        })
+        self.read_snapshot(|view| view.search_fts(query, limit, filter))
     }
 
     pub(crate) fn search_vector(
@@ -413,7 +433,7 @@ impl IndexStore {
             state.needs_optimize = true;
             let old_ids = invalidation_entity_ids(state, file_id)?;
             state.files.mark_deleting(file_id)?;
-            if let Some(graph) = state.graph.as_mut() {
+            if let Ok(graph) = state.graph.as_mut() {
                 graph
                     .delete_file_graph(file_id.get(), &old_ids)
                     .map_err(graph_error)?;
@@ -421,6 +441,30 @@ impl IndexStore {
             state.fragments.delete_file(file_id)?;
             state.entities.delete_file(file_id)?;
             state.files.delete(file_id)
+        })
+    }
+
+    /// Requeues references whose evidence changed during this pass.
+    ///
+    /// The resolution sweep only reads `pending` rows, so a resolved reference
+    /// never sees a changed candidate set or module path again unless a pass
+    /// explicitly requeues it. Endpoint invalidation covers references that
+    /// pointed at a replaced file; this covers the workspace-wide sets that
+    /// endpoint identity cannot express. The evidence lives in the graph
+    /// database, recorded with the file writes that produced it, so a pass that
+    /// fails or is cancelled before this call requeues on the next one. A pass
+    /// without graph storage has nothing to requeue.
+    ///
+    /// # Errors
+    /// Rejects SQLite failures. The caller degrades like a failed sweep: the
+    /// canonical index stays published, the stale resolutions survive, and the
+    /// evidence stays recorded.
+    pub(crate) fn requeue_stale_resolutions(&self) -> EngineResult<usize> {
+        self.write(|state| {
+            let Ok(graph) = state.graph.as_mut() else {
+                return Ok(0);
+            };
+            graph.requeue_stale_resolutions().map_err(graph_error)
         })
     }
 
@@ -479,12 +523,45 @@ impl IndexStore {
         // for this lock. A successful close commits every accepted write.
         state.closed = true;
         let flush_result = flush(&state);
-        let graph_close = state
-            .graph
-            .take()
-            .map_or(Ok(()), |graph| graph.close().map_err(graph_error));
+        let graph_close = std::mem::replace(
+            &mut state.graph,
+            Err(EngineError::resource_closed("workspace graph is closed").into_report()),
+        )
+        .map_or(Ok(()), |graph| graph.close().map_err(graph_error));
         flush_result.and(graph_close)
     }
+}
+
+fn open_tables(
+    path: &Path,
+    schema: &[EmbeddingModelInfo],
+    read_only: bool,
+) -> EngineResult<(Files, Directories, Entities, Fragments)> {
+    Ok((
+        Files::open(path, read_only)?,
+        Directories::open(path, read_only)?,
+        Entities::open(path, read_only)?,
+        Fragments::open(path, schema, read_only)?,
+    ))
+}
+
+fn recover_wal(
+    path: &Path,
+    options: WorkspaceIndexStorageOptions,
+    shared_lock: File,
+) -> EngineResult<(File, Vec<EmbeddingModelInfo>)> {
+    // Keep the caller's workspace read lock to prevent publication, but release
+    // shared storage access before taking the exclusive recovery lock.
+    drop(shared_lock);
+    let recovery_lock = acquire_storage_lock(path, false)?;
+    let (schema, _) = load_schema(path, options.clone())?;
+    for name in collection_names(&schema) {
+        recover_collection(&path.join(name))?;
+    }
+    drop(recovery_lock);
+    // Do not retain an exclusive lock in a long-lived cached read session.
+    let (lock, schema, _) = prepare_storage(path, options)?;
+    Ok((lock, schema))
 }
 
 fn optimize_collections(
@@ -512,7 +589,7 @@ fn replace_file(
     entries: &[IndexedFragment],
     graph: &FileGraphResult,
 ) -> EngineResult<()> {
-    if state.graph.is_none()
+    if state.graph.is_err()
         && (!graph.nodes.is_empty() || !graph.edges.is_empty() || !graph.pending_refs.is_empty())
     {
         return Err(graph_disabled());
@@ -520,6 +597,23 @@ fn replace_file(
     state.files.validate(file)?;
     state.entities.validate_ownership(entities, file.id())?;
     state.fragments.validate_ownership(entries, file.id())?;
+    // Endpoint invalidation below only revisits references that pointed at this
+    // file's old entities. A file that enters or leaves the indexed set, or one
+    // that introduces a name another entity already uses, changes the
+    // workspace-wide sets resolution reads without touching those endpoints, so
+    // the graph records that evidence with the rows it can stale and the pass
+    // requeues them once before its sweep.
+    //
+    // Membership is what an import specifier reads, not record existence: the
+    // snapshot's path lookup skips `Failed` and `NotIndexed` records, so a path
+    // that failed one pass and succeeded the next enters the set while its
+    // record already exists — and one that breaks leaves it the same way.
+    let previous_indexed = state
+        .files
+        .fetch(&[file.id()])?
+        .remove(&file.id())
+        .is_some_and(|previous| previous.index_status().is_indexed());
+    let paths_changed = previous_indexed != file.index_status().is_indexed();
     state.needs_optimize = true;
     let directories = state.directories.ensure(file.relative_path())?;
     // Encode every projection before removing any of the previous file's data.
@@ -529,10 +623,34 @@ fn replace_file(
     let mut unfinished = file.clone();
     unfinished.set_index_status(FileIndexStatus::NotIndexed)?;
     state.files.put(&unfinished, &directories)?;
+    // The language labels this file's pending references for the resolver's
+    // language gate; the path itself stays canonical in zvec.
+    let relative_path = file
+        .relative_path()
+        .as_path()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let formats = crate::domain::formats_for_path(std::path::Path::new(&relative_path));
+    // Shared extensions such as .h must use the grammar that produced the
+    // entities, rather than the first extension candidate (which can be C).
+    let language = entities
+        .iter()
+        .find_map(|entity| match entity.metadata() {
+            Some(EntityMetadata::Code(metadata)) => metadata.language.map(Language::as_str),
+            _ => None,
+        })
+        .or_else(|| formats.first().map(|format| format.as_str()))
+        .unwrap_or("unknown");
     // zvec writes are durable on success: record retry intent before advancing SQLite.
-    if let Some(storage) = state.graph.as_mut() {
+    if let Ok(storage) = state.graph.as_mut() {
         storage
-            .write_file_graph(file.id().get(), graph, &old_ids)
+            .write_file_graph(
+                file.id().get(),
+                Some(language),
+                graph,
+                &old_ids,
+                paths_changed,
+            )
             .map_err(graph_error)?;
     }
     state.fragments.delete_file(file.id())?;
@@ -544,11 +662,11 @@ fn replace_file(
 }
 
 fn invalidation_entity_ids(state: &StoreState, file_id: FileId) -> EngineResult<Vec<String>> {
-    let Some(graph) = state.graph.as_ref() else {
+    let Ok(graph) = state.graph.as_ref() else {
         return Ok(Vec::new());
     };
     // An empty graph has no incoming relationships to invalidate. Avoid a
-    // canonical entity scan on every file while extractors produce no graph.
+    // canonical entity scan on every file when the graph is empty or absent.
     if graph.is_empty().map_err(graph_error)? {
         return Ok(Vec::new());
     }
@@ -556,7 +674,27 @@ fn invalidation_entity_ids(state: &StoreState, file_id: FileId) -> EngineResult<
 }
 
 fn graph_disabled() -> EngineError {
-    EngineError::unsupported("graph indexing is disabled")
+    EngineError::unsupported("graph support is disabled")
+        .with_help("Rebuild the index with `zg --index --rebuild --graph`.")
+}
+
+fn graph_missing() -> EngineError {
+    EngineError::not_found(
+        "workspace graph is missing; this index has no persisted relationship data",
+    )
+}
+
+fn open_graph(path: &Path, mode: OpenMode) -> EngineResult<SqliteGraphStorage> {
+    let graph = if mode == OpenMode::Create {
+        SqliteGraphStorage::open(path, mode).map_err(graph_error)
+    } else {
+        match fs::metadata(path) {
+            Ok(_) => SqliteGraphStorage::open(path, mode).map_err(graph_error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(graph_missing()),
+            Err(error) => Err(io_error("inspect workspace graph", path, &error)),
+        }
+    };
+    graph.map_err(|error| error.with_help("Rebuild the index with `zg --index --rebuild --graph`."))
 }
 
 fn graph_error(error: graph::Error) -> EngineError {
@@ -685,10 +823,11 @@ fn validate_vector(vector: &[f32], schema: &EmbeddingModelInfo) -> EngineResult<
     Ok(())
 }
 
+/// Returns the model schema and whether this call initialized an empty store.
 fn load_schema(
     path: &Path,
     options: WorkspaceIndexStorageOptions,
-) -> EngineResult<Vec<EmbeddingModelInfo>> {
+) -> EngineResult<(Vec<EmbeddingModelInfo>, bool)> {
     let descriptor = path.join("schema.json");
     if file_exists(&descriptor)? {
         let schema = read_json::<SchemaRecord>(&descriptor)
@@ -716,14 +855,7 @@ fn load_schema(
                 })?;
             }
         }
-        for collection in [
-            "files".to_owned(),
-            "directories".to_owned(),
-            "entities".to_owned(),
-        ]
-        .into_iter()
-        .chain(schema.iter().map(fragments::fragment_collection_name))
-        {
+        for collection in collection_names(&schema) {
             let collection_path = path.join(&collection);
             if !directory_exists(&collection_path)? {
                 return Err(EngineError::storage_failure(format!(
@@ -731,7 +863,7 @@ fn load_schema(
                 )));
             }
         }
-        return Ok(schema);
+        return Ok((schema, false));
     }
     if fs::read_dir(path)
         .map_err(|error| io_error("inspect storage directory", path, &error))?
@@ -758,7 +890,17 @@ fn load_schema(
         &descriptor,
         &serde_json::to_vec(&SchemaRecord::new(&embeddings)).map_err(|error| json_error(&error))?,
     )?;
-    Ok(embeddings)
+    Ok((embeddings, true))
+}
+
+fn collection_names(schema: &[EmbeddingModelInfo]) -> impl Iterator<Item = String> + '_ {
+    [
+        "files".to_owned(),
+        "directories".to_owned(),
+        "entities".to_owned(),
+    ]
+    .into_iter()
+    .chain(schema.iter().map(fragments::fragment_collection_name))
 }
 
 fn registry() -> EngineResult<MutexGuard<'static, HashMap<PathBuf, Weak<SharedStore>>>> {
@@ -780,9 +922,10 @@ fn lock_state(shared: &SharedStore) -> EngineResult<MutexGuard<'_, StoreState>> 
 fn prepare_storage(
     path: &Path,
     options: WorkspaceIndexStorageOptions,
-) -> EngineResult<(File, Vec<EmbeddingModelInfo>)> {
+) -> EngineResult<(File, Vec<EmbeddingModelInfo>, bool)> {
     let lock = acquire_storage_lock(path, options.is_read_only())?;
-    Ok((lock, load_schema(path, options)?))
+    let (schema, new_storage) = load_schema(path, options)?;
+    Ok((lock, schema, new_storage))
 }
 
 fn acquire_storage_lock(home: &Path, shared: bool) -> EngineResult<File> {
@@ -851,3 +994,19 @@ mod tables_tests;
 
 #[cfg(test)]
 mod graph_tests;
+
+#[cfg(test)]
+impl IndexStore {
+    pub(crate) fn set_test_file_status(
+        &self,
+        id: FileId,
+        status: FileIndexStatus,
+    ) -> EngineResult<()> {
+        self.write(|state| {
+            let mut file = state.files.fetch(&[id])?.remove(&id).expect("fixture file");
+            file.set_index_status(status)?;
+            let directories = state.directories.ensure(file.relative_path())?;
+            state.files.put(&file, &directories)
+        })
+    }
+}

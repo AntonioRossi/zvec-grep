@@ -46,6 +46,7 @@ pub(crate) struct IndexDescriptor {
     default_embedding_model: EmbeddingModelInfo,
     embedding_routes: BTreeMap<ContentKind, EmbeddingModelInfo>,
     embedding_configs: BTreeMap<String, ModelConfig<EncryptedApiKey>>,
+    graph_indexing: bool,
     #[serde(skip)]
     fts: FtsConfig,
 }
@@ -60,6 +61,9 @@ impl<'de> Deserialize<'de> for IndexDescriptor {
             embedding_routes: BTreeMap<ContentKind, EmbeddingModelInfo>,
             #[serde(default, deserialize_with = "deserialize_unique_map")]
             embedding_configs: BTreeMap<String, ModelConfig<EncryptedApiKey>>,
+            // Released v2 indexes predate the optional code graph.
+            #[serde(default)]
+            graph_indexing: bool,
         }
 
         let fields = Fields::deserialize(deserializer)?;
@@ -67,6 +71,7 @@ impl<'de> Deserialize<'de> for IndexDescriptor {
             fields.default_embedding_model,
             fields.embedding_routes,
             fields.embedding_configs,
+            fields.graph_indexing,
             FTS_CONFIG,
         )
         .map_err(serde::de::Error::custom)
@@ -135,6 +140,7 @@ impl IndexDescriptor {
         default_embedding_model: EmbeddingModelInfo,
         embedding_routes: BTreeMap<ContentKind, EmbeddingModelInfo>,
         embedding_configs: BTreeMap<String, ModelConfig<EncryptedApiKey>>,
+        graph_indexing: bool,
         fts: FtsConfig,
     ) -> EngineResult<Self> {
         for (kind, embedding) in &embedding_routes {
@@ -170,8 +176,22 @@ impl IndexDescriptor {
             default_embedding_model,
             embedding_routes,
             embedding_configs,
+            graph_indexing,
             fts,
         })
+    }
+
+    /// Whether the persisted index carries the walk-time code graph.
+    pub(crate) fn graph_indexing(&self) -> bool {
+        self.graph_indexing
+    }
+
+    /// Records whether the published index carries the walk-time code graph.
+    /// Production sets the switch through [`Self::new`]; tests use this to
+    /// derive a variant of a fixture descriptor.
+    #[cfg(test)]
+    pub(crate) fn set_graph_indexing(&mut self, enabled: bool) {
+        self.graph_indexing = enabled;
     }
 
     pub(crate) fn default_embedding_model(&self) -> &EmbeddingModelInfo {
@@ -244,6 +264,16 @@ impl IndexDescriptor {
                 .embedding
                 .ensure_index_compatible(&other_index.embedding)?;
         }
+        if self.graph_indexing != other.graph_indexing {
+            let existing = if self.graph_indexing {
+                "stores the code graph"
+            } else {
+                "has no code graph"
+            };
+            return Err(EngineError::invalid_argument(format!(
+                "existing index {existing}; rebuild the index to change graph indexing",
+            )));
+        }
         Ok(())
     }
 }
@@ -278,6 +308,7 @@ mod tests {
             .expect("embedding"),
             BTreeMap::new(),
             BTreeMap::new(),
+            false,
             FTS_CONFIG,
         )
         .expect("index descriptor")
@@ -288,7 +319,10 @@ mod tests {
         for state in [
             IndexState::Uninitialized,
             IndexState::Disabled,
-            IndexState::Enabled(Box::new(descriptor())),
+            IndexState::Enabled(Box::new(IndexDescriptor {
+                graph_indexing: true,
+                ..descriptor()
+            })),
         ] {
             let json = serde_json::to_string(&state).expect("encode index");
             assert_eq!(
@@ -305,6 +339,56 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<IndexState>(json).is_err(), "{json}");
         }
+    }
+
+    #[test]
+    fn graph_setting_mismatch_requires_a_rebuild() {
+        let published = descriptor();
+        let requested = IndexDescriptor {
+            graph_indexing: true,
+            ..descriptor()
+        };
+        let error = published
+            .ensure_index_compatible(&requested)
+            .expect_err("graph setting changed");
+        assert!(
+            error.message().contains("has no code graph"),
+            "{}",
+            error.message()
+        );
+        let error = requested
+            .ensure_index_compatible(&published)
+            .expect_err("graph setting changed");
+        assert!(
+            error.message().contains("stores the code graph"),
+            "{}",
+            error.message()
+        );
+        published
+            .ensure_index_compatible(&descriptor())
+            .expect("matching graph setting");
+    }
+
+    #[test]
+    fn legacy_descriptor_defaults_to_indexing_without_a_graph() {
+        let encoded =
+            serde_json::to_string(&IndexState::Enabled(Box::new(descriptor()))).expect("encode");
+        assert!(encoded.contains("\"graphIndexing\":false"));
+
+        let incomplete = encoded.replace(",\"graphIndexing\":false", "");
+        assert_ne!(incomplete, encoded);
+        let restored = serde_json::from_str::<IndexState>(&incomplete).expect("v2 descriptor");
+        let restored = restored.descriptor().expect("enabled index");
+        assert!(!restored.graph_indexing());
+        restored
+            .ensure_index_compatible(&descriptor())
+            .expect("existing v2 index remains compatible");
+        assert!(
+            serde_json::from_str::<IndexState>(
+                &encoded.replace("\"graphIndexing\":false", "\"graphIndexing\":null")
+            )
+            .is_err()
+        );
     }
 
     #[test]
