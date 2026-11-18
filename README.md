@@ -49,8 +49,8 @@ terminal, or let your agent use it for you.
 
 ## 💫 Why zg?
 
-- **Move and reuse an index** — relocate a complete indexed workspace or
-  export and import it on another host without re-embedding unchanged documents.
+- **Move and reuse a Node index** — use the Node CLI to relocate an indexed
+  workspace or to export and import its index without embedding unchanged documents again.
   See [Move and reuse an index](./docs/09-portable-indexes.md) for requirements
   and limits.
 - **Ready for humans and agents** — install once, index once, then use the same
